@@ -1,5 +1,10 @@
 build/
 build-manual/
+build-vcpkg-manual/
+build-vcpkg-direct/
+.vcpkg-cache/
+.vcpkg-downloads/
+.vcpkg-registries/
 out/
 *.user
 *.suo

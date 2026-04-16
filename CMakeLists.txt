@@ -11,6 +11,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc highgui)
 
+if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
+    message(FATAL_ERROR
+        "OpenCV resolved to an Anaconda path: ${OpenCV_DIR}\n"
+        "Use the vcpkg preset or set OpenCV_DIR to a standalone OpenCV install.")
+endif()
+
 add_executable(ps_spheres
     src/args.cpp
     src/image_io.cpp
@@ -23,6 +29,7 @@ target_compile_features(ps_spheres PRIVATE cxx_std_17)
 
 if(MSVC)
     target_compile_options(ps_spheres PRIVATE /W4 /permissive-)
+    target_link_options(ps_spheres PRIVATE /MANIFEST:NO)
 else()
     target_compile_options(ps_spheres PRIVATE -Wall -Wextra -Wpedantic)
 endif()

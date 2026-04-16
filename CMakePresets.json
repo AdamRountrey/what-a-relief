@@ -1,0 +1,39 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs2022-vcpkg",
+      "displayName": "Visual Studio 2022 with vcpkg OpenCV",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022-vcpkg",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    {
+      "name": "ninja-vcpkg",
+      "displayName": "Ninja with vcpkg OpenCV",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-vcpkg",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+        "CMAKE_TOOLCHAIN_FILE": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_APPLOCAL_DEPS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-vcpkg-release",
+      "configurePreset": "vs2022-vcpkg",
+      "configuration": "Release"
+    },
+    {
+      "name": "ninja-vcpkg-release",
+      "configurePreset": "ninja-vcpkg",
+      "configuration": "Release"
+    }
+  ]
+}

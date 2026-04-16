@@ -6,23 +6,33 @@ This is aimed at microscope-style directional illumination workflows, including 
 
 ## Build
 
-Install OpenCV with C++ development files, including the `highgui` module for the interactive sphere picker.
+The recommended Windows build uses Visual Studio's bundled vcpkg so the project gets its own OpenCV install. This avoids accidentally linking against Anaconda OpenCV.
 
-With vcpkg on Windows:
+Open a Visual Studio x64 Native Tools command prompt, or run `VsDevCmd.bat -arch=x64`, then configure and build:
 
 ```powershell
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
+cmake --preset ninja-vcpkg
+cmake --build --preset ninja-vcpkg-release
 ```
 
-With a system OpenCV install:
+The first configure may take a while because vcpkg builds OpenCV. After that, it is cached under `build/ninja-vcpkg/vcpkg_installed`.
+
+If you use a standalone OpenCV install instead, set `OpenCV_DIR` to that install's `OpenCVConfig.cmake` directory. The CMake file intentionally rejects Anaconda paths.
 
 ```powershell
-cmake -S . -B build
+cmake -S . -B build -DOpenCV_DIR=C:/opencv/build/x64/vc16/lib
 cmake --build build --config Release
 ```
 
 The executable is `ps_spheres`.
+
+If your CMake/Ninja link step gets stuck in the MSVC manifest wrapper, use the direct MSVC fallback. It still uses the same vcpkg OpenCV install and does not touch Anaconda:
+
+```powershell
+.\scripts\build-vcpkg-direct-msvc.ps1
+$env:PATH = "$PWD\build\ninja-vcpkg\vcpkg_installed\x64-windows\bin;$env:PATH"
+.\build-vcpkg-direct\ps_spheres.exe --help
+```
 
 ## Run
 
