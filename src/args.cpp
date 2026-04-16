@@ -43,6 +43,9 @@ int parseInt(const std::string& s, const std::string& label) {
 void printUsage() {
     std::cout
         << "Photometric stereo from 4 or 8 images with highlight sphere light calibration.\n\n"
+        << "GUI:\n"
+        << "  ps_spheres.exe               Open file picker, output folder picker, and sphere marker.\n"
+        << "  --gui                        Same as running with no arguments.\n\n"
         << "Required:\n"
         << "  --image path                 Add one image. Use exactly 4 or 8 times.\n\n"
         << "Interactive sphere selection:\n"
@@ -66,6 +69,11 @@ void printUsage() {
 
 Options parseArgs(int argc, char** argv) {
     Options opt;
+    if (argc == 1) {
+        opt.guiMode = true;
+        return opt;
+    }
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto need = [&](int n) {
@@ -77,6 +85,8 @@ Options parseArgs(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") {
             printUsage();
             std::exit(0);
+        } else if (arg == "--gui") {
+            opt.guiMode = true;
         } else if (arg == "--image") {
             need(1);
             opt.imagePaths.emplace_back(argv[++i]);
@@ -124,7 +134,10 @@ Options parseArgs(int argc, char** argv) {
         }
     }
 
-    if (opt.imagePaths.size() != 4 && opt.imagePaths.size() != 8) {
+    if (!opt.guiMode && opt.imagePaths.size() != 4 && opt.imagePaths.size() != 8) {
+        die("Use exactly 4 or 8 --image arguments.");
+    }
+    if (opt.guiMode && !opt.imagePaths.empty() && opt.imagePaths.size() != 4 && opt.imagePaths.size() != 8) {
         die("Use exactly 4 or 8 --image arguments.");
     }
     if (opt.noGui && opt.lightsFile.empty() && !opt.hasSphere) {

@@ -41,6 +41,14 @@ The packaging step copies the OpenCV runtime DLLs next to `ps_spheres.exe`, so t
 
 Use exactly 4 or 8 images. All images must have the same dimensions and must include the same highlight sphere.
 
+For the GUI workflow, run the packaged executable with no arguments:
+
+```powershell
+.\build-vcpkg-direct\ps_spheres.exe
+```
+
+Select exactly 4 or 8 images in the file picker, choose an output folder, then mark the highlight sphere by dragging from its center to its edge.
+
 ```powershell
 .\build\Release\ps_spheres.exe `
   --image capture_01.tif `

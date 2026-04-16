@@ -18,6 +18,7 @@ struct Options {
     std::string lightsFile;
     Sphere sphere;
     bool hasSphere = false;
+    bool guiMode = false;
     bool noGui = false;
     bool srgb = false;
     bool keepSphere = false;

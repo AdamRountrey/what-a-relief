@@ -19,12 +19,16 @@ endif()
 
 add_executable(ps_spheres
     src/args.cpp
+    src/gui_workflow.cpp
     src/image_io.cpp
     src/main.cpp
     src/photometric.cpp
     src/sphere_ui.cpp)
 
 target_link_libraries(ps_spheres PRIVATE ${OpenCV_LIBS})
+if(WIN32)
+    target_link_libraries(ps_spheres PRIVATE comdlg32 shell32 ole32 user32)
+endif()
 target_compile_features(ps_spheres PRIVATE cxx_std_17)
 
 if(MSVC)
