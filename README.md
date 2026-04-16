@@ -30,9 +30,12 @@ If your CMake/Ninja link step gets stuck in the MSVC manifest wrapper, use the d
 
 ```powershell
 .\scripts\build-vcpkg-direct-msvc.ps1
+.\scripts\package-vcpkg-runtime.ps1
 $env:PATH = "$PWD\build\ninja-vcpkg\vcpkg_installed\x64-windows\bin;$env:PATH"
 .\build-vcpkg-direct\ps_spheres.exe --help
 ```
+
+The packaging step copies the OpenCV runtime DLLs next to `ps_spheres.exe`, so the executable can also be run directly from `build-vcpkg-direct` without editing `PATH`.
 
 ## Run
 
