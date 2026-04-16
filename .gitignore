@@ -1,4 +1,5 @@
 build/
+build-manual/
 out/
 *.user
 *.suo

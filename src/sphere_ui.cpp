@@ -1,5 +1,15 @@
 #include "sphere_ui.hpp"
 
+#ifdef PS_NO_GUI
+
+#include <stdexcept>
+
+Sphere chooseSphereInteractive(const cv::Mat&) {
+    throw std::runtime_error("Interactive sphere selection is disabled in this build. Use --sphere or rebuild with OpenCV highgui.");
+}
+
+#else
+
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -116,3 +126,5 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
     sphere.radius = state.radius;
     return sphere;
 }
+
+#endif
