@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(photometric_stereo_spheres
+project(WhatARelief
     VERSION 0.1.0
-    DESCRIPTION "Photometric stereo from 4 or 8 images using highlight spheres"
+    DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -17,23 +17,25 @@ if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
         "Use the vcpkg preset or set OpenCV_DIR to a standalone OpenCV install.")
 endif()
 
-add_executable(ps_spheres
+add_executable(what-a-relief
     src/args.cpp
+    src/crop_ui.cpp
     src/gui_workflow.cpp
     src/image_io.cpp
     src/main.cpp
     src/photometric.cpp
+    src/relight_ui.cpp
     src/sphere_ui.cpp)
 
-target_link_libraries(ps_spheres PRIVATE ${OpenCV_LIBS})
+target_link_libraries(what-a-relief PRIVATE ${OpenCV_LIBS})
 if(WIN32)
-    target_link_libraries(ps_spheres PRIVATE comdlg32 shell32 ole32 user32)
+    target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32)
 endif()
-target_compile_features(ps_spheres PRIVATE cxx_std_17)
+target_compile_features(what-a-relief PRIVATE cxx_std_17)
 
 if(MSVC)
-    target_compile_options(ps_spheres PRIVATE /W4 /permissive-)
-    target_link_options(ps_spheres PRIVATE /MANIFEST:NO)
+    target_compile_options(what-a-relief PRIVATE /W4 /permissive-)
+    target_link_options(what-a-relief PRIVATE /MANIFEST:NO)
 else()
-    target_compile_options(ps_spheres PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(what-a-relief PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -25,8 +25,8 @@ call "$VsDevCmd" -arch=x64
 "$CMake" --preset ninja-vcpkg
 if errorlevel 1 exit /b %errorlevel%
 cl /nologo /std:c++17 /EHsc /W4 /permissive- /external:W0 /external:I"$build\vcpkg_installed\x64-windows\include\opencv4" ^
-  "$repo\src\args.cpp" "$repo\src\gui_workflow.cpp" "$repo\src\image_io.cpp" "$repo\src\main.cpp" "$repo\src\photometric.cpp" "$repo\src\sphere_ui.cpp" ^
-  /Fe:"$out\ps_spheres.exe" /Fo:"$obj\\" ^
+  "$repo\src\args.cpp" "$repo\src\crop_ui.cpp" "$repo\src\gui_workflow.cpp" "$repo\src\image_io.cpp" "$repo\src\main.cpp" "$repo\src\photometric.cpp" "$repo\src\relight_ui.cpp" "$repo\src\sphere_ui.cpp" ^
+  /Fe:"$out\what-a-relief.exe" /Fo:"$obj\\" ^
   /link /MANIFEST:NO /LIBPATH:"$build\vcpkg_installed\x64-windows\lib" ^
   opencv_highgui4.lib opencv_videoio4.lib opencv_imgcodecs4.lib opencv_imgproc4.lib opencv_core4.lib comdlg32.lib shell32.lib ole32.lib user32.lib
 if errorlevel 1 exit /b %errorlevel%
@@ -39,6 +39,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "Built $out\ps_spheres.exe"
+Write-Host "Built $out\what-a-relief.exe"
 Write-Host "Run with this DLL path first:"
 Write-Host "  $build\vcpkg_installed\x64-windows\bin"

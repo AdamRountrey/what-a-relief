@@ -8,8 +8,15 @@
 
 namespace {
 
+constexpr size_t kMinImages = 3;
+constexpr size_t kMaxImages = 25;
+
 [[noreturn]] void die(const std::string& message) {
     throw std::runtime_error(message);
+}
+
+bool validImageCount(size_t count) {
+    return count >= kMinImages && count <= kMaxImages;
 }
 
 double parseDouble(const std::string& s, const std::string& label) {
@@ -42,26 +49,33 @@ int parseInt(const std::string& s, const std::string& label) {
 
 void printUsage() {
     std::cout
-        << "Photometric stereo from 4 or 8 images with highlight sphere light calibration.\n\n"
+        << "What A Relief: relief visualization and photometric stereo from 3 to 25 images.\n\n"
         << "GUI:\n"
-        << "  ps_spheres.exe               Open file picker, output folder picker, and sphere marker.\n"
+        << "  what-a-relief.exe            Open file picker, output folder picker, and lighting choice.\n"
         << "  --gui                        Same as running with no arguments.\n\n"
         << "Required:\n"
-        << "  --image path                 Add one image. Use exactly 4 or 8 times.\n\n"
+        << "  --image path                 Add one image. Use 3 to 25 times.\n\n"
         << "Interactive sphere selection:\n"
-        << "  If --sphere and --lights-file are omitted, the first image opens in a window.\n"
-        << "  Click-drag from sphere center to sphere edge, then press Enter or Space.\n\n"
+        << "  If --sphere, --lights-file, and --uncalibrated are omitted, the first image opens in a window.\n"
+        << "  Click three points on the sphere edge, then press Enter or Space.\n"
+        << "  Mouse wheel/+/- zoom; right-drag, WASD, or arrow keys pan.\n\n"
         << "Options:\n"
         << "  --out dir                    Output directory. Default: out\n"
         << "  --mask path                  Optional object mask; white pixels are solved.\n"
+        << "  --uncalibrated               Skip sphere calibration and estimate a relative normal field.\n"
+        << "  --crop x y width height      Restrict solve to a rectangular image region.\n"
         << "  --sphere cx cy radius        Reuse a known sphere circle without the GUI.\n"
         << "  --lights-file path           CSV/text file with one x,y,z light vector per image.\n"
-        << "  --no-gui                     Disable interactive selection. Requires --sphere or --lights-file.\n"
+        << "  --no-gui                     Disable interactive selection. Requires --sphere, --lights-file, or --uncalibrated.\n"
         << "  --srgb                       Linearize sRGB image intensities.\n"
         << "  --highlight-percentile p     Bright percentile inside sphere. Default: 99.8\n"
         << "  --min-highlight v            Minimum highlight intensity. Default: 0.05\n"
         << "  --shadow-threshold v         Per-observation shadow cutoff. Default: 0.02\n"
-        << "  --integration-iterations n   Height preview iterations. Default: 800\n"
+        << "  --integration-iterations n   Legacy option accepted; DCT/Poisson height ignores it.\n"
+        << "  --no-height                  Skip height.png and height.pfm.\n"
+        << "  --mesh path.ply              Export a PLY mesh from the height preview.\n"
+        << "  --mesh-step n                Use every nth pixel for PLY export. Default: 1\n"
+        << "  --height-scale s             Scale mesh z coordinates. Default: 1.0\n"
         << "  --keep-sphere                Do not remove the calibration sphere from the solve mask.\n"
         << "  --view-dir x y z             Camera view vector. Default: 0 0 1\n"
         << "  --help                       Show this help.\n";
@@ -96,6 +110,15 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--mask") {
             need(1);
             opt.maskPath = argv[++i];
+        } else if (arg == "--uncalibrated" || arg == "--no-sphere") {
+            opt.uncalibratedLighting = true;
+        } else if (arg == "--crop") {
+            need(4);
+            opt.crop.x = parseInt(argv[++i], "crop x");
+            opt.crop.y = parseInt(argv[++i], "crop y");
+            opt.crop.width = parseInt(argv[++i], "crop width");
+            opt.crop.height = parseInt(argv[++i], "crop height");
+            opt.hasCrop = true;
         } else if (arg == "--lights-file") {
             need(1);
             opt.lightsFile = argv[++i];
@@ -123,6 +146,18 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--integration-iterations") {
             need(1);
             opt.integrationIterations = parseInt(argv[++i], "integration iterations");
+        } else if (arg == "--no-height") {
+            opt.calculateHeight = false;
+        } else if (arg == "--mesh") {
+            need(1);
+            opt.meshPath = argv[++i];
+            opt.calculateHeight = true;
+        } else if (arg == "--mesh-step") {
+            need(1);
+            opt.meshStep = parseInt(argv[++i], "mesh step");
+        } else if (arg == "--height-scale") {
+            need(1);
+            opt.heightScale = parseDouble(argv[++i], "height scale");
         } else if (arg == "--view-dir") {
             need(3);
             opt.viewDir = cv::Vec3f(
@@ -134,14 +169,23 @@ Options parseArgs(int argc, char** argv) {
         }
     }
 
-    if (!opt.guiMode && opt.imagePaths.size() != 4 && opt.imagePaths.size() != 8) {
-        die("Use exactly 4 or 8 --image arguments.");
+    if (!opt.guiMode && !validImageCount(opt.imagePaths.size())) {
+        die("Use 3 to 25 --image arguments.");
     }
-    if (opt.guiMode && !opt.imagePaths.empty() && opt.imagePaths.size() != 4 && opt.imagePaths.size() != 8) {
-        die("Use exactly 4 or 8 --image arguments.");
+    if (opt.guiMode && !opt.imagePaths.empty() && !validImageCount(opt.imagePaths.size())) {
+        die("Use 3 to 25 --image arguments.");
     }
-    if (opt.noGui && opt.lightsFile.empty() && !opt.hasSphere) {
-        die("--no-gui requires --sphere or --lights-file.");
+    if (opt.noGui && opt.lightsFile.empty() && !opt.hasSphere && !opt.uncalibratedLighting) {
+        die("--no-gui requires --sphere, --lights-file, or --uncalibrated.");
+    }
+    if (opt.uncalibratedLighting && (!opt.lightsFile.empty() || opt.hasSphere)) {
+        die("--uncalibrated cannot be combined with --sphere or --lights-file.");
+    }
+    if (opt.uncalibratedLighting && (!opt.guiMode || !opt.imagePaths.empty()) && opt.imagePaths.size() < 4) {
+        die("--uncalibrated requires at least 4 images.");
+    }
+    if (opt.hasCrop && (opt.crop.width <= 0 || opt.crop.height <= 0)) {
+        die("--crop width and height must be positive.");
     }
     if (opt.hasSphere && opt.sphere.radius <= 0.0) {
         die("Sphere radius must be positive.");
@@ -151,6 +195,15 @@ Options parseArgs(int argc, char** argv) {
     }
     if (opt.integrationIterations < 0) {
         die("--integration-iterations must be non-negative.");
+    }
+    if (opt.meshStep < 1) {
+        die("--mesh-step must be at least 1.");
+    }
+    if (!std::isfinite(opt.heightScale) || opt.heightScale == 0.0) {
+        die("--height-scale must be finite and non-zero.");
+    }
+    if (!opt.meshPath.empty()) {
+        opt.calculateHeight = true;
     }
 
     const float viewNorm = std::sqrt(opt.viewDir.dot(opt.viewDir));

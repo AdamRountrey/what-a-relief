@@ -2,4 +2,8 @@
 
 #include "types.hpp"
 
+#include <string>
+
 void launchGuiWorkflow(Options& opt);
+void showGuiInfo(const std::string& title, const std::string& text);
+bool askGuiYesNo(const std::string& title, const std::string& text, bool defaultYes);

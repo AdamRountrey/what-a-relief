@@ -16,16 +16,23 @@ struct Options {
     std::string outputDir = "out";
     std::string maskPath;
     std::string lightsFile;
+    std::string meshPath;
     Sphere sphere;
+    cv::Rect crop;
     bool hasSphere = false;
+    bool hasCrop = false;
     bool guiMode = false;
     bool noGui = false;
     bool srgb = false;
     bool keepSphere = false;
+    bool uncalibratedLighting = false;
+    bool calculateHeight = true;
     double highlightPercentile = 99.8;
     double minHighlight = 0.05;
     double shadowThreshold = 0.02;
     int integrationIterations = 800;
+    int meshStep = 1;
+    double heightScale = 1.0;
     cv::Vec3f viewDir = cv::Vec3f(0.0f, 0.0f, 1.0f);
 };
 

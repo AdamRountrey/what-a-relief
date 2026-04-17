@@ -1,11 +1,11 @@
-#include "sphere_ui.hpp"
+#include "crop_ui.hpp"
 
 #ifdef PS_NO_GUI
 
 #include <stdexcept>
 
-Sphere chooseSphereInteractive(const cv::Mat&) {
-    throw std::runtime_error("Interactive sphere selection is disabled in this build. Use --sphere or rebuild with OpenCV highgui.");
+cv::Rect chooseCropInteractive(const cv::Mat&) {
+    throw std::runtime_error("Interactive crop selection is disabled in this build. Use --crop or rebuild with OpenCV highgui.");
 }
 
 #else
@@ -17,40 +17,38 @@ Sphere chooseSphereInteractive(const cv::Mat&) {
 #include <cmath>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace {
 
-struct PickerState {
+struct CropState {
     cv::Mat image;
     cv::Size viewSize;
     double zoom = 1.0;
     double minZoom = 1.0;
     double maxZoom = 32.0;
     cv::Point2d origin = cv::Point2d(0.0, 0.0);
-    std::vector<cv::Point2d> edgePoints;
-    Sphere circle;
-    bool hasCircle = false;
+    cv::Point2d dragStart;
+    cv::Point2d dragEnd;
+    bool hasCrop = false;
+    bool drawing = false;
     bool panning = false;
     cv::Point panStartMouse;
     cv::Point2d panStartOrigin = cv::Point2d(0.0, 0.0);
-    bool leftDown = false;
-    cv::Point leftStartMouse;
     bool done = false;
     bool canceled = false;
 };
 
-cv::Point2d toImagePoint(const PickerState& state, int x, int y) {
+cv::Point2d toImagePoint(const CropState& state, int x, int y) {
     return state.origin + cv::Point2d(static_cast<double>(x) / state.zoom, static_cast<double>(y) / state.zoom);
 }
 
-cv::Point toViewPoint(const PickerState& state, const cv::Point2d& p) {
+cv::Point toViewPoint(const CropState& state, const cv::Point2d& p) {
     return cv::Point(
         static_cast<int>(std::lround((p.x - state.origin.x) * state.zoom)),
         static_cast<int>(std::lround((p.y - state.origin.y) * state.zoom)));
 }
 
-void clampOrigin(PickerState& state) {
+void clampOrigin(CropState& state) {
     const double visibleW = static_cast<double>(state.viewSize.width) / state.zoom;
     const double visibleH = static_cast<double>(state.viewSize.height) / state.zoom;
     const double maxX = std::max(0.0, static_cast<double>(state.image.cols) - visibleW);
@@ -59,80 +57,54 @@ void clampOrigin(PickerState& state) {
     state.origin.y = std::clamp(state.origin.y, 0.0, maxY);
 }
 
-void resetView(PickerState& state) {
+void resetView(CropState& state) {
     state.zoom = state.minZoom;
     state.origin = cv::Point2d(0.0, 0.0);
     clampOrigin(state);
 }
 
-void zoomAt(PickerState& state, double factor, const cv::Point& anchor) {
+void zoomAt(CropState& state, double factor, const cv::Point& anchor) {
     const cv::Point2d before = toImagePoint(state, anchor.x, anchor.y);
     state.zoom = std::clamp(state.zoom * factor, state.minZoom, state.maxZoom);
     state.origin = before - cv::Point2d(static_cast<double>(anchor.x) / state.zoom, static_cast<double>(anchor.y) / state.zoom);
     clampOrigin(state);
 }
 
-void panBy(PickerState& state, double dx, double dy) {
+void panBy(CropState& state, double dx, double dy) {
     state.origin += cv::Point2d(dx, dy);
     clampOrigin(state);
 }
 
-bool fitCircleFromThreePoints(const std::vector<cv::Point2d>& points, Sphere& sphere) {
-    if (points.size() != 3) {
-        return false;
-    }
-
-    const cv::Point2d a = points[0];
-    const cv::Point2d b = points[1];
-    const cv::Point2d c = points[2];
-    const double d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
-    if (std::abs(d) < 1.0e-6) {
-        return false;
-    }
-
-    const double aa = a.x * a.x + a.y * a.y;
-    const double bb = b.x * b.x + b.y * b.y;
-    const double cc = c.x * c.x + c.y * c.y;
-    sphere.cx = (aa * (b.y - c.y) + bb * (c.y - a.y) + cc * (a.y - b.y)) / d;
-    sphere.cy = (aa * (c.x - b.x) + bb * (a.x - c.x) + cc * (b.x - a.x)) / d;
-    sphere.radius = cv::norm(cv::Point2d(sphere.cx, sphere.cy) - a);
-    return std::isfinite(sphere.cx) && std::isfinite(sphere.cy) && std::isfinite(sphere.radius) && sphere.radius > 1.0;
+cv::Rect currentCrop(const CropState& state) {
+    const double x0d = std::min(state.dragStart.x, state.dragEnd.x);
+    const double y0d = std::min(state.dragStart.y, state.dragEnd.y);
+    const double x1d = std::max(state.dragStart.x, state.dragEnd.x);
+    const double y1d = std::max(state.dragStart.y, state.dragEnd.y);
+    const int x0 = std::clamp(static_cast<int>(std::floor(x0d)), 0, state.image.cols - 1);
+    const int y0 = std::clamp(static_cast<int>(std::floor(y0d)), 0, state.image.rows - 1);
+    const int x1 = std::clamp(static_cast<int>(std::ceil(x1d)), x0 + 1, state.image.cols);
+    const int y1 = std::clamp(static_cast<int>(std::ceil(y1d)), y0 + 1, state.image.rows);
+    return cv::Rect(x0, y0, x1 - x0, y1 - y0);
 }
 
-void addEdgePoint(PickerState& state, const cv::Point2d& p) {
-    if (state.edgePoints.size() >= 3) {
-        return;
-    }
-    state.edgePoints.push_back(p);
-    state.hasCircle = false;
-    if (state.edgePoints.size() == 3) {
-        if (!fitCircleFromThreePoints(state.edgePoints, state.circle)) {
-            state.edgePoints.clear();
-            state.hasCircle = false;
-            return;
-        }
-        state.hasCircle = true;
-    }
-}
-
-void resetSelection(PickerState& state) {
-    state.edgePoints.clear();
-    state.hasCircle = false;
-    state.leftDown = false;
-    state.panning = false;
+void resetSelection(CropState& state) {
+    state.hasCrop = false;
+    state.drawing = false;
 }
 
 void mouseCallback(int event, int x, int y, int flags, void* userdata) {
-    auto* state = static_cast<PickerState*>(userdata);
+    auto* state = static_cast<CropState*>(userdata);
     if (event == cv::EVENT_LBUTTONDOWN) {
-        state->leftDown = true;
-        state->leftStartMouse = cv::Point(x, y);
-    } else if (event == cv::EVENT_LBUTTONUP && state->leftDown) {
-        const cv::Point mouse(x, y);
-        if (cv::norm(mouse - state->leftStartMouse) <= 4.0) {
-            addEdgePoint(*state, toImagePoint(*state, x, y));
-        }
-        state->leftDown = false;
+        state->drawing = true;
+        state->dragStart = toImagePoint(*state, x, y);
+        state->dragEnd = state->dragStart;
+        state->hasCrop = true;
+    } else if (event == cv::EVENT_MOUSEMOVE && state->drawing) {
+        state->dragEnd = toImagePoint(*state, x, y);
+    } else if (event == cv::EVENT_LBUTTONUP && state->drawing) {
+        state->dragEnd = toImagePoint(*state, x, y);
+        state->drawing = false;
+        state->hasCrop = currentCrop(*state).area() >= 100;
     } else if (event == cv::EVENT_RBUTTONDOWN || event == cv::EVENT_MBUTTONDOWN) {
         state->panning = true;
         state->panStartMouse = cv::Point(x, y);
@@ -151,7 +123,7 @@ void mouseCallback(int event, int x, int y, int flags, void* userdata) {
     }
 }
 
-cv::Mat render(const PickerState& state) {
+cv::Mat render(const CropState& state) {
     cv::Mat frame(state.viewSize, state.image.type(), cv::Scalar(0, 0, 0));
     const int x0 = std::clamp(static_cast<int>(std::floor(state.origin.x)), 0, state.image.cols - 1);
     const int y0 = std::clamp(static_cast<int>(std::floor(state.origin.y)), 0, state.image.rows - 1);
@@ -173,34 +145,27 @@ cv::Mat render(const PickerState& state) {
         scaled(srcRect).copyTo(frame(dstRect));
     }
 
-    const std::string line1 = "Click 3 points on the sphere edge. Wheel/+/- zoom. Right-drag or WASD pans.";
-    const std::string line2 = "Enter/Space accepts after 3 points. Backspace removes last. R resets. 0 fits. Esc cancels.";
+    const std::string line1 = "Drag a rectangle around the surface only. Wheel/+/- zoom. Right-drag or WASD pans.";
+    const std::string line2 = "Enter/Space accepts. R redraws. 0 fits. Esc cancels.";
     cv::rectangle(frame, cv::Point(0, 0), cv::Point(frame.cols, 64), cv::Scalar(0, 0, 0), cv::FILLED);
-    cv::putText(frame, line1, cv::Point(12, 24), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-    cv::putText(frame, line2, cv::Point(12, 50), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+    cv::putText(frame, line1, cv::Point(12, 24), cv::FONT_HERSHEY_SIMPLEX, 0.54, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    cv::putText(frame, line2, cv::Point(12, 50), cv::FONT_HERSHEY_SIMPLEX, 0.50, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
 
-    for (size_t i = 0; i < state.edgePoints.size(); ++i) {
-        const cv::Point p = toViewPoint(state, state.edgePoints[i]);
-        cv::circle(frame, p, 5, cv::Scalar(0, 255, 255), cv::FILLED, cv::LINE_AA);
-        cv::circle(frame, p, 9, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-        cv::putText(frame, std::to_string(i + 1), p + cv::Point(9, -8), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    }
-
-    if (state.hasCircle) {
-        const cv::Point c = toViewPoint(state, cv::Point2d(state.circle.cx, state.circle.cy));
-        const int r = static_cast<int>(std::lround(state.circle.radius * state.zoom));
-        cv::circle(frame, c, r, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-        cv::circle(frame, c, 4, cv::Scalar(0, 255, 255), cv::FILLED, cv::LINE_AA);
-
+    if (state.hasCrop) {
+        const cv::Rect crop = currentCrop(state);
+        const cv::Point p0 = toViewPoint(state, cv::Point2d(crop.x, crop.y));
+        const cv::Point p1 = toViewPoint(state, cv::Point2d(crop.x + crop.width, crop.y + crop.height));
+        cv::rectangle(frame, cv::Rect(p0, p1), cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
         const std::string values =
-            "cx=" + std::to_string(static_cast<int>(std::lround(state.circle.cx))) +
-            " cy=" + std::to_string(static_cast<int>(std::lround(state.circle.cy))) +
-            " r=" + std::to_string(static_cast<int>(std::lround(state.circle.radius))) +
+            "x=" + std::to_string(crop.x) +
+            " y=" + std::to_string(crop.y) +
+            " w=" + std::to_string(crop.width) +
+            " h=" + std::to_string(crop.height) +
             " zoom=" + std::to_string(static_cast<int>(std::lround(state.zoom * 100.0))) + "%";
         cv::putText(frame, values, cv::Point(12, frame.rows - 16), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     } else {
         const std::string values =
-            std::to_string(state.edgePoints.size()) + "/3 edge points   zoom=" +
+            "No crop selected   zoom=" +
             std::to_string(static_cast<int>(std::lround(state.zoom * 100.0))) + "%";
         cv::putText(frame, values, cv::Point(12, frame.rows - 16), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     }
@@ -210,12 +175,12 @@ cv::Mat render(const PickerState& state) {
 
 } // namespace
 
-Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
+cv::Rect chooseCropInteractive(const cv::Mat& displayImage) {
     if (displayImage.empty()) {
-        throw std::runtime_error("Cannot choose a sphere from an empty image.");
+        throw std::runtime_error("Cannot choose a crop from an empty image.");
     }
 
-    PickerState state;
+    CropState state;
     const double maxW = 1400.0;
     const double maxH = 900.0;
     state.image = displayImage.clone();
@@ -226,7 +191,7 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
         std::max(1, static_cast<int>(std::lround(displayImage.rows * state.minZoom))));
     state.maxZoom = std::max(32.0, state.minZoom * 32.0);
 
-    const std::string windowName = "Select highlight sphere";
+    const std::string windowName = "Select uncalibrated surface crop";
     cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
     cv::setMouseCallback(windowName, mouseCallback, &state);
 
@@ -238,9 +203,6 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
             state.canceled = true;
         } else if (ascii == 'r' || ascii == 'R') {
             resetSelection(state);
-        } else if (ascii == 8 && !state.edgePoints.empty()) {
-            state.edgePoints.pop_back();
-            state.hasCircle = false;
         } else if (ascii == '0') {
             resetView(state);
         } else if (ascii == '+' || ascii == '=') {
@@ -255,17 +217,17 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
             panBy(state, 0.0, -static_cast<double>(state.viewSize.height) * 0.15 / state.zoom);
         } else if (ascii == 's' || ascii == 'S' || key == 2621440) {
             panBy(state, 0.0, static_cast<double>(state.viewSize.height) * 0.15 / state.zoom);
-        } else if ((ascii == 13 || ascii == 10 || ascii == 32) && state.hasCircle && state.circle.radius > 1.0) {
+        } else if ((ascii == 13 || ascii == 10 || ascii == 32) && state.hasCrop && currentCrop(state).area() >= 100) {
             state.done = true;
         }
     }
 
     cv::destroyWindow(windowName);
     if (state.canceled) {
-        throw std::runtime_error("Interactive sphere selection was canceled.");
+        throw std::runtime_error("Interactive crop selection was canceled.");
     }
 
-    return state.circle;
+    return currentCrop(state);
 }
 
 #endif

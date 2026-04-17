@@ -4,6 +4,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,4 +19,18 @@ void solvePhotometricStereo(
     cv::Mat& albedo,
     cv::Mat& residual,
     cv::Mat& validMask);
-cv::Mat integrateHeight(const cv::Mat& normalMap, const cv::Mat& validMask, int iterations);
+void solveUncalibratedPhotometricStereo(
+    const std::vector<cv::Mat>& images,
+    const cv::Mat& inputMask,
+    float shadowThreshold,
+    cv::Mat& normalMap,
+    cv::Mat& albedo,
+    cv::Mat& residual,
+    cv::Mat& validMask,
+    const std::function<void(const std::string&)>& progress = {});
+cv::Mat integrateHeight(
+    const cv::Mat& normalMap,
+    const cv::Mat& validMask,
+    int iterations,
+    const std::function<void(int, int)>& progress = {});
+void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask);

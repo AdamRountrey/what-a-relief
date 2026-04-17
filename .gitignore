@@ -1,11 +1,17 @@
 build/
 build-manual/
+build-ninja/
+build-*/
 build-vcpkg-manual/
 build-vcpkg-direct/
 .vcpkg-cache/
 .vcpkg-downloads/
 .vcpkg-registries/
 out/
+out_*/
+dist/
+*.pfm
+*.ply
 *.user
 *.suo
 .vs/
