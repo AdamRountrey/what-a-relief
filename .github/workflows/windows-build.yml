@@ -1,0 +1,77 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build Windows Installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Locate Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstall) {
+            throw "Visual Studio with C++ tools was not found."
+          }
+          "VSDEVCMD=$vsInstall\Common7\Tools\VsDevCmd.bat" >> $env:GITHUB_ENV
+          "CMAKE_EXE=$vsInstall\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" >> $env:GITHUB_ENV
+          "VCPKG_ROOT=$vsInstall\VC\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .vcpkg-cache
+            .vcpkg-downloads
+            .vcpkg-registries
+            build/ninja-vcpkg/vcpkg_installed
+          key: windows-vcpkg-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', 'CMakePresets.json') }}
+          restore-keys: |
+            windows-vcpkg-
+
+      - name: Build app and installer
+        shell: pwsh
+        run: |
+          $version = "0.1.0"
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME.StartsWith("v")) {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+          }
+          .\scripts\build-vcpkg-direct-msvc.ps1 -VsDevCmd "$env:VSDEVCMD" -CMake "$env:CMAKE_EXE"
+          .\scripts\package-vcpkg-runtime.ps1
+          .\scripts\build-windows-installer.ps1 -SkipBuild -Version $version
+          Compress-Archive -Path build-vcpkg-direct\* -DestinationPath "dist\What-A-Relief-$version-portable-windows.zip" -Force
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: What-A-Relief-Windows-${{ env.RELEASE_VERSION }}
+          path: |
+            dist/What-A-Relief-${{ env.RELEASE_VERSION }}-Setup.exe
+            dist/What-A-Relief-${{ env.RELEASE_VERSION }}-portable-windows.zip
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "dist\What-A-Relief-$env:RELEASE_VERSION-Setup.exe" `
+            "dist\What-A-Relief-$env:RELEASE_VERSION-portable-windows.zip" `
+            --title "What A Relief $env:GITHUB_REF_NAME" `
+            --notes "Windows installer and portable build for What A Relief."

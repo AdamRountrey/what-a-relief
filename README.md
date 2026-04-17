@@ -64,6 +64,8 @@ The installer is written to `dist\What-A-Relief-0.1.0-Setup.exe`. It installs un
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 
+GitHub Actions can also build the Windows installer. Run the **Windows Build** workflow manually to download the installer and portable ZIP as workflow artifacts, or push a version tag such as `v0.1.0` to publish those files on a GitHub Release.
+
 ## Run
 
 Use 3 to 25 images. All images must have the same dimensions. Calibrated mode needs the same highlight sphere visible in each image; uncalibrated mode can skip the sphere and should crop or mask to the surface region.
