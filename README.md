@@ -44,7 +44,7 @@ cmake -S . -B build -DOpenCV_DIR=C:/opencv/build/x64/vc16/lib
 cmake --build build --config Release
 ```
 
-The executable is `what-a-relief`.
+The executable target is `what-a-relief`; on Windows the direct build writes `build-vcpkg-direct\what-a-relief.exe`.
 
 ## Windows Installer
 
@@ -76,13 +76,12 @@ For the GUI workflow, run the packaged executable with no arguments:
 .\build-vcpkg-direct\what-a-relief.exe
 ```
 
-Select 3 to 25 images in the file picker, choose an output folder, then choose whether to use highlight-sphere calibration. If you use the sphere, mark it by clicking three points on its edge. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve.
-The program then asks whether to calculate the optional height preview, prints progress in the console, and shows a completion dialog when outputs are written. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`.
-The GUI can also open an interactive specular relight viewer after processing. Drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close.
-If height preview is enabled, the GUI can also export `surface.ply`, a 3D mesh made from the reconstructed height field.
+The setup window lets you choose the image set, output folder, lighting mode, optional previous `lights.csv` or `light_vectors.csv`, optional near-field ring-light geometry, normal solver, optional relief flattening, sRGB handling, height preview, PLY export, experimental diagnostics, and the interactive relight viewer before computation starts. If you use calibrated sphere mode, mark the sphere by clicking three points on its edge, or load a previous calibration CSV to skip sphere marking. For a previous near-field ring run, load the full `lights.csv` so the ring radius, height, and pixel scale are restored along with the light vectors. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve.
+
+The program prints progress in the console and shows a completion dialog when outputs are written. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, a 3D mesh made from the reconstructed height field.
 
 ```powershell
-.\build\Release\what-a-relief.exe `
+.\build-vcpkg-direct\what-a-relief.exe `
   --image capture_01.tif `
   --image capture_02.tif `
   --image capture_03.tif `
@@ -96,7 +95,7 @@ The first image opens in a picker window. Use the mouse wheel or `+`/`-` to zoom
 For repeat runs, use the sphere values written to `lights.csv`:
 
 ```powershell
-.\build\Release\what-a-relief.exe `
+.\build-vcpkg-direct\what-a-relief.exe `
   --image capture_01.tif `
   --image capture_02.tif `
   --image capture_03.tif `
@@ -117,9 +116,13 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `liquid_metal_custom.png`: optional render saved from the interactive relight viewer.
 - `height.png`: optional normalized height preview from integrating the normal-derived slopes.
 - `height.pfm`: optional floating-point relative height field. With no additional scale calibration, `x` and `y` are image pixels and `z` is a relative integrated height.
-- `surface.ply`: optional binary PLY 3D mesh exported from the height preview. Vertex `x` and `y` are image pixel coordinates, and `z` is the relative height preview multiplied by `--height-scale`.
+- `surface.ply`: optional binary PLY 3D mesh exported from the height preview. Vertex `x` and `y` are image pixel coordinates, `z` is the relative height preview multiplied by `--height-scale`, and vertex RGB color is grayscale albedo.
 - `residual.png`: normalized per-pixel root-mean-square fit error. Higher values can indicate specular highlights, shadows, saturation, registration errors, non-Lambertian behavior, or bad light estimates.
 - `valid_mask.png`: pixels included in the solve.
+- `robust_weight.png`: diagnostic map from the robust calibrated solver. Darker pixels had more downweighted observations.
+- `shadow_count.png`: diagnostic map showing how many images were below the shadow threshold at each solved pixel.
+- `highlight_outlier_count.png`: diagnostic map showing how many observations were rejected as high-intensity outliers.
+- `specular_cue_mask.png`: optional experimental mask of pixels that behaved like shiny or otherwise non-Lambertian outliers. It is a diagnostic, not a calibrated light estimate.
 
 ## Options
 
@@ -131,6 +134,13 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `--crop x y width height`: restrict the solve to a rectangular image region. Especially useful in uncalibrated mode.
 - `--sphere cx cy radius`: use a known sphere circle in image pixels and skip interactive sphere marking.
 - `--srgb`: convert typical JPEG/PNG sRGB intensities into linear light before solving.
+- `--solver standard|robust`: calibrated normal solver. `robust` is the default and uses highlight rejection plus Huber-style reweighting when enough observations are available.
+- `--high-outlier-threshold value`: normalized intensity cutoff for robust highlight/saturation rejection. Default: `0.98`.
+- `--near-field-ring radius height`: use a simple point-light ring model for calibrated solving. Radius and height are in millimeters.
+- `--pixel-scale-mm value`: pixel size in millimeters per pixel for near-field solving. Use `0` to auto-read supported TIFF physical scale tags.
+- `--specular-diagnostics`: write experimental shiny-cue diagnostics such as `specular_cue_mask.png`.
+- `--flatten none|gentle|strong`: optional low-frequency slope flattening before outputs are written. Default: `none`.
+- `--open-relight`: open the interactive specular relight viewer after GUI processing.
 - `--highlight-percentile value`: percentile used to find the specular highlight centroid inside the selected sphere. Default: `99.8`.
 - `--min-highlight value`: minimum highlight intensity after normalization. Default: `0.05`.
 - `--shadow-threshold value`: ignore observations darker than this value. Default: `0.02`.
@@ -139,7 +149,7 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `--mesh path.ply`: export a PLY mesh from the height preview. This forces height calculation.
 - `--mesh-step n`: export every nth pixel to reduce PLY size. Default: `1`.
 - `--height-scale value`: multiply mesh z coordinates. Default: `1.0`.
-- `--lights-file path`: skip sphere calibration and read known light vectors, one `x,y,z` row per image. Use a previous run's `light_vectors.csv` for batch processing.
+- `--lights-file path`: skip sphere calibration and read known light vectors. Use a previous run's full `lights.csv` to restore near-field ring metadata, or `light_vectors.csv` when only directional vectors are needed.
 - `--keep-sphere`: keep the calibration sphere in the solve mask. By default, the selected sphere is removed before solving sample normals.
 - `--view-dir x y z`: camera view vector used for mirror-sphere light calibration. Default: `0 0 1`.
 - `--no-gui`: disable interactive selection. Use with `--sphere`, `--lights-file`, or `--uncalibrated` for batch processing.
@@ -167,7 +177,13 @@ Use raw, TIFF, or other minimally processed images when possible. JPEGs can work
 
 The default input interpretation treats pixel values as already linear with intensity. For typical sRGB JPEG/PNG images, use `--srgb`; this applies a simple gamma-2.2 linearization rather than a full camera-profile correction. For scientific imaging, a linear, dark-corrected, consistently exposed stack is preferable.
 
-The calibrated normal solve is diffuse Lambertian. At each pixel it uses only observations above `--shadow-threshold` and requires at least 3 usable observations. Specular object pixels, deep shadows, saturation, interreflections, and misregistration will often show up as higher values in `residual.png`.
+The calibrated normal solve is diffuse Lambertian. At each pixel it uses only observations above `--shadow-threshold` and requires at least 3 usable observations. The default robust solver estimates a per-pixel high-outlier threshold from the local observation distribution, caps it with `--high-outlier-threshold`, rejects very bright observations when enough images remain, and downweights large residuals with a Huber-style iteratively reweighted fit. Specular object pixels, deep shadows, saturation, interreflections, and misregistration can still show up as higher values in `residual.png`.
+
+The default lighting model treats each image as a single directional light. `--near-field-ring` instead treats the calibrated light azimuths as point lights on a ring, using the given ring radius and light height in millimeters. The program keeps the ring geometry in millimeters and converts image pixel coordinates into millimeters using `--pixel-scale-mm`; if the value is `0`, it tries to read common TIFF physical scale tags from the first input image. This can better approximate close microscope ring lights, but it is still a geometric approximation unless the pixel scale and ring geometry match the actual optical setup.
+
+`--specular-diagnostics` is experimental. It writes a mask of pixels whose observations were rejected or strongly downweighted by the robust solver, which can help identify shiny scene features. The current application does not yet use those pixels to solve lighting directions.
+
+Optional relief flattening removes a broad low-frequency slope trend from the normal field so smaller surface features stand out. This is a visualization control, not calibrated metrological form removal; leave it off when large-scale curvature or tilt is part of the scientific question.
 
 Uncalibrated no-sphere mode is useful for visual relief enhancement when a highlight sphere is not available, but its normals, height, and PLY mesh are relative. The solver stabilizes the visual-relief slopes and removes a best-fit plane from the height preview, but the remaining unknown-lighting ambiguity can still stretch, shear, or rotate the recovered relief. Use sphere calibration when geometry needs to be physically meaningful.
 
@@ -183,8 +199,13 @@ This project stands on a long line of photometric stereo and shape-reconstructio
 
 - Robert J. Woodham introduced photometric stereo for estimating surface orientation from multiple images with fixed view and varying illumination: "Photometric Method for Determining Surface Orientation from Multiple Images," Optical Engineering 19(1), 139-144, 1980. DOI: https://doi.org/10.1117/12.7972479
 - Ronen Basri, David Jacobs, and Ira Kemelmacher developed photometric stereo under general unknown lighting, which informed the no-sphere experimental mode here: "Photometric Stereo with General, Unknown Lighting," International Journal of Computer Vision 72(3), 239-257, 2007. DOI: https://doi.org/10.1007/s11263-006-8815-7
+- Peter J. Huber's robust statistics work is the basis for the Huber-style reweighting used by the robust calibrated solver: "Robust Estimation of a Location Parameter," The Annals of Mathematical Statistics 35(1), 73-101, 1964. DOI: https://doi.org/10.1214/aoms/1177703732
+- Satoshi Ikehata, David Wipf, Yasuyuki Matsushita, and Kiyoharu Aizawa, and separately Lun Wu, Arvind Ganesh, Boxin Shi, Yasuyuki Matsushita, Yongtian Wang, and Yi Ma, provide important robust photometric-stereo references for treating shadows, specularities, and sparse corruptions. See `docs\references.bib` for full citations.
+- Tony Lindeberg's scale-space work and ISO 16610-61's areal Gaussian filtering standard are relevant background for the optional low-frequency relief-flattening control. This implementation is only a practical visualization filter.
 - Robert T. Frankot and Rama Chellappa's integrability work is part of the background for turning normal/slope fields into coherent surfaces: "A Method for Enforcing Integrability in Shape from Shading Algorithms," IEEE TPAMI 10(4), 439-451, 1988. DOI: https://doi.org/10.1109/34.3909
 - Tal Simchony, Rama Chellappa, and M. Shao's direct Poisson solvers using fast orthogonal transforms inspired the fast DCT/Poisson height preview: "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems," IEEE TPAMI 12(5), 435-446, 1990. DOI: https://doi.org/10.1109/34.55103
+
+Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing against Relight helped identify useful workflow ideas, especially explicit robust-normal and flattening controls. What A Relief does not include Relight source code. Relight is available at https://github.com/cnr-isti-vclab/relight, with software releases archived on Zenodo.
 
 The implementation uses OpenCV for image I/O, image processing, and GUI windows, and vcpkg/CMake to make the Windows OpenCV dependency reproducible.
 

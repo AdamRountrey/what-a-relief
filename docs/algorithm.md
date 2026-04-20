@@ -34,9 +34,33 @@ I_i = dot(L_i, g)
 g   = rho * n
 ```
 
-`L_i` is the light direction for image `i`, `rho` is a relative albedo or brightness scale, and `n` is the unit normal. The program solves `g` by least squares. Observations below `--shadow-threshold` are omitted so that shadowed images do not dominate the fit. A pixel must have at least 3 usable observations, the fitted normal must face the camera, and the resulting residual is stored as a root-mean-square intensity error.
+`L_i` is the light direction for image `i`, `rho` is a relative albedo or brightness scale, and `n` is the unit normal. The standard solver estimates `g` by least squares. Observations below `--shadow-threshold` are omitted so that shadowed images do not dominate the fit. A pixel must have at least 3 usable observations, the fitted normal must face the camera, and the resulting residual is stored as a root-mean-square intensity error.
+
+The default calibrated solver is a modest robust variant. It estimates a per-pixel high-outlier cutoff from the median and median absolute deviation of the usable observations, caps that cutoff with `--high-outlier-threshold`, omits very bright observations when enough other observations remain, then uses an iteratively reweighted least-squares pass with Huber-style residual weights. This is not the same as the larger sparse-regression or low-rank robust photometric-stereo methods in the literature, but it follows the same practical motivation: shadows, saturation, and specular highlights should not control a diffuse Lambertian normal estimate. When too few observations are available, it falls back to the direct least-squares fit.
+
+The robust solver also writes diagnostic maps for mean robust weight, shadow count, high-intensity outlier count, and, if requested, an experimental specular-cue mask. The mask identifies pixels whose observations behaved like shiny or otherwise non-Lambertian outliers. It is currently a review aid only; those pixels are not used as independent light-calibration constraints.
+
+## Near-Field Ring Lighting
+
+The standard calibrated solve uses one global light direction per image. This is appropriate when illumination is approximately directional at the sample scale. For close microscope or ring-light geometries, `--near-field-ring radius height` can instead treat each image as a point light on a ring. The sphere-derived or file-supplied light vector provides the azimuth of the light, while the user-provided radius and height define the point-light position in millimeters. Image pixel locations are converted into millimeters using `--pixel-scale-mm`, or by reading common TIFF physical scale tags when possible; the light positions themselves are not stored as image-pixel dimensions.
+
+For each solved pixel, the light vector is recomputed from the surface pixel to the corresponding point light:
+
+```text
+P = ((x - cx) * pixel_scale_mm, (cy - y) * pixel_scale_mm, 0)
+S = (radius_mm * cos(theta), radius_mm * sin(theta), height_mm)
+L = normalize(S - P)
+```
+
+This is an approximation. It can reduce systematic errors when the light is close, but it does not yet model lens perspective, true 3D sample height, LED size, falloff, or spatial illumination nonuniformity. TIFF metadata support currently covers common classic TIFF resolution tags and the GeoTIFF pixel-scale tag; when those are absent or ambiguous, enter the pixel scale manually.
 
 This direct solve supports 3 to 25 images. It does not use conventional RTI fitting because these captures usually have too few lighting samples for that style of spherical-harmonic reconstruction.
+
+## Relief Flattening
+
+Optional relief flattening removes a low-frequency slope trend from the normal field before writing the normal visualizations, relit image, optional height preview, and optional PLY mesh. The program converts normals to slopes, estimates a broad Gaussian low-pass version of those slopes inside the valid mask, subtracts a fraction of that low-frequency component, and converts the remaining slopes back to normals.
+
+The goal is visual: broad sample tilt or curvature can be reduced so smaller topographic features stand out without sharpening pixel-scale noise. This is best understood as scale separation, related to Gaussian scale-space filtering and surface-texture filtering practice, not as calibrated form removal for metrology. Leave this option off when the large-scale shape itself is scientifically important.
 
 ## Uncalibrated Unknown Lighting
 
@@ -65,7 +89,14 @@ If requested, the height preview can also be exported as a binary little-endian 
 
 - Woodham, R. J. "Photometric Method for Determining Surface Orientation from Multiple Images." Optical Engineering 19(1), 139-144, 1980. https://doi.org/10.1117/12.7972479
 - Basri, R., Jacobs, D. W., and Kemelmacher, I. "Photometric Stereo with General, Unknown Lighting." International Journal of Computer Vision 72(3), 239-257, 2007. https://doi.org/10.1007/s11263-006-8815-7
+- Huber, P. J. "Robust Estimation of a Location Parameter." The Annals of Mathematical Statistics 35(1), 73-101, 1964. https://doi.org/10.1214/aoms/1177703732
+- Ikehata, S., Wipf, D., Matsushita, Y., and Aizawa, K. "Robust Photometric Stereo Using Sparse Regression." CVPR 2012, 318-325. https://doi.org/10.1109/CVPR.2012.6247691
+- Wu, L., Ganesh, A., Shi, B., Matsushita, Y., Wang, Y., and Ma, Y. "Robust Photometric Stereo via Low-Rank Matrix Completion and Recovery." ACCV 2010, LNCS 6494, 703-717. https://doi.org/10.1007/978-3-642-19318-7_55
+- Lindeberg, T. "Scale-Space Theory in Computer Vision." Kluwer/Springer, 1994. https://doi.org/10.1007/978-1-4757-6465-9
+- ISO 16610-61:2015 specifies areal Gaussian filters for separating large- and small-scale surface components in surface texture work.
 - Frankot, R. T., and Chellappa, R. "A Method for Enforcing Integrability in Shape from Shading Algorithms." IEEE Transactions on Pattern Analysis and Machine Intelligence 10(4), 439-451, 1988. https://doi.org/10.1109/34.3909
 - Simchony, T., Chellappa, R., and Shao, M. "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems." IEEE Transactions on Pattern Analysis and Machine Intelligence 12(5), 435-446, 1990. https://doi.org/10.1109/34.55103
 
 The program also depends on OpenCV for image operations and windowing, and uses vcpkg/CMake to build OpenCV reproducibly on Windows.
+
+Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing What A Relief against Relight helped identify useful workflow ideas, such as explicit robust-normal and flattening controls. What A Relief does not include Relight source code.

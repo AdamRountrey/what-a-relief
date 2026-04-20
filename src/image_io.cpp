@@ -4,15 +4,19 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -35,6 +39,236 @@ bool insideSphere(const Sphere& sphere, int x, int y, double margin = 0.0) {
     const double dy = static_cast<double>(y) - sphere.cy;
     const double r = sphere.radius + margin;
     return dx * dx + dy * dy <= r * r;
+}
+
+std::string lowerAscii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+double imageDescriptionUnitMm(const std::string& description) {
+    const std::string lower = lowerAscii(description);
+    const size_t pos = lower.find("unit=");
+    if (pos == std::string::npos) {
+        return 0.0;
+    }
+    const std::string unit = lower.substr(pos + 5, 32);
+    if (unit.find("micron") != std::string::npos ||
+        unit.find("micrometer") != std::string::npos ||
+        unit.find("um") != std::string::npos) {
+        return 0.001;
+    }
+    if (unit.find("millimeter") != std::string::npos || unit.find("mm") != std::string::npos) {
+        return 1.0;
+    }
+    if (unit.find("nanometer") != std::string::npos || unit.find("nm") != std::string::npos) {
+        return 0.000001;
+    }
+    return 0.0;
+}
+
+double averagePositive(double a, double b) {
+    if (a > 0.0 && b > 0.0) {
+        return 0.5 * (a + b);
+    }
+    return a > 0.0 ? a : b;
+}
+
+class ClassicTiffReader {
+public:
+    explicit ClassicTiffReader(std::vector<std::uint8_t> bytesInput)
+        : bytes(std::move(bytesInput)) {
+        if (bytes.size() < 8) {
+            return;
+        }
+        if (bytes[0] == 'I' && bytes[1] == 'I') {
+            little = true;
+        } else if (bytes[0] == 'M' && bytes[1] == 'M') {
+            little = false;
+        } else {
+            return;
+        }
+        valid = readU16(2) == 42;
+    }
+
+    bool isValid() const {
+        return valid;
+    }
+
+    std::uint32_t firstIfdOffset() const {
+        return readU32(4);
+    }
+
+    std::uint16_t readU16(size_t offset) const {
+        if (offset + 2 > bytes.size()) {
+            return 0;
+        }
+        if (little) {
+            return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8));
+        }
+        return static_cast<std::uint16_t>((bytes[offset] << 8) | bytes[offset + 1]);
+    }
+
+    std::uint32_t readU32(size_t offset) const {
+        if (offset + 4 > bytes.size()) {
+            return 0;
+        }
+        if (little) {
+            return static_cast<std::uint32_t>(bytes[offset]) |
+                (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
+                (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) |
+                (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+        }
+        return (static_cast<std::uint32_t>(bytes[offset]) << 24) |
+            (static_cast<std::uint32_t>(bytes[offset + 1]) << 16) |
+            (static_cast<std::uint32_t>(bytes[offset + 2]) << 8) |
+            static_cast<std::uint32_t>(bytes[offset + 3]);
+    }
+
+    double readDouble(size_t offset) const {
+        if (offset + 8 > bytes.size()) {
+            return 0.0;
+        }
+        std::uint64_t raw = 0;
+        if (little) {
+            for (int i = 7; i >= 0; --i) {
+                raw = (raw << 8) | bytes[offset + static_cast<size_t>(i)];
+            }
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                raw = (raw << 8) | bytes[offset + static_cast<size_t>(i)];
+            }
+        }
+        double value = 0.0;
+        static_assert(sizeof(value) == sizeof(raw), "Unexpected double size");
+        std::memcpy(&value, &raw, sizeof(value));
+        return value;
+    }
+
+    double readRational(size_t offset) const {
+        const std::uint32_t numerator = readU32(offset);
+        const std::uint32_t denominator = readU32(offset + 4);
+        if (denominator == 0) {
+            return 0.0;
+        }
+        return static_cast<double>(numerator) / static_cast<double>(denominator);
+    }
+
+    const std::vector<std::uint8_t>& data() const {
+        return bytes;
+    }
+
+private:
+    std::vector<std::uint8_t> bytes;
+    bool little = true;
+    bool valid = false;
+};
+
+size_t tiffTypeSize(std::uint16_t type) {
+    switch (type) {
+    case 1:
+    case 2:
+        return 1;
+    case 3:
+        return 2;
+    case 4:
+    case 9:
+        return 4;
+    case 5:
+    case 10:
+    case 12:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+size_t tiffEntryValueOffset(const ClassicTiffReader& reader, size_t entry, std::uint16_t type, std::uint32_t count) {
+    const size_t total = tiffTypeSize(type) * static_cast<size_t>(count);
+    if (total == 0) {
+        return 0;
+    }
+    if (total <= 4) {
+        return entry + 8;
+    }
+    return reader.readU32(entry + 8);
+}
+
+double readClassicTiffPixelScaleMm(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return 0.0;
+    }
+    std::vector<std::uint8_t> bytes(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+    ClassicTiffReader reader(std::move(bytes));
+    if (!reader.isValid()) {
+        return 0.0;
+    }
+
+    const size_t ifd = reader.firstIfdOffset();
+    if (ifd + 2 > reader.data().size()) {
+        return 0.0;
+    }
+    const std::uint16_t entries = reader.readU16(ifd);
+    double xResolution = 0.0;
+    double yResolution = 0.0;
+    double modelScaleX = 0.0;
+    double modelScaleY = 0.0;
+    int resolutionUnit = 0;
+    std::string imageDescription;
+
+    for (std::uint16_t i = 0; i < entries; ++i) {
+        const size_t entry = ifd + 2 + static_cast<size_t>(i) * 12;
+        if (entry + 12 > reader.data().size()) {
+            break;
+        }
+        const std::uint16_t tag = reader.readU16(entry);
+        const std::uint16_t type = reader.readU16(entry + 2);
+        const std::uint32_t count = reader.readU32(entry + 4);
+        const size_t valueOffset = tiffEntryValueOffset(reader, entry, type, count);
+        if (valueOffset == 0 || valueOffset >= reader.data().size()) {
+            continue;
+        }
+        if (tag == 282 && type == 5 && count >= 1) {
+            xResolution = reader.readRational(valueOffset);
+        } else if (tag == 283 && type == 5 && count >= 1) {
+            yResolution = reader.readRational(valueOffset);
+        } else if (tag == 296 && type == 3 && count >= 1) {
+            resolutionUnit = reader.readU16(valueOffset);
+        } else if (tag == 270 && type == 2 && count > 0) {
+            const size_t readable = std::min(static_cast<size_t>(count), reader.data().size() - valueOffset);
+            imageDescription.assign(
+                reinterpret_cast<const char*>(reader.data().data() + valueOffset),
+                readable);
+        } else if (tag == 33550 && type == 12 && count >= 2) {
+            modelScaleX = reader.readDouble(valueOffset);
+            modelScaleY = reader.readDouble(valueOffset + 8);
+        }
+    }
+
+    const double averageResolution = averagePositive(xResolution, yResolution);
+    if (averageResolution > 0.0) {
+        if (resolutionUnit == 2) {
+            return 25.4 / averageResolution;
+        }
+        if (resolutionUnit == 3) {
+            return 10.0 / averageResolution;
+        }
+        const double descriptionUnitMm = imageDescriptionUnitMm(imageDescription);
+        if (descriptionUnitMm > 0.0) {
+            return descriptionUnitMm / averageResolution;
+        }
+    }
+
+    const double modelScale = averagePositive(modelScaleX, modelScaleY);
+    if (modelScale > 0.0 && std::isfinite(modelScale)) {
+        return modelScale;
+    }
+    return 0.0;
 }
 
 cv::Mat toFloatLuminance(const cv::Mat& input, bool srgb) {
@@ -239,6 +473,58 @@ cv::Mat maskedGaussianBlurVec3(const cv::Mat& src, const cv::Mat& mask, double s
     return out;
 }
 
+float maskedColorLuminancePercentile(const cv::Mat& image, const cv::Mat& mask, float percentileValue) {
+    std::vector<float> values;
+    values.reserve(static_cast<size_t>(image.rows * image.cols / 4));
+    for (int y = 0; y < image.rows; ++y) {
+        const cv::Vec3b* row = image.ptr<cv::Vec3b>(y);
+        const uchar* mrow = mask.ptr<uchar>(y);
+        for (int x = 0; x < image.cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            const cv::Vec3b bgr = row[x];
+            values.push_back(0.0722f * static_cast<float>(bgr[0]) +
+                0.7152f * static_cast<float>(bgr[1]) +
+                0.2126f * static_cast<float>(bgr[2]));
+        }
+    }
+    if (values.empty()) {
+        return 0.0f;
+    }
+    const size_t index = static_cast<size_t>(
+        std::clamp(percentileValue, 0.0f, 1.0f) * static_cast<float>(values.size() - 1));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(index), values.end());
+    return values[index];
+}
+
+cv::Mat stretchColorByMaskedLuminance(const cv::Mat& image, const cv::Mat& mask) {
+    const float low = maskedColorLuminancePercentile(image, mask, 0.01f);
+    const float high = maskedColorLuminancePercentile(image, mask, 0.992f);
+    if (high - low < 8.0f) {
+        return image;
+    }
+
+    const float outLow = 6.0f;
+    const float outHigh = 248.0f;
+    const float scale = (outHigh - outLow) / (high - low);
+    cv::Mat stretched = image.clone();
+    for (int y = 0; y < image.rows; ++y) {
+        const uchar* mrow = mask.ptr<uchar>(y);
+        cv::Vec3b* row = stretched.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < image.cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            for (int c = 0; c < 3; ++c) {
+                const float v = (static_cast<float>(row[x][c]) - low) * scale + outLow;
+                row[x][c] = static_cast<uchar>(std::clamp(v, 0.0f, 255.0f));
+            }
+        }
+    }
+    return stretched;
+}
+
 cv::Mat liquidMetalTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
     cv::Mat smoothNormals = maskedGaussianBlurVec3(normalMap, mask, 0.45);
     const cv::Vec3f view(0.0f, 0.0f, 1.0f);
@@ -291,7 +577,7 @@ cv::Mat liquidMetalTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
                 static_cast<uchar>(std::clamp(rgb[0] * 255.0f, 0.0f, 255.0f)));
         }
     }
-    return out;
+    return stretchColorByMaskedLuminance(out, mask);
 }
 
 void writePfm(const fs::path& path, const cv::Mat& image, const cv::Mat& mask) {
@@ -327,6 +613,12 @@ void writeLightsCsv(
             out << '"' << imagePath << '"' << '\n';
         }
         return;
+    }
+    out << "lighting_model," << (opt.lightingModel == LightingModel::NearFieldRing ? "near_field_ring" : "directional") << "\n";
+    if (opt.lightingModel == LightingModel::NearFieldRing) {
+        out << "ring_light_radius_mm," << opt.ringLightRadiusMm << "\n";
+        out << "ring_light_height_mm," << opt.ringLightHeightMm << "\n";
+        out << "pixel_scale_mm_per_pixel," << opt.pixelScaleMm << "\n";
     }
     out << "sphere_cx," << opt.sphere.cx << "\n";
     out << "sphere_cy," << opt.sphere.cy << "\n";
@@ -366,6 +658,7 @@ void writePlyMesh(
     const fs::path& path,
     const cv::Mat& height,
     const cv::Mat& mask,
+    const cv::Mat& vertexColor,
     int step,
     double heightScale,
     const std::function<void(const std::string&)>& progress) {
@@ -418,6 +711,9 @@ void writePlyMesh(
     out << "property float x\n";
     out << "property float y\n";
     out << "property float z\n";
+    out << "property uchar red\n";
+    out << "property uchar green\n";
+    out << "property uchar blue\n";
     out << "element face " << faceCount << "\n";
     out << "property list uchar int vertex_indices\n";
     out << "end_header\n";
@@ -426,14 +722,19 @@ void writePlyMesh(
     for (int y = 0; y < rows; y += step) {
         const float* hrow = height.ptr<float>(y);
         const int* irow = index.ptr<int>(y);
+        const uchar* colorRow = vertexColor.empty() ? nullptr : vertexColor.ptr<uchar>(y);
         for (int x = 0; x < cols; x += step) {
             if (irow[x] >= 0) {
                 const float vx = static_cast<float>(x);
                 const float vy = static_cast<float>(-y);
                 const float vz = static_cast<float>(static_cast<double>(hrow[x]) * heightScale);
+                const std::uint8_t color = colorRow == nullptr ? 200 : colorRow[x];
                 out.write(reinterpret_cast<const char*>(&vx), sizeof(vx));
                 out.write(reinterpret_cast<const char*>(&vy), sizeof(vy));
                 out.write(reinterpret_cast<const char*>(&vz), sizeof(vz));
+                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
             }
         }
     }
@@ -480,6 +781,14 @@ void writePlyMesh(
 }
 
 } // namespace
+
+double readPixelScaleMmFromImage(const std::string& path) {
+    const std::string ext = lowerAscii(fs::path(path).extension().string());
+    if (ext == ".tif" || ext == ".tiff") {
+        return readClassicTiffPixelScaleMm(path);
+    }
+    return 0.0;
+}
 
 std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, bool srgb) {
     std::vector<cv::Mat> images;
@@ -576,6 +885,7 @@ void saveOutputs(
     const cv::Mat& albedo,
     const cv::Mat& residual,
     const cv::Mat& validMask,
+    const PhotometricDiagnostics& diagnostics,
     const cv::Mat& height,
     const std::function<void(const std::string&)>& progress) {
     const fs::path outDir = opt.outputDir;
@@ -584,20 +894,29 @@ void saveOutputs(
     writeLightsCsv(outDir / "lights.csv", opt, lights, estimates);
     writeLightVectorsCsv(outDir / "light_vectors.csv", lights);
     reportProgress(progress, "Writing image outputs...");
+    const cv::Mat albedo8 = normalizeFloatTo8U(albedo, validMask, true);
     cv::imwrite((outDir / "normal_rgb.png").string(), normalRgbTo8U(normalMap, validMask));
     cv::imwrite((outDir / "normal_x.png").string(), normalComponentTo8U(normalMap, validMask, 0, true));
     cv::imwrite((outDir / "normal_y.png").string(), normalComponentTo8U(normalMap, validMask, 1, true));
     cv::imwrite((outDir / "normal_z.png").string(), normalComponentTo8U(normalMap, validMask, 2, false));
-    cv::imwrite((outDir / "albedo.png").string(), normalizeFloatTo8U(albedo, validMask, true));
+    cv::imwrite((outDir / "albedo.png").string(), albedo8);
     cv::imwrite((outDir / "residual.png").string(), normalizeFloatTo8U(residual, validMask, true));
     cv::imwrite((outDir / "valid_mask.png").string(), validMask);
     cv::imwrite((outDir / "liquid_metal.png").string(), liquidMetalTo8U(normalMap, validMask));
+    if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustWeight.empty()) {
+        cv::imwrite((outDir / "robust_weight.png").string(), normalizeFloatTo8U(diagnostics.robustWeight, validMask, true));
+        cv::imwrite((outDir / "shadow_count.png").string(), normalizeFloatTo8U(diagnostics.shadowCount, validMask, true));
+        cv::imwrite((outDir / "highlight_outlier_count.png").string(), normalizeFloatTo8U(diagnostics.highlightOutlierCount, validMask, true));
+    }
+    if (opt.specularDiagnostics && !diagnostics.specularCueMask.empty()) {
+        cv::imwrite((outDir / "specular_cue_mask.png").string(), diagnostics.specularCueMask);
+    }
     if (!height.empty()) {
         reportProgress(progress, "Writing height outputs...");
         cv::imwrite((outDir / "height.png").string(), normalizeFloatTo8U(height, validMask, false));
         writePfm(outDir / "height.pfm", height, validMask);
         if (!opt.meshPath.empty()) {
-            writePlyMesh(opt.meshPath, height, validMask, opt.meshStep, opt.heightScale, progress);
+            writePlyMesh(opt.meshPath, height, validMask, albedo8, opt.meshStep, opt.heightScale, progress);
         }
     }
 }

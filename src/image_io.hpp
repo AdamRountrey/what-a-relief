@@ -10,6 +10,7 @@
 #include <vector>
 
 std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, bool srgb);
+double readPixelScaleMmFromImage(const std::string& path);
 cv::Mat loadDisplayImage(const std::string& path);
 cv::Mat loadMask(const std::string& path, const cv::Size& size);
 void applyCropToMask(cv::Mat& mask, const cv::Rect& crop);
@@ -22,5 +23,6 @@ void saveOutputs(
     const cv::Mat& albedo,
     const cv::Mat& residual,
     const cv::Mat& validMask,
+    const PhotometricDiagnostics& diagnostics,
     const cv::Mat& height,
     const std::function<void(const std::string&)>& progress = {});

@@ -87,7 +87,7 @@ cl /nologo /std:c++17 /EHsc /W4 /permissive- /external:W0 /external:I"$build\vcp
   "$repo\src\args.cpp" "$repo\src\crop_ui.cpp" "$repo\src\gui_workflow.cpp" "$repo\src\image_io.cpp" "$repo\src\main.cpp" "$repo\src\photometric.cpp" "$repo\src\relight_ui.cpp" "$repo\src\sphere_ui.cpp" ^
   /Fe:"$out\what-a-relief.exe" /Fo:"$obj\\" ^
   /link /MANIFEST:NO /LIBPATH:"$build\vcpkg_installed\x64-windows\lib" ^
-  opencv_highgui4.lib opencv_videoio4.lib opencv_imgcodecs4.lib opencv_imgproc4.lib opencv_core4.lib comdlg32.lib shell32.lib ole32.lib user32.lib
+  opencv_highgui4.lib opencv_videoio4.lib opencv_imgcodecs4.lib opencv_imgproc4.lib opencv_core4.lib comdlg32.lib shell32.lib ole32.lib user32.lib gdi32.lib
 if errorlevel 1 exit /b %errorlevel%
 "@
 

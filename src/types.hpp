@@ -11,6 +11,22 @@ struct Sphere {
     double radius = 0.0;
 };
 
+enum class NormalSolverMode {
+    Standard,
+    Robust
+};
+
+enum class FlattenMode {
+    None,
+    Gentle,
+    Strong
+};
+
+enum class LightingModel {
+    Directional,
+    NearFieldRing
+};
+
 struct Options {
     std::vector<std::string> imagePaths;
     std::string outputDir = "out";
@@ -27,13 +43,29 @@ struct Options {
     bool keepSphere = false;
     bool uncalibratedLighting = false;
     bool calculateHeight = true;
+    bool openRelightViewer = false;
+    bool specularDiagnostics = false;
+    NormalSolverMode solverMode = NormalSolverMode::Robust;
+    FlattenMode flattenMode = FlattenMode::None;
+    LightingModel lightingModel = LightingModel::Directional;
     double highlightPercentile = 99.8;
     double minHighlight = 0.05;
     double shadowThreshold = 0.02;
+    double highOutlierThreshold = 0.98;
+    double ringLightRadiusMm = 10.0;
+    double ringLightHeightMm = 10.0;
+    double pixelScaleMm = 0.0;
     int integrationIterations = 800;
     int meshStep = 1;
     double heightScale = 1.0;
     cv::Vec3f viewDir = cv::Vec3f(0.0f, 0.0f, 1.0f);
+};
+
+struct PhotometricDiagnostics {
+    cv::Mat robustWeight;
+    cv::Mat shadowCount;
+    cv::Mat highlightOutlierCount;
+    cv::Mat specularCueMask;
 };
 
 struct HighlightEstimate {

@@ -45,6 +45,29 @@ int parseInt(const std::string& s, const std::string& label) {
     }
 }
 
+NormalSolverMode parseSolverMode(const std::string& s) {
+    if (s == "standard" || s == "least-squares" || s == "ls") {
+        return NormalSolverMode::Standard;
+    }
+    if (s == "robust" || s == "irls") {
+        return NormalSolverMode::Robust;
+    }
+    die("Invalid solver mode: " + s + " (use standard or robust)");
+}
+
+FlattenMode parseFlattenMode(const std::string& s) {
+    if (s == "none" || s == "off") {
+        return FlattenMode::None;
+    }
+    if (s == "gentle" || s == "light") {
+        return FlattenMode::Gentle;
+    }
+    if (s == "strong") {
+        return FlattenMode::Strong;
+    }
+    die("Invalid flatten mode: " + s + " (use none, gentle, or strong)");
+}
+
 } // namespace
 
 void printUsage() {
@@ -68,6 +91,13 @@ void printUsage() {
         << "  --lights-file path           CSV/text file with one x,y,z light vector per image.\n"
         << "  --no-gui                     Disable interactive selection. Requires --sphere, --lights-file, or --uncalibrated.\n"
         << "  --srgb                       Linearize sRGB image intensities.\n"
+        << "  --solver standard|robust     Calibrated normal solve. Default: robust\n"
+        << "  --high-outlier-threshold v   Robust solve highlight/saturation cutoff. Default: 0.98\n"
+        << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
+        << "  --pixel-scale-mm s           Pixel size in mm/pixel for near-field solving; 0 auto-reads TIFF tags.\n"
+        << "  --specular-diagnostics       Write experimental shiny-cue and robust outlier diagnostic maps.\n"
+        << "  --flatten none|gentle|strong Remove low-frequency slope trend before output. Default: none\n"
+        << "  --open-relight               Open the interactive relight viewer after GUI processing.\n"
         << "  --highlight-percentile p     Bright percentile inside sphere. Default: 99.8\n"
         << "  --min-highlight v            Minimum highlight intensity. Default: 0.05\n"
         << "  --shadow-threshold v         Per-observation shadow cutoff. Default: 0.02\n"
@@ -132,6 +162,27 @@ Options parseArgs(int argc, char** argv) {
             opt.noGui = true;
         } else if (arg == "--srgb") {
             opt.srgb = true;
+        } else if (arg == "--solver") {
+            need(1);
+            opt.solverMode = parseSolverMode(argv[++i]);
+        } else if (arg == "--high-outlier-threshold") {
+            need(1);
+            opt.highOutlierThreshold = parseDouble(argv[++i], "high outlier threshold");
+        } else if (arg == "--near-field-ring") {
+            need(2);
+            opt.lightingModel = LightingModel::NearFieldRing;
+            opt.ringLightRadiusMm = parseDouble(argv[++i], "ring light radius");
+            opt.ringLightHeightMm = parseDouble(argv[++i], "ring light height");
+        } else if (arg == "--pixel-scale-mm") {
+            need(1);
+            opt.pixelScaleMm = parseDouble(argv[++i], "pixel scale");
+        } else if (arg == "--specular-diagnostics") {
+            opt.specularDiagnostics = true;
+        } else if (arg == "--flatten") {
+            need(1);
+            opt.flattenMode = parseFlattenMode(argv[++i]);
+        } else if (arg == "--open-relight") {
+            opt.openRelightViewer = true;
         } else if (arg == "--keep-sphere") {
             opt.keepSphere = true;
         } else if (arg == "--highlight-percentile") {
@@ -192,6 +243,23 @@ Options parseArgs(int argc, char** argv) {
     }
     if (opt.highlightPercentile <= 0.0 || opt.highlightPercentile >= 100.0) {
         die("--highlight-percentile must be between 0 and 100.");
+    }
+    if (!std::isfinite(opt.highOutlierThreshold) ||
+        opt.highOutlierThreshold <= opt.shadowThreshold ||
+        opt.highOutlierThreshold > 1.0) {
+        die("--high-outlier-threshold must be above --shadow-threshold and no more than 1.0.");
+    }
+    if (opt.lightingModel == LightingModel::NearFieldRing) {
+        if (opt.uncalibratedLighting) {
+            die("--near-field-ring cannot be combined with --uncalibrated.");
+        }
+        if (!std::isfinite(opt.ringLightRadiusMm) || opt.ringLightRadiusMm <= 0.0 ||
+            !std::isfinite(opt.ringLightHeightMm) || opt.ringLightHeightMm <= 0.0) {
+            die("--near-field-ring radius and height must be positive finite values.");
+        }
+        if (!std::isfinite(opt.pixelScaleMm) || opt.pixelScaleMm < 0.0) {
+            die("--pixel-scale-mm must be positive, or 0 to auto-read TIFF tags.");
+        }
     }
     if (opt.integrationIterations < 0) {
         die("--integration-iterations must be non-negative.");

@@ -29,7 +29,7 @@ add_executable(what-a-relief
 
 target_link_libraries(what-a-relief PRIVATE ${OpenCV_LIBS})
 if(WIN32)
-    target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32)
+    target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32 gdi32)
 endif()
 target_compile_features(what-a-relief PRIVATE cxx_std_17)
 
