@@ -31,7 +31,7 @@ constexpr size_t kMaxImages = 25;
 #ifdef _WIN32
 
 constexpr int kWindowWidth = 700;
-constexpr int kWindowHeight = 820;
+constexpr int kWindowHeight = 860;
 constexpr int kMargin = 20;
 constexpr int kLabelWidth = 150;
 constexpr int kControlX = 180;
@@ -64,6 +64,7 @@ constexpr int kIdPixelScale = 1022;
 constexpr int kIdSelectLights = 1023;
 constexpr int kIdLightsStatus = 1024;
 constexpr int kIdClearLights = 1025;
+constexpr int kIdNeuralFusion = 1026;
 
 struct SetupDialogState {
     Options* opt = nullptr;
@@ -89,6 +90,7 @@ struct SetupDialogState {
     HWND meshCheck = nullptr;
     HWND relightCheck = nullptr;
     HWND specularDiagnosticsCheck = nullptr;
+    HWND neuralFusionCheck = nullptr;
 };
 
 std::vector<std::string> parseMultiSelectBuffer(const char* buffer) {
@@ -296,6 +298,14 @@ void updateSetupControls(SetupDialogState& state) {
     EnableWindow(state.cropButton, !calibrated);
     EnableWindow(state.solverCombo, calibrated);
     EnableWindow(state.nearFieldCheck, calibrated);
+    const bool supportsNeuralFusion = calibrated &&
+        state.opt->imagePaths.size() >= kMinImages &&
+        state.opt->imagePaths.size() <= kMaxImages;
+    EnableWindow(state.neuralFusionCheck, supportsNeuralFusion);
+    if (!supportsNeuralFusion) {
+        setButtonChecked(state.neuralFusionCheck, false);
+        state.opt->neuralFusion = false;
+    }
     const bool nearField = calibrated && buttonChecked(state.nearFieldCheck);
     EnableWindow(state.ringRadiusEdit, nearField);
     EnableWindow(state.ringHeightEdit, nearField);
@@ -410,6 +420,15 @@ bool validateAndAccept(SetupDialogState& state) {
         showOwnerMessage(state.hwnd, "Setup", "Uncalibrated no-sphere mode requires at least 4 images.", MB_ICONWARNING);
         return false;
     }
+    if (!opt.uncalibratedLighting && buttonChecked(state.neuralFusionCheck) &&
+        (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxImages)) {
+        showOwnerMessage(
+            state.hwnd,
+            "Setup",
+            "Experimental neural fusion currently supports 3 to 25 calibrated images.",
+            MB_ICONWARNING);
+        return false;
+    }
     if (!opt.uncalibratedLighting && opt.lightsFile.empty() && !opt.hasSphere) {
         const int answer = MessageBoxA(
             state.hwnd,
@@ -480,6 +499,15 @@ bool validateAndAccept(SetupDialogState& state) {
     }
     opt.openRelightViewer = buttonChecked(state.relightCheck);
     opt.specularDiagnostics = buttonChecked(state.specularDiagnosticsCheck);
+    opt.neuralFusion = buttonChecked(state.neuralFusionCheck);
+    if (opt.neuralFusion) {
+        showOwnerMessage(
+            state.hwnd,
+            "Neural Fusion Height Note",
+            "Experimental neural fusion only affects the normal-map style outputs.\n\n"
+            "Height preview and PLY mesh stay on the classical geometry path to avoid exaggerated shape.",
+            MB_ICONINFORMATION);
+    }
     return true;
 }
 
@@ -573,6 +601,9 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     y += 30;
     state.specularDiagnosticsCheck = makeControl(hwnd, "BUTTON", "Write experimental specular-cue diagnostics", BS_AUTOCHECKBOX, kIdSpecularDiagnostics, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.specularDiagnosticsCheck, state.opt->specularDiagnostics);
+    y += 30;
+    state.neuralFusionCheck = makeControl(hwnd, "BUTTON", "Experimental: PS-FCN neural prior + fusion (3 to 25 calibrated images)", BS_AUTOCHECKBOX, kIdNeuralFusion, kControlX, y, kControlWidth, 24);
+    setButtonChecked(state.neuralFusionCheck, state.opt->neuralFusion);
     y += 30;
     state.relightCheck = makeControl(hwnd, "BUTTON", "Open interactive relight viewer after processing", BS_AUTOCHECKBOX, kIdRelight, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.relightCheck, state.opt->openRelightViewer);

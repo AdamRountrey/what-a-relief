@@ -1,6 +1,7 @@
 #include "args.hpp"
 #include "gui_workflow.hpp"
 #include "image_io.hpp"
+#include "neural_fusion.hpp"
 #include "photometric.hpp"
 #include "relight_ui.hpp"
 #include "sphere_ui.hpp"
@@ -86,6 +87,8 @@ void runPhotometricStereo(Options& opt) {
     cv::Mat albedo;
     cv::Mat residual;
     cv::Mat validMask;
+    cv::Mat geometryNormalMap;
+    cv::Mat geometryValidMask;
     PhotometricDiagnostics diagnostics;
     if (opt.uncalibratedLighting) {
         solveUncalibratedPhotometricStereo(
@@ -130,27 +133,46 @@ void runPhotometricStereo(Options& opt) {
             residual,
             validMask,
             diagnostics);
+        geometryNormalMap = normalMap.clone();
+        geometryValidMask = validMask.clone();
+
+        if (opt.neuralFusion) {
+            logStage("[5.5/6] Running experimental PS-FCN neural fusion...");
+            std::cout << "      note: neural fusion changes the normal-map outputs only; height preview and PLY stay classical to avoid exaggerated geometry." << std::endl;
+            applyNeuralFusion(
+                opt,
+                images,
+                lights,
+                mask,
+                lightingCenter,
+                normalMap,
+                albedo,
+                residual,
+                validMask,
+                diagnostics);
+        }
     }
 
     if (opt.flattenMode != FlattenMode::None) {
         logStage("      applying low-frequency relief flattening");
         flattenNormalField(normalMap, validMask, opt.flattenMode);
+        if (!geometryNormalMap.empty()) {
+            flattenNormalField(geometryNormalMap, geometryValidMask, opt.flattenMode);
+        }
     }
 
     cv::Mat height;
     if (opt.calculateHeight) {
         logStage("[6/6] Solving DCT/Poisson height preview...");
         height = integrateHeight(
-            normalMap,
-            validMask,
+            geometryNormalMap.empty() ? normalMap : geometryNormalMap,
+            geometryValidMask.empty() ? validMask : geometryValidMask,
             opt.integrationIterations,
             [](int done, int total) {
                 std::cout << "      height solve " << done << "/" << total << std::endl;
             });
-        if (opt.uncalibratedLighting) {
-            std::cout << "      removing uncalibrated height tilt" << std::endl;
-            removeBestFitPlane(height, validMask);
-        }
+        std::cout << "      removing best-fit plane from height preview" << std::endl;
+        removeBestFitPlane(height, geometryValidMask.empty() ? validMask : geometryValidMask);
         if (!opt.meshPath.empty()) {
             std::cout << "      PLY mesh will be written to: " << opt.meshPath << std::endl;
         }

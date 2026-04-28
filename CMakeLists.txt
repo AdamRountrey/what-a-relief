@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc highgui)
+find_package(OpenCV REQUIRED COMPONENTS core dnn imgcodecs imgproc highgui)
 
 if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
     message(FATAL_ERROR
@@ -23,6 +23,7 @@ add_executable(what-a-relief
     src/gui_workflow.cpp
     src/image_io.cpp
     src/main.cpp
+    src/neural_fusion.cpp
     src/photometric.cpp
     src/relight_ui.cpp
     src/sphere_ui.cpp)
@@ -32,6 +33,12 @@ if(WIN32)
     target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32 gdi32)
 endif()
 target_compile_features(what-a-relief PRIVATE cxx_std_17)
+
+add_custom_command(TARGET what-a-relief POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:what-a-relief>/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/models"
+        "$<TARGET_FILE_DIR:what-a-relief>/models")
 
 if(MSVC)
     target_compile_options(what-a-relief PRIVATE /W4 /permissive-)

@@ -96,6 +96,10 @@ void printUsage() {
         << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
         << "  --pixel-scale-mm s           Pixel size in mm/pixel for near-field solving; 0 auto-reads TIFF tags.\n"
         << "  --specular-diagnostics       Write experimental shiny-cue and robust outlier diagnostic maps.\n"
+        << "  --neural-fusion             Run bundled PS-FCN neural normal prior and fuse it with the classical solve.\n"
+        << "                               Experimental; calibrated mode only, supports 3 to 25 images.\n"
+        << "                               Height/PLY remain classical-only to avoid exaggerated geometry.\n"
+        << "  --neural-model path         Override bundled PS-FCN ONNX model path, or point at a model directory.\n"
         << "  --flatten none|gentle|strong Remove low-frequency slope trend before output. Default: none\n"
         << "  --open-relight               Open the interactive relight viewer after GUI processing.\n"
         << "  --highlight-percentile p     Bright percentile inside sphere. Default: 99.8\n"
@@ -178,6 +182,11 @@ Options parseArgs(int argc, char** argv) {
             opt.pixelScaleMm = parseDouble(argv[++i], "pixel scale");
         } else if (arg == "--specular-diagnostics") {
             opt.specularDiagnostics = true;
+        } else if (arg == "--neural-fusion") {
+            opt.neuralFusion = true;
+        } else if (arg == "--neural-model") {
+            need(1);
+            opt.neuralModelPath = argv[++i];
         } else if (arg == "--flatten") {
             need(1);
             opt.flattenMode = parseFlattenMode(argv[++i]);
@@ -234,6 +243,15 @@ Options parseArgs(int argc, char** argv) {
     }
     if (opt.uncalibratedLighting && (!opt.guiMode || !opt.imagePaths.empty()) && opt.imagePaths.size() < 4) {
         die("--uncalibrated requires at least 4 images.");
+    }
+    if (opt.neuralFusion) {
+        if (opt.uncalibratedLighting) {
+            die("--neural-fusion cannot be combined with --uncalibrated.");
+        }
+        if ((!opt.guiMode || !opt.imagePaths.empty()) &&
+            (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxImages)) {
+            die("--neural-fusion supports 3 to 25 images.");
+        }
     }
     if (opt.hasCrop && (opt.crop.width <= 0 || opt.crop.height <= 0)) {
         die("--crop width and height must be positive.");

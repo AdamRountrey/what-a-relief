@@ -96,6 +96,9 @@ Copy-Item -LiteralPath (Join-Path $repo "SECURITY.md") -Destination $payload -Fo
 Copy-Item -LiteralPath (Join-Path $repo "AI_ATTRIBUTION.md") -Destination $payload -Force
 Copy-Item -LiteralPath (Join-Path $repo "THIRD_PARTY_NOTICES.md") -Destination $payload -Force
 Copy-Item -LiteralPath (Join-Path $repo "docs\algorithm.md") -Destination (Join-Path $payload "ALGORITHM.md") -Force
+if (Test-Path (Join-Path $buildOut "models")) {
+    Copy-Item -LiteralPath (Join-Path $buildOut "models") -Destination (Join-Path $payload "models") -Recurse -Force
+}
 Write-ThirdPartyLicenseBundle -OutputPath (Join-Path $payload "THIRD_PARTY_LICENSES.txt") -ShareDir $share
 
 $payloadFiles = @(Get-ChildItem -LiteralPath $payload -File | Sort-Object Name)
@@ -217,11 +220,18 @@ internal static class InstallerStub {
         Directory.CreateDirectory(installDir);
         Directory.CreateDirectory(startMenuDir);
 
-        foreach (string file in Directory.GetFiles(tempDir)) {
-            if (string.Equals(Path.GetFileName(file), "payload.cab", StringComparison.OrdinalIgnoreCase)) {
+        foreach (string sourcePath in Directory.GetFileSystemEntries(tempDir)) {
+            string name = Path.GetFileName(sourcePath);
+            if (string.Equals(name, "payload.cab", StringComparison.OrdinalIgnoreCase)) {
                 continue;
             }
-            File.Copy(file, Path.Combine(installDir, Path.GetFileName(file)), true);
+
+            string destinationPath = Path.Combine(installDir, name);
+            if (Directory.Exists(sourcePath)) {
+                CopyDirectory(sourcePath, destinationPath);
+            } else {
+                File.Copy(sourcePath, destinationPath, true);
+            }
         }
 
         WriteUninstaller(installDir, startMenuDir);
@@ -259,6 +269,20 @@ Start-Process -FilePath `$env:ComSpec -ArgumentList `$cmd -WindowStyle Hidden
         shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
         Marshal.FinalReleaseComObject(shortcut);
         Marshal.FinalReleaseComObject(shell);
+    }
+
+    private static void CopyDirectory(string sourceDir, string destinationDir) {
+        Directory.CreateDirectory(destinationDir);
+        foreach (string directory in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories)) {
+            string relative = directory.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            Directory.CreateDirectory(Path.Combine(destinationDir, relative));
+        }
+        foreach (string file in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories)) {
+            string relative = file.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string outPath = Path.Combine(destinationDir, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+            File.Copy(file, outPath, true);
+        }
     }
 
     private static void RegisterUninstall(string installDir) {

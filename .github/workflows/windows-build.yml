@@ -55,6 +55,12 @@ jobs:
           .\scripts\build-windows-installer.ps1 -SkipBuild -Version $version
           Compress-Archive -Path build-vcpkg-direct\* -DestinationPath "dist\What-A-Relief-$version-portable-windows.zip" -Force
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          $notesFile = "docs/release-notes/v$version.md"
+          if (Test-Path $notesFile) {
+            "RELEASE_NOTES_FILE=$notesFile" >> $env:GITHUB_ENV
+          }
+          $isPrerelease = $version.Contains("-")
+          "RELEASE_PRERELEASE=$isPrerelease" >> $env:GITHUB_ENV
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -70,8 +76,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME `
-            "dist\What-A-Relief-$env:RELEASE_VERSION-Setup.exe" `
-            "dist\What-A-Relief-$env:RELEASE_VERSION-portable-windows.zip" `
-            --title "What A Relief $env:GITHUB_REF_NAME" `
-            --notes "Windows installer and portable build for What A Relief."
+          $args = @(
+            'release', 'create', $env:GITHUB_REF_NAME,
+            "dist\What-A-Relief-$env:RELEASE_VERSION-Setup.exe",
+            "dist\What-A-Relief-$env:RELEASE_VERSION-portable-windows.zip",
+            '--title', "What A Relief $env:GITHUB_REF_NAME"
+          )
+          if ($env:RELEASE_PRERELEASE -eq 'True') {
+            $args += '--prerelease'
+          }
+          if ($env:RELEASE_NOTES_FILE) {
+            $args += @('--notes-file', $env:RELEASE_NOTES_FILE)
+          } else {
+            $args += @('--notes', 'Windows installer and portable build for What A Relief.')
+          }
+          gh @args

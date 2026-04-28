@@ -8,6 +8,21 @@ What A Relief was created by Adam Rountrey with the use of AI coding tools. The 
 
 What A Relief is licensed under the BSD 3-Clause License. See `LICENSE`. Third-party notices for bundled Windows runtime libraries are summarized in `THIRD_PARTY_NOTICES.md`; packaged builds also include the exact vcpkg license texts in `THIRD_PARTY_LICENSES.txt`.
 
+## How It Works
+
+The calibrated workflow is a practical photometric-stereo pipeline with optional experimental neural assistance:
+
+1. Load 3 to 25 registered images of the same specimen, optionally with a mask or crop.
+2. Determine lighting either by marking a highlight sphere, loading a previous `lights.csv` or `light_vectors.csv`, or using the uncalibrated unknown-lighting mode.
+3. Convert the image stack to grayscale working intensities and solve a classical Lambertian normal field per pixel.
+4. In robust calibrated mode, reject very dark observations, reject or downweight bright outliers, and record residual and confidence-style diagnostics.
+5. Optionally apply relief flattening, which subtracts a broad low-frequency slope trend so smaller topographic features stand out more clearly.
+6. Optionally run experimental PS-FCN neural fusion in calibrated mode. This uses a bundled pretrained neural normal prior, fuses it with the classical normals in slope space, and writes separate classical, neural, and fused normal outputs.
+7. Generate visualization products such as `normal_rgb.png`, `albedo.png`, `residual.png`, and `liquid_metal.png`.
+8. If requested, integrate the classical normal field into a fast relative height preview and optional PLY mesh.
+
+The important boundary is that neural fusion currently helps the normal-map-style outputs only. Height preview and PLY mesh generation stay on the classical geometry path so the mesh does not inherit exaggerated slopes from the neural prior.
+
 ## Scientific Scope
 
 What A Relief is intended for exploratory surface-shape visualization and relative normal estimation. It is not a calibrated height metrology system by itself.
@@ -76,9 +91,9 @@ For the GUI workflow, run the packaged executable with no arguments:
 .\build-vcpkg-direct\what-a-relief.exe
 ```
 
-The setup window lets you choose the image set, output folder, lighting mode, optional previous `lights.csv` or `light_vectors.csv`, optional near-field ring-light geometry, normal solver, optional relief flattening, sRGB handling, height preview, PLY export, experimental diagnostics, and the interactive relight viewer before computation starts. If you use calibrated sphere mode, mark the sphere by clicking three points on its edge, or load a previous calibration CSV to skip sphere marking. For a previous near-field ring run, load the full `lights.csv` so the ring radius, height, and pixel scale are restored along with the light vectors. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve.
+The setup window lets you choose the image set, output folder, lighting mode, optional previous `lights.csv` or `light_vectors.csv`, optional near-field ring-light geometry, normal solver, optional relief flattening, sRGB handling, height preview, PLY export, experimental diagnostics, optional experimental neural fusion, and the interactive relight viewer before computation starts. If you use calibrated sphere mode, mark the sphere by clicking three points on its edge, or load a previous calibration CSV to skip sphere marking. For a previous near-field ring run, load the full `lights.csv` so the ring radius, height, and pixel scale are restored along with the light vectors. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve.
 
-The program prints progress in the console and shows a completion dialog when outputs are written. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, a 3D mesh made from the reconstructed height field.
+The program prints progress in the console and shows a completion dialog when outputs are written. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If experimental neural fusion is enabled, the output folder also includes separate classical, neural, and fused normal-map sets so the result can be reviewed directly. Height preview and PLY export stay on the classical geometry path in that mode. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, a 3D mesh made from the reconstructed height field.
 
 ```powershell
 .\build-vcpkg-direct\what-a-relief.exe `
@@ -111,6 +126,9 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `light_vectors.csv`: just the `x,y,z` light vectors, suitable for `--lights-file`. In uncalibrated mode it contains only the header because no physical light vectors are estimated.
 - `normal_rgb.png`: 8-bit RGB visualization of the estimated normal map.
 - `normal_x.png`, `normal_y.png`, `normal_z.png`: 8-bit visual encodings of the normal components. `x` and `y` are mapped from `[-1, 1]` to `[0, 255]`; `z` is mapped from `[0, 1]` to `[0, 255]`.
+- `classical_normal_rgb.png`, `classical_normal_x.png`, `classical_normal_y.png`, `classical_normal_z.png`: written when experimental neural fusion is enabled. These are the classical solver normals before fusion.
+- `neural_normal_rgb.png`, `neural_normal_x.png`, `neural_normal_y.png`, `neural_normal_z.png`: written when experimental neural fusion is enabled. These are the bundled PS-FCN neural-prior normals.
+- `fused_normal_rgb.png`, `fused_normal_x.png`, `fused_normal_y.png`, `fused_normal_z.png`: written when experimental neural fusion is enabled. These are the slope-domain fused normals.
 - `albedo.png`: normalized 8-bit relative albedo or brightness-scale estimate. It is not an absolute reflectance measurement.
 - `liquid_metal.png`: normal-map chrome-style render that uses light smoothing to avoid boosting pixel-scale noise.
 - `liquid_metal_custom.png`: optional render saved from the interactive relight viewer.
@@ -123,6 +141,8 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `shadow_count.png`: diagnostic map showing how many images were below the shadow threshold at each solved pixel.
 - `highlight_outlier_count.png`: diagnostic map showing how many observations were rejected as high-intensity outliers.
 - `specular_cue_mask.png`: optional experimental mask of pixels that behaved like shiny or otherwise non-Lambertian outliers. It is a diagnostic, not a calibrated light estimate.
+
+When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `normal_y.png`, and `normal_z.png` are the fused normals.
 
 ## Options
 
@@ -139,6 +159,8 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `--near-field-ring radius height`: use a simple point-light ring model for calibrated solving. Radius and height are in millimeters.
 - `--pixel-scale-mm value`: pixel size in millimeters per pixel for near-field solving. Use `0` to auto-read supported TIFF physical scale tags.
 - `--specular-diagnostics`: write experimental shiny-cue diagnostics such as `specular_cue_mask.png`.
+- `--neural-fusion`: run bundled PS-FCN neural inference and slope-domain fusion after the classical calibrated solve. Supports 3 to 25 calibrated images.
+- `--neural-model path`: override the bundled PS-FCN ONNX model path, or point at a directory containing the count-specific ONNX files.
 - `--flatten none|gentle|strong`: optional low-frequency slope flattening before outputs are written. Default: `none`.
 - `--open-relight`: open the interactive specular relight viewer after GUI processing.
 - `--highlight-percentile value`: percentile used to find the specular highlight centroid inside the selected sphere. Default: `99.8`.
@@ -183,9 +205,11 @@ The default lighting model treats each image as a single directional light. `--n
 
 `--specular-diagnostics` is experimental. It writes a mask of pixels whose observations were rejected or strongly downweighted by the robust solver, which can help identify shiny scene features. The current application does not yet use those pixels to solve lighting directions.
 
+Experimental neural fusion uses bundled PS-FCN ONNX exports for 3 through 25 calibrated images. The network provides a qualitative dense normal prior, which What A Relief fuses with the classical normals in slope space using a confidence term derived from the classical residual and robust diagnostics. Because this neural prior was not trained for near-field microscope metrology, the fused normals are intended for visualization-oriented normal products. Height preview and PLY export remain on the classical geometry path in this mode, and the app warns about that when neural fusion is enabled.
+
 Optional relief flattening removes a broad low-frequency slope trend from the normal field so smaller surface features stand out. This is a visualization control, not calibrated metrological form removal; leave it off when large-scale curvature or tilt is part of the scientific question.
 
-Uncalibrated no-sphere mode is useful for visual relief enhancement when a highlight sphere is not available, but its normals, height, and PLY mesh are relative. The solver stabilizes the visual-relief slopes and removes a best-fit plane from the height preview, but the remaining unknown-lighting ambiguity can still stretch, shear, or rotate the recovered relief. Use sphere calibration when geometry needs to be physically meaningful.
+Uncalibrated no-sphere mode is useful for visual relief enhancement when a highlight sphere is not available, but its normals, height, and PLY mesh are relative. The solver stabilizes the visual-relief slopes and removes a best-fit plane from the height preview, but the remaining unknown-lighting ambiguity can still stretch, shear, or rotate the recovered relief. In the current implementation the displayed height preview also has a best-fit plane removed after integration so broad ramps do not dominate the visualization. Use sphere calibration when geometry needs to be physically meaningful.
 
 The height output is an optional DCT/Poisson preview integration of normals, not a calibrated metrology surface. It is fast and useful for visualization, but calibrated depth requires pixel pitch, optical calibration, lens distortion correction, validation of the light directions, and a more rigorous treatment of boundary conditions and missing data.
 
@@ -204,9 +228,10 @@ This project stands on a long line of photometric stereo and shape-reconstructio
 - Tony Lindeberg's scale-space work and ISO 16610-61's areal Gaussian filtering standard are relevant background for the optional low-frequency relief-flattening control. This implementation is only a practical visualization filter.
 - Robert T. Frankot and Rama Chellappa's integrability work is part of the background for turning normal/slope fields into coherent surfaces: "A Method for Enforcing Integrability in Shape from Shading Algorithms," IEEE TPAMI 10(4), 439-451, 1988. DOI: https://doi.org/10.1109/34.3909
 - Tal Simchony, Rama Chellappa, and M. Shao's direct Poisson solvers using fast orthogonal transforms inspired the fast DCT/Poisson height preview: "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems," IEEE TPAMI 12(5), 435-446, 1990. DOI: https://doi.org/10.1109/34.55103
+- Guanying Chen, Kai Han, and Kwan-Yee K. Wong developed PS-FCN, the pretrained neural photometric-stereo model used here as an optional qualitative normal prior for experimental fusion: "PS-FCN: A Flexible Learning Framework for Photometric Stereo," ECCV 2018. DOI: https://doi.org/10.1007/978-3-030-01252-6_1
 
 Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing against Relight helped identify useful workflow ideas, especially explicit robust-normal and flattening controls. What A Relief does not include Relight source code. Relight is available at https://github.com/cnr-isti-vclab/relight, with software releases archived on Zenodo.
 
-The implementation uses OpenCV for image I/O, image processing, and GUI windows, and vcpkg/CMake to make the Windows OpenCV dependency reproducible.
+The implementation uses OpenCV for image I/O, image processing, DNN inference, and GUI windows, and vcpkg/CMake to make the Windows OpenCV dependency reproducible. Optional experimental neural-fusion builds bundle PS-FCN-derived ONNX assets under the upstream MIT license; see `THIRD_PARTY_NOTICES.md`, `assets\models\NOTICE.txt`, and `assets\models\LICENSE-PS-FCN.txt`.
 
 BibTeX entries for the academic references are in `docs\references.bib`.

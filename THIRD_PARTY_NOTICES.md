@@ -17,3 +17,13 @@ The current Windows runtime package is built from vcpkg's `x64-windows` triplet 
 | zlib | `zlib1.dll` | zlib license |
 
 Before making a release, rebuild the package and check `build-vcpkg-direct` to confirm the bundled DLL list still matches this file. If vcpkg changes OpenCV's dependency set, update this notice and regenerate the packaged license bundle.
+
+## Bundled Neural Models
+
+Experimental neural-fusion builds also bundle count-specific ONNX exports of the PS-FCN photometric-stereo model for image counts from 3 through 25:
+
+| Component | Bundled files | Source and license |
+| --- | --- | --- |
+| PS-FCN ONNX models | `assets/models/psfcn_*_normalize.onnx` and packaged `models/psfcn_*_normalize.onnx` | Derived from the PS-FCN pretrained checkpoint by Guanying Chen; original code and checkpoint are distributed under the MIT License |
+
+These ONNX files are format-converted exports of the original pretrained PS-FCN model used only for optional experimental normal-map fusion. They do not change the license of What A Relief itself; they remain third-party assets and should continue to be attributed to the PS-FCN authors in source and binary distributions. The repository bundles `assets/models/NOTICE.txt` and `assets/models/LICENSE-PS-FCN.txt`, and packaged builds should include those same files under `models/`.

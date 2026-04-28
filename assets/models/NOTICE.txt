@@ -1,0 +1,21 @@
+Bundled experimental neural-fusion models
+=========================================
+
+Files in this folder named `psfcn_*_normalize.onnx` are ONNX exports derived from
+the PS-FCN pretrained model by Guanying Chen.
+
+Original project:
+  PS-FCN: A Flexible Learning Framework for Photometric Stereo
+  Guanying Chen, Kai Han, and Kwan-Yee K. Wong
+  ECCV 2018
+
+Original source repository:
+  https://github.com/guanyingc/PS-FCN
+
+Original code license:
+  MIT License
+
+The full upstream MIT license text is reproduced in LICENSE-PS-FCN.txt.
+
+These ONNX files are included only for the optional experimental neural-fusion
+feature. Height preview and PLY mesh generation remain on the classical solver path.

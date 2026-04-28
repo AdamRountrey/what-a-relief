@@ -389,6 +389,17 @@ cv::Mat normalRgbTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
     return out;
 }
 
+void writeNormalSet(
+    const fs::path& outDir,
+    const std::string& prefix,
+    const cv::Mat& normalMap,
+    const cv::Mat& mask) {
+    cv::imwrite((outDir / (prefix + "_normal_rgb.png")).string(), normalRgbTo8U(normalMap, mask));
+    cv::imwrite((outDir / (prefix + "_normal_x.png")).string(), normalComponentTo8U(normalMap, mask, 0, true));
+    cv::imwrite((outDir / (prefix + "_normal_y.png")).string(), normalComponentTo8U(normalMap, mask, 1, true));
+    cv::imwrite((outDir / (prefix + "_normal_z.png")).string(), normalComponentTo8U(normalMap, mask, 2, false));
+}
+
 cv::Vec3f normalizeVector(const cv::Vec3f& v) {
     const float length = std::sqrt(v.dot(v));
     if (length <= 1.0e-6f) {
@@ -903,6 +914,15 @@ void saveOutputs(
     cv::imwrite((outDir / "residual.png").string(), normalizeFloatTo8U(residual, validMask, true));
     cv::imwrite((outDir / "valid_mask.png").string(), validMask);
     cv::imwrite((outDir / "liquid_metal.png").string(), liquidMetalTo8U(normalMap, validMask));
+    if (opt.neuralFusion && !diagnostics.neuralNormal.empty()) {
+        writeNormalSet(outDir, "fused", normalMap, validMask);
+        if (!diagnostics.classicalNormal.empty()) {
+            writeNormalSet(outDir, "classical", diagnostics.classicalNormal, validMask);
+        }
+        cv::Mat neuralMask(diagnostics.neuralNormal.size(), CV_8U, cv::Scalar(255));
+        writeNormalSet(outDir, "neural", diagnostics.neuralNormal, neuralMask);
+        cv::imwrite((outDir / "fused_classical_confidence.png").string(), normalizeFloatTo8U(diagnostics.classicalConfidence, validMask, true));
+    }
     if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustWeight.empty()) {
         cv::imwrite((outDir / "robust_weight.png").string(), normalizeFloatTo8U(diagnostics.robustWeight, validMask, true));
         cv::imwrite((outDir / "shadow_count.png").string(), normalizeFloatTo8U(diagnostics.shadowCount, validMask, true));

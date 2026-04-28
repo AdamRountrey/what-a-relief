@@ -45,9 +45,11 @@ struct Options {
     bool calculateHeight = true;
     bool openRelightViewer = false;
     bool specularDiagnostics = false;
+    bool neuralFusion = false;
     NormalSolverMode solverMode = NormalSolverMode::Robust;
     FlattenMode flattenMode = FlattenMode::None;
     LightingModel lightingModel = LightingModel::Directional;
+    std::string neuralModelPath;
     double highlightPercentile = 99.8;
     double minHighlight = 0.05;
     double shadowThreshold = 0.02;
@@ -66,6 +68,9 @@ struct PhotometricDiagnostics {
     cv::Mat shadowCount;
     cv::Mat highlightOutlierCount;
     cv::Mat specularCueMask;
+    cv::Mat classicalConfidence;
+    cv::Mat classicalNormal;
+    cv::Mat neuralNormal;
 };
 
 struct HighlightEstimate {

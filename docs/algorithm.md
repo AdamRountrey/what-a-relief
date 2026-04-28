@@ -1,6 +1,6 @@
 # Algorithm
 
-What A Relief is an implementation-oriented tool, not a new claim of invention. The calibrated workflow follows the classical photometric stereo model introduced by Woodham, with light directions estimated from a user-marked highlight sphere. The uncalibrated workflow is a pragmatic visual-relief mode inspired by the unknown-lighting literature, especially Basri, Jacobs, and Kemelmacher, but it is intentionally simpler and aimed at useful enhancement rather than metrically unique shape recovery.
+What A Relief is an implementation-oriented tool, not a new claim of invention. The calibrated workflow follows the classical photometric stereo model introduced by Woodham, with light directions estimated from a user-marked highlight sphere. The optional neural-fusion workflow adds a pretrained PS-FCN normal prior after the classical solve, but keeps geometry outputs on the classical path. The uncalibrated workflow is a pragmatic visual-relief mode inspired by the unknown-lighting literature, especially Basri, Jacobs, and Kemelmacher, but it is intentionally simpler and aimed at useful enhancement rather than metrically unique shape recovery.
 
 The program estimates image-space normals and relative brightness terms from a fixed-view image stack. It does not by itself calibrate physical height, pixel pitch, lens distortion, bidirectional reflectance, or microscope illumination nonuniformity.
 
@@ -39,6 +39,23 @@ g   = rho * n
 The default calibrated solver is a modest robust variant. It estimates a per-pixel high-outlier cutoff from the median and median absolute deviation of the usable observations, caps that cutoff with `--high-outlier-threshold`, omits very bright observations when enough other observations remain, then uses an iteratively reweighted least-squares pass with Huber-style residual weights. This is not the same as the larger sparse-regression or low-rank robust photometric-stereo methods in the literature, but it follows the same practical motivation: shadows, saturation, and specular highlights should not control a diffuse Lambertian normal estimate. When too few observations are available, it falls back to the direct least-squares fit.
 
 The robust solver also writes diagnostic maps for mean robust weight, shadow count, high-intensity outlier count, and, if requested, an experimental specular-cue mask. The mask identifies pixels whose observations behaved like shiny or otherwise non-Lambertian outliers. It is currently a review aid only; those pixels are not used as independent light-calibration constraints.
+
+## Experimental Neural Fusion
+
+When the experimental neural-fusion option is enabled, the program still performs the full classical calibrated solve first. It then runs a bundled ONNX export of the pretrained PS-FCN model that matches the number of input images from 3 through 25.
+
+The neural model expects one directional light vector per image, stacks the grayscale image channels as repeated RGB inputs, normalizes the stacked intensities by the per-pixel energy across the image set, and predicts a dense normal map. Because PS-FCN was trained for directional-light photometric stereo rather than microscope-specific near-field metrology, What A Relief treats it as a qualitative normal prior rather than as a replacement physical model.
+
+Fusion is done in slope space rather than by directly averaging RGB normals:
+
+1. Convert the classical and neural normals into slope fields `p = -nx / nz` and `q = ny / nz`.
+2. Build low-frequency slope fields for each source with masked Gaussian smoothing.
+3. Blend the low-frequency fields with a confidence term derived from the classical residual, robust weight, shadow count, and highlight-outlier count.
+4. Reinject a reduced amount of high-frequency classical slope detail.
+5. Clamp the fused slope magnitude against the classical slope distribution.
+6. Convert the fused slopes back into a normal map.
+
+The fused normals are used for the visualization-oriented normal outputs. To avoid exaggerated geometry, height preview and PLY mesh generation remain on the classical geometry path even when neural fusion is enabled. Fusion runs write three explicit normal sets: classical, neural, and fused.
 
 ## Near-Field Ring Lighting
 
@@ -79,9 +96,9 @@ dz/dx   = -nx / nz
 dz/drow =  ny / nz
 ```
 
-The program then solves a Poisson-style integration using a DCT. Invalid pixels have zero gradients in the current preview solver, and the solution is mean-centered over the valid mask. In uncalibrated mode, a best-fit plane is removed after integration.
+The program then solves a Poisson-style integration using a DCT. Invalid pixels have zero gradients in the current preview solver, and the solution is mean-centered over the valid mask.
 
-The result is useful for visual inspection, while `normal_rgb.png`, the component maps, and `residual.png` remain the primary outputs.
+The result is useful for visual inspection, while `normal_rgb.png`, the component maps, and `residual.png` remain the primary outputs. In the current implementation, the height preview has a best-fit plane removed after integration so broad image-wide ramps do not dominate the display.
 
 If requested, the height preview can also be exported as a binary little-endian PLY mesh.
 
@@ -96,7 +113,8 @@ If requested, the height preview can also be exported as a binary little-endian 
 - ISO 16610-61:2015 specifies areal Gaussian filters for separating large- and small-scale surface components in surface texture work.
 - Frankot, R. T., and Chellappa, R. "A Method for Enforcing Integrability in Shape from Shading Algorithms." IEEE Transactions on Pattern Analysis and Machine Intelligence 10(4), 439-451, 1988. https://doi.org/10.1109/34.3909
 - Simchony, T., Chellappa, R., and Shao, M. "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems." IEEE Transactions on Pattern Analysis and Machine Intelligence 12(5), 435-446, 1990. https://doi.org/10.1109/34.55103
+- Chen, G., Han, K., and Wong, K.-Y. K. "PS-FCN: A Flexible Learning Framework for Photometric Stereo." ECCV 2018. https://doi.org/10.1007/978-3-030-01252-6_1
 
-The program also depends on OpenCV for image operations and windowing, and uses vcpkg/CMake to build OpenCV reproducibly on Windows.
+The program also depends on OpenCV for image operations and windowing, and uses vcpkg/CMake to build OpenCV reproducibly on Windows. The optional experimental neural-fusion models are exported from the PS-FCN project and are bundled as third-party MIT-licensed assets.
 
 Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing What A Relief against Relight helped identify useful workflow ideas, such as explicit robust-normal and flattening controls. What A Relief does not include Relight source code.
