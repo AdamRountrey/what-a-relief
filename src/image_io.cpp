@@ -16,6 +16,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -369,6 +370,33 @@ cv::Mat normalComponentTo8U(const cv::Mat& normalMap, const cv::Mat& mask, int c
     return out;
 }
 
+cv::Mat hillshadeTo8U(const cv::Mat& normalMap, const cv::Mat& mask, const cv::Vec3f& lightDirection) {
+    const float length = std::sqrt(lightDirection.dot(lightDirection));
+    const cv::Vec3f light = length > 1.0e-6f ? lightDirection / length : cv::Vec3f(-0.5f, 0.5f, 0.70710678f);
+    constexpr double kAmbient = 0.16;
+    constexpr double kDiffuse = 0.82;
+    constexpr double kGamma = 0.78;
+    cv::Mat out(normalMap.rows, normalMap.cols, CV_8U, cv::Scalar(0));
+    for (int y = 0; y < normalMap.rows; ++y) {
+        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+        const uchar* mrow = mask.ptr<uchar>(y);
+        uchar* orow = out.ptr<uchar>(y);
+        for (int x = 0; x < normalMap.cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            const double ndotl =
+                static_cast<double>(nrow[x][0]) * light[0] +
+                static_cast<double>(nrow[x][1]) * light[1] +
+                static_cast<double>(nrow[x][2]) * light[2];
+            const double hillshade = std::pow(std::clamp(ndotl, 0.0, 1.0), kGamma);
+            const double value = kAmbient + kDiffuse * hillshade;
+            orow[x] = static_cast<uchar>(std::clamp(value * 255.0, 0.0, 255.0));
+        }
+    }
+    return out;
+}
+
 cv::Mat normalRgbTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
     cv::Mat out(normalMap.rows, normalMap.cols, CV_8UC3, cv::Scalar(0, 0, 0));
     for (int y = 0; y < normalMap.rows; ++y) {
@@ -397,6 +425,7 @@ void writeNormalSet(
     cv::imwrite((outDir / (prefix + "_normal_rgb.png")).string(), normalRgbTo8U(normalMap, mask));
     cv::imwrite((outDir / (prefix + "_normal_x.png")).string(), normalComponentTo8U(normalMap, mask, 0, true));
     cv::imwrite((outDir / (prefix + "_normal_y.png")).string(), normalComponentTo8U(normalMap, mask, 1, true));
+    cv::imwrite((outDir / (prefix + "_hillshade_ul.png")).string(), hillshadeTo8U(normalMap, mask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
     cv::imwrite((outDir / (prefix + "_normal_z.png")).string(), normalComponentTo8U(normalMap, mask, 2, false));
 }
 
@@ -629,6 +658,8 @@ void writeLightsCsv(
     if (opt.lightingModel == LightingModel::NearFieldRing) {
         out << "ring_light_radius_mm," << opt.ringLightRadiusMm << "\n";
         out << "ring_light_height_mm," << opt.ringLightHeightMm << "\n";
+    }
+    if (opt.pixelScaleMm > 0.0) {
         out << "pixel_scale_mm_per_pixel," << opt.pixelScaleMm << "\n";
     }
     out << "sphere_cx," << opt.sphere.cx << "\n";
@@ -791,6 +822,201 @@ void writePlyMesh(
             std::to_string(faceCount) + " faces).");
 }
 
+struct PlyBoundaryEdge {
+    std::int32_t a = -1;
+    std::int32_t b = -1;
+    int count = 0;
+};
+
+std::uint64_t plyEdgeKey(std::int32_t a, std::int32_t b) {
+    const std::uint32_t lo = static_cast<std::uint32_t>(std::min(a, b));
+    const std::uint32_t hi = static_cast<std::uint32_t>(std::max(a, b));
+    return (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
+}
+
+void addPlyEdge(std::unordered_map<std::uint64_t, PlyBoundaryEdge>& edges, std::int32_t a, std::int32_t b) {
+    PlyBoundaryEdge& edge = edges[plyEdgeKey(a, b)];
+    if (edge.count == 0) {
+        edge.a = a;
+        edge.b = b;
+    }
+    ++edge.count;
+}
+
+void addPlyTriangleEdges(std::unordered_map<std::uint64_t, PlyBoundaryEdge>& edges, std::int32_t a, std::int32_t b, std::int32_t c) {
+    addPlyEdge(edges, a, b);
+    addPlyEdge(edges, b, c);
+    addPlyEdge(edges, c, a);
+}
+
+void writePlyTriangle(std::ofstream& out, std::int32_t a, std::int32_t b, std::int32_t c) {
+    const std::uint8_t count = 3;
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(&a), sizeof(a));
+    out.write(reinterpret_cast<const char*>(&b), sizeof(b));
+    out.write(reinterpret_cast<const char*>(&c), sizeof(c));
+}
+
+void writePlyQuad(std::ofstream& out, std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
+    const std::uint8_t count = 4;
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(&a), sizeof(a));
+    out.write(reinterpret_cast<const char*>(&b), sizeof(b));
+    out.write(reinterpret_cast<const char*>(&c), sizeof(c));
+    out.write(reinterpret_cast<const char*>(&d), sizeof(d));
+}
+
+void writePrintablePlyMesh(
+    const fs::path& path,
+    const cv::Mat& height,
+    const cv::Mat& mask,
+    const cv::Mat& vertexColor,
+    int step,
+    double heightScale,
+    double pixelScaleMm,
+    double baseThicknessMm,
+    const std::function<void(const std::string&)>& progress) {
+    const int rows = height.rows;
+    const int cols = height.cols;
+    const double xyScale = pixelScaleMm > 0.0 ? pixelScaleMm : 1.0;
+    const double zScale = xyScale * heightScale;
+    const double baseThickness = pixelScaleMm > 0.0 ? baseThicknessMm : baseThicknessMm / xyScale;
+    cv::Mat index(rows, cols, CV_32S, cv::Scalar(-1));
+
+    reportProgress(progress, "Printable PLY: indexing top vertices...");
+    int topVertexCount = 0;
+    double minZ = std::numeric_limits<double>::infinity();
+    for (int y = 0; y < rows; y += step) {
+        const float* hrow = height.ptr<float>(y);
+        const uchar* mrow = mask.ptr<uchar>(y);
+        int* irow = index.ptr<int>(y);
+        for (int x = 0; x < cols; x += step) {
+            if (mrow[x] != 0 && std::isfinite(hrow[x])) {
+                irow[x] = topVertexCount++;
+                minZ = std::min(minZ, static_cast<double>(hrow[x]) * zScale);
+            }
+        }
+    }
+    if (topVertexCount < 3 || !std::isfinite(minZ)) {
+        die("Printable PLY needs at least three finite height pixels inside the geometry mask.");
+    }
+
+    reportProgress(progress, "Printable PLY: counting faces...");
+    std::unordered_map<std::uint64_t, PlyBoundaryEdge> edges;
+    edges.reserve(static_cast<std::size_t>(topVertexCount) * 3);
+    int topFaceCount = 0;
+    for (int y = 0; y + step < rows; y += step) {
+        const int* row0 = index.ptr<int>(y);
+        const int* row1 = index.ptr<int>(y + step);
+        for (int x = 0; x + step < cols; x += step) {
+            const int a = row0[x];
+            const int b = row0[x + step];
+            const int c = row1[x];
+            const int d = row1[x + step];
+            if (a >= 0 && b >= 0 && c >= 0) {
+                addPlyTriangleEdges(edges, a, c, b);
+                ++topFaceCount;
+            }
+            if (b >= 0 && d >= 0 && c >= 0) {
+                addPlyTriangleEdges(edges, b, c, d);
+                ++topFaceCount;
+            }
+        }
+    }
+    int boundaryFaceCount = 0;
+    for (const auto& item : edges) {
+        if (item.second.count == 1) {
+            ++boundaryFaceCount;
+        }
+    }
+    if (topFaceCount == 0) {
+        die("Printable PLY has no surface faces. Use a smaller mesh step or a larger height mask.");
+    }
+    const int vertexCount = topVertexCount * 2;
+    const int faceCount = topFaceCount * 2 + boundaryFaceCount;
+    const double baseZ = minZ - std::max(0.0, baseThickness);
+
+    fs::create_directories(path.parent_path().empty() ? fs::path(".") : path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        die("Failed to write printable PLY mesh: " + path.string());
+    }
+
+    out << "ply\n";
+    out << "format binary_little_endian 1.0\n";
+    out << "comment generated by What A Relief printable solid export\n";
+    out << "comment units " << (pixelScaleMm > 0.0 ? "millimeters" : "input_pixels") << "\n";
+    out << "element vertex " << vertexCount << "\n";
+    out << "property float x\n";
+    out << "property float y\n";
+    out << "property float z\n";
+    out << "property uchar red\n";
+    out << "property uchar green\n";
+    out << "property uchar blue\n";
+    out << "element face " << faceCount << "\n";
+    out << "property list uchar int vertex_indices\n";
+    out << "end_header\n";
+
+    reportProgress(progress, "Printable PLY: writing vertices...");
+    for (int layer = 0; layer < 2; ++layer) {
+        for (int y = 0; y < rows; y += step) {
+            const float* hrow = height.ptr<float>(y);
+            const int* irow = index.ptr<int>(y);
+            const uchar* colorRow = vertexColor.empty() ? nullptr : vertexColor.ptr<uchar>(y);
+            for (int x = 0; x < cols; x += step) {
+                if (irow[x] >= 0) {
+                    const float vx = static_cast<float>(static_cast<double>(x) * xyScale);
+                    const float vy = static_cast<float>(static_cast<double>(-y) * xyScale);
+                    const float vz = layer == 0
+                        ? static_cast<float>(static_cast<double>(hrow[x]) * zScale)
+                        : static_cast<float>(baseZ);
+                    const std::uint8_t color = colorRow == nullptr ? 200 : colorRow[x];
+                    out.write(reinterpret_cast<const char*>(&vx), sizeof(vx));
+                    out.write(reinterpret_cast<const char*>(&vy), sizeof(vy));
+                    out.write(reinterpret_cast<const char*>(&vz), sizeof(vz));
+                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                }
+            }
+        }
+    }
+
+    reportProgress(progress, "Printable PLY: writing closed faces...");
+    for (int y = 0; y + step < rows; y += step) {
+        const int* row0 = index.ptr<int>(y);
+        const int* row1 = index.ptr<int>(y + step);
+        for (int x = 0; x + step < cols; x += step) {
+            const int a = row0[x];
+            const int b = row0[x + step];
+            const int c = row1[x];
+            const int d = row1[x + step];
+            if (a >= 0 && b >= 0 && c >= 0) {
+                writePlyTriangle(out, a, c, b);
+                writePlyTriangle(out, b + topVertexCount, c + topVertexCount, a + topVertexCount);
+            }
+            if (b >= 0 && d >= 0 && c >= 0) {
+                writePlyTriangle(out, b, c, d);
+                writePlyTriangle(out, d + topVertexCount, c + topVertexCount, b + topVertexCount);
+            }
+        }
+    }
+    for (const auto& item : edges) {
+        const PlyBoundaryEdge& edge = item.second;
+        if (edge.count == 1) {
+            writePlyQuad(out, edge.b, edge.a, edge.a + topVertexCount, edge.b + topVertexCount);
+        }
+    }
+
+    if (!out) {
+        die("Failed while writing printable PLY mesh: " + path.string());
+    }
+    reportProgress(
+        progress,
+        "Printable PLY: done (" + std::to_string(vertexCount) + " vertices, " +
+            std::to_string(faceCount) + " faces).");
+}
+
 } // namespace
 
 double readPixelScaleMmFromImage(const std::string& path) {
@@ -898,6 +1124,7 @@ void saveOutputs(
     const cv::Mat& validMask,
     const PhotometricDiagnostics& diagnostics,
     const cv::Mat& height,
+    const cv::Mat& heightMask,
     const std::function<void(const std::string&)>& progress) {
     const fs::path outDir = opt.outputDir;
     fs::create_directories(outDir);
@@ -909,6 +1136,7 @@ void saveOutputs(
     cv::imwrite((outDir / "normal_rgb.png").string(), normalRgbTo8U(normalMap, validMask));
     cv::imwrite((outDir / "normal_x.png").string(), normalComponentTo8U(normalMap, validMask, 0, true));
     cv::imwrite((outDir / "normal_y.png").string(), normalComponentTo8U(normalMap, validMask, 1, true));
+    cv::imwrite((outDir / "hillshade_ul.png").string(), hillshadeTo8U(normalMap, validMask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
     cv::imwrite((outDir / "normal_z.png").string(), normalComponentTo8U(normalMap, validMask, 2, false));
     cv::imwrite((outDir / "albedo.png").string(), albedo8);
     cv::imwrite((outDir / "residual.png").string(), normalizeFloatTo8U(residual, validMask, true));
@@ -933,10 +1161,24 @@ void saveOutputs(
     }
     if (!height.empty()) {
         reportProgress(progress, "Writing height outputs...");
-        cv::imwrite((outDir / "height.png").string(), normalizeFloatTo8U(height, validMask, false));
-        writePfm(outDir / "height.pfm", height, validMask);
+        const cv::Mat& geometryMask = heightMask.empty() ? validMask : heightMask;
+        cv::imwrite((outDir / "height_mask.png").string(), geometryMask);
+        cv::imwrite((outDir / "height.png").string(), normalizeFloatTo8U(height, geometryMask, false));
+        writePfm(outDir / "height.pfm", height, geometryMask);
         if (!opt.meshPath.empty()) {
-            writePlyMesh(opt.meshPath, height, validMask, albedo8, opt.meshStep, opt.heightScale, progress);
+            writePlyMesh(opt.meshPath, height, geometryMask, albedo8, opt.meshStep, opt.heightScale, progress);
+        }
+        if (!opt.printableMeshPath.empty()) {
+            writePrintablePlyMesh(
+                opt.printableMeshPath,
+                height,
+                geometryMask,
+                albedo8,
+                opt.meshStep,
+                opt.heightScale,
+                opt.pixelScaleMm,
+                opt.printableThicknessMm,
+                progress);
         }
     }
 }

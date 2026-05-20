@@ -25,4 +25,5 @@ void saveOutputs(
     const cv::Mat& validMask,
     const PhotometricDiagnostics& diagnostics,
     const cv::Mat& height,
+    const cv::Mat& heightMask,
     const std::function<void(const std::string&)>& progress = {});

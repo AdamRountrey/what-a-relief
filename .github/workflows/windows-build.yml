@@ -46,7 +46,7 @@ jobs:
       - name: Build app and installer
         shell: pwsh
         run: |
-          $version = "0.1.0"
+          $version = "0.2.0-specular.2"
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME.StartsWith("v")) {
             $version = $env:GITHUB_REF_NAME.Substring(1)
           }

@@ -68,6 +68,52 @@ FlattenMode parseFlattenMode(const std::string& s) {
     die("Invalid flatten mode: " + s + " (use none, gentle, or strong)");
 }
 
+HeightSolverMode parseHeightSolverMode(const std::string& s) {
+    if (s == "robust" || s == "masked" || s == "quality") {
+        return HeightSolverMode::RobustMasked;
+    }
+    if (s == "fast" || s == "dct" || s == "poisson") {
+        return HeightSolverMode::FastDct;
+    }
+    die("Invalid height solver: " + s + " (use robust or fast)");
+}
+
+HeightFlattenMode parseHeightFlattenMode(const std::string& s) {
+    if (s == "none" || s == "off") {
+        return HeightFlattenMode::None;
+    }
+    if (s == "radial" || s == "dome") {
+        return HeightFlattenMode::Radial;
+    }
+    if (s == "quadratic" || s == "quad" || s == "curl") {
+        return HeightFlattenMode::Quadratic;
+    }
+    die("Invalid height flatten mode: " + s + " (use none, radial, or quadratic)");
+}
+
+RtiLayoutMode parseRtiLayoutMode(const std::string& s) {
+    if (s == "image" || s == "plain" || s == "single") {
+        return RtiLayoutMode::Image;
+    }
+    if (s == "deepzoom" || s == "dzi" || s == "tiled") {
+        return RtiLayoutMode::DeepZoom;
+    }
+    if (s == "webrti" || s == "webrtiviewer" || s == "web-rti" || s == "web") {
+        return RtiLayoutMode::WebRtiViewer;
+    }
+    die("Invalid RTI layout: " + s + " (use image, deepzoom, or webrti)");
+}
+
+RtiColorMode parseRtiColorMode(const std::string& s) {
+    if (s == "rgb" || s == "direct") {
+        return RtiColorMode::Rgb;
+    }
+    if (s == "lrgb" || s == "albedo" || s == "luminance-rgb") {
+        return RtiColorMode::Lrgb;
+    }
+    die("Invalid RTI color mode: " + s + " (use rgb or lrgb)");
+}
+
 } // namespace
 
 void printUsage() {
@@ -85,6 +131,7 @@ void printUsage() {
         << "Options:\n"
         << "  --out dir                    Output directory. Default: out\n"
         << "  --mask path                  Optional object mask; white pixels are solved.\n"
+        << "  --height-mask path           Optional specimen mask used only for height.png, height.pfm, and PLY.\n"
         << "  --uncalibrated               Skip sphere calibration and estimate a relative normal field.\n"
         << "  --crop x y width height      Restrict solve to a rectangular image region.\n"
         << "  --sphere cx cy radius        Reuse a known sphere circle without the GUI.\n"
@@ -94,22 +141,33 @@ void printUsage() {
         << "  --solver standard|robust     Calibrated normal solve. Default: robust\n"
         << "  --high-outlier-threshold v   Robust solve highlight/saturation cutoff. Default: 0.98\n"
         << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
-        << "  --pixel-scale-mm s           Pixel size in mm/pixel for near-field solving; 0 auto-reads TIFF tags.\n"
+        << "  --pixel-scale-mm s           Image pixel size in mm/pixel; 0 auto-reads TIFF tags when needed.\n"
         << "  --specular-diagnostics       Write experimental shiny-cue and robust outlier diagnostic maps.\n"
         << "  --neural-fusion             Run bundled PS-FCN neural normal prior and fuse it with the classical solve.\n"
         << "                               Experimental; calibrated mode only, supports 3 to 25 images.\n"
         << "                               Height/PLY remain classical-only to avoid exaggerated geometry.\n"
         << "  --neural-model path         Override bundled PS-FCN ONNX model path, or point at a model directory.\n"
+        << "  --neural-max-side n         Long-side PS-FCN inference limit; 0 tries native size. Default: 2048\n"
         << "  --flatten none|gentle|strong Remove low-frequency slope trend before output. Default: none\n"
         << "  --open-relight               Open the interactive relight viewer after GUI processing.\n"
         << "  --highlight-percentile p     Bright percentile inside sphere. Default: 99.8\n"
         << "  --min-highlight v            Minimum highlight intensity. Default: 0.05\n"
         << "  --shadow-threshold v         Per-observation shadow cutoff. Default: 0.02\n"
-        << "  --integration-iterations n   Legacy option accepted; DCT/Poisson height ignores it.\n"
+        << "  --integration-iterations n   Work budget for robust height; fast DCT/Poisson ignores it.\n"
+        << "  --height-solver robust|fast  Height integration. Default: robust\n"
+        << "  --height-flatten none|radial|quadratic\n"
+        << "                               Height/PLY-only curl correction after integration. Default: none\n"
+        << "  --height-slope-cap s         Clamp extreme normal-derived height slopes; 0 disables. Default: 3.0\n"
         << "  --no-height                  Skip height.png and height.pfm.\n"
         << "  --mesh path.ply              Export a PLY mesh from the height preview.\n"
+        << "  --printable-mesh path.ply    Export a watertight solid PLY; requires pixel scale.\n"
         << "  --mesh-step n                Use every nth pixel for PLY export. Default: 1\n"
         << "  --height-scale s             Scale mesh z coordinates. Default: 1.0\n"
+        << "  --printable-thickness-mm s   Solid base thickness for --printable-mesh. Default: 2.0\n"
+        << "  --rti path                   Export a Relight/OpenLIME PTM-style RTI package.\n"
+        << "  --rti-layout image|deepzoom|webrti\n"
+        << "                               RTI package layout. Default: image\n"
+        << "  --rti-color rgb|lrgb         RTI color model. LRGB uses a base image plus luminance PTM. Default: rgb\n"
         << "  --keep-sphere                Do not remove the calibration sphere from the solve mask.\n"
         << "  --view-dir x y z             Camera view vector. Default: 0 0 1\n"
         << "  --help                       Show this help.\n";
@@ -144,6 +202,9 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--mask") {
             need(1);
             opt.maskPath = argv[++i];
+        } else if (arg == "--height-mask") {
+            need(1);
+            opt.heightMaskPath = argv[++i];
         } else if (arg == "--uncalibrated" || arg == "--no-sphere") {
             opt.uncalibratedLighting = true;
         } else if (arg == "--crop") {
@@ -187,6 +248,9 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--neural-model") {
             need(1);
             opt.neuralModelPath = argv[++i];
+        } else if (arg == "--neural-max-side") {
+            need(1);
+            opt.neuralMaxSide = parseInt(argv[++i], "neural max side");
         } else if (arg == "--flatten") {
             need(1);
             opt.flattenMode = parseFlattenMode(argv[++i]);
@@ -206,11 +270,24 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--integration-iterations") {
             need(1);
             opt.integrationIterations = parseInt(argv[++i], "integration iterations");
+        } else if (arg == "--height-solver") {
+            need(1);
+            opt.heightSolverMode = parseHeightSolverMode(argv[++i]);
+        } else if (arg == "--height-flatten") {
+            need(1);
+            opt.heightFlattenMode = parseHeightFlattenMode(argv[++i]);
+        } else if (arg == "--height-slope-cap") {
+            need(1);
+            opt.heightSlopeCap = parseDouble(argv[++i], "height slope cap");
         } else if (arg == "--no-height") {
             opt.calculateHeight = false;
         } else if (arg == "--mesh") {
             need(1);
             opt.meshPath = argv[++i];
+            opt.calculateHeight = true;
+        } else if (arg == "--printable-mesh") {
+            need(1);
+            opt.printableMeshPath = argv[++i];
             opt.calculateHeight = true;
         } else if (arg == "--mesh-step") {
             need(1);
@@ -218,6 +295,19 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--height-scale") {
             need(1);
             opt.heightScale = parseDouble(argv[++i], "height scale");
+        } else if (arg == "--printable-thickness-mm") {
+            need(1);
+            opt.printableThicknessMm = parseDouble(argv[++i], "printable thickness");
+        } else if (arg == "--rti") {
+            need(1);
+            opt.rtiPath = argv[++i];
+            opt.exportRti = true;
+        } else if (arg == "--rti-layout") {
+            need(1);
+            opt.rtiLayoutMode = parseRtiLayoutMode(argv[++i]);
+        } else if (arg == "--rti-color" || arg == "--rti-colorspace") {
+            need(1);
+            opt.rtiColorMode = parseRtiColorMode(argv[++i]);
         } else if (arg == "--view-dir") {
             need(3);
             opt.viewDir = cv::Vec3f(
@@ -267,6 +357,9 @@ Options parseArgs(int argc, char** argv) {
         opt.highOutlierThreshold > 1.0) {
         die("--high-outlier-threshold must be above --shadow-threshold and no more than 1.0.");
     }
+    if (!std::isfinite(opt.pixelScaleMm) || opt.pixelScaleMm < 0.0) {
+        die("--pixel-scale-mm must be non-negative. Use 0 to auto-read TIFF tags when possible.");
+    }
     if (opt.lightingModel == LightingModel::NearFieldRing) {
         if (opt.uncalibratedLighting) {
             die("--near-field-ring cannot be combined with --uncalibrated.");
@@ -275,9 +368,6 @@ Options parseArgs(int argc, char** argv) {
             !std::isfinite(opt.ringLightHeightMm) || opt.ringLightHeightMm <= 0.0) {
             die("--near-field-ring radius and height must be positive finite values.");
         }
-        if (!std::isfinite(opt.pixelScaleMm) || opt.pixelScaleMm < 0.0) {
-            die("--pixel-scale-mm must be positive, or 0 to auto-read TIFF tags.");
-        }
     }
     if (opt.integrationIterations < 0) {
         die("--integration-iterations must be non-negative.");
@@ -285,10 +375,19 @@ Options parseArgs(int argc, char** argv) {
     if (opt.meshStep < 1) {
         die("--mesh-step must be at least 1.");
     }
+    if (opt.neuralMaxSide < 0) {
+        die("--neural-max-side must be 0 or greater.");
+    }
+    if (!std::isfinite(opt.heightSlopeCap) || opt.heightSlopeCap < 0.0) {
+        die("--height-slope-cap must be finite and non-negative.");
+    }
     if (!std::isfinite(opt.heightScale) || opt.heightScale == 0.0) {
         die("--height-scale must be finite and non-zero.");
     }
-    if (!opt.meshPath.empty()) {
+    if (!std::isfinite(opt.printableThicknessMm) || opt.printableThicknessMm <= 0.0) {
+        die("--printable-thickness-mm must be positive.");
+    }
+    if (!opt.meshPath.empty() || !opt.printableMeshPath.empty()) {
         opt.calculateHeight = true;
     }
 

@@ -1310,9 +1310,79 @@ void flattenNormalField(cv::Mat& normalMap, const cv::Mat& validMask, FlattenMod
     }
 }
 
-cv::Mat integrateHeight(
+void clampSlopeMagnitude(cv::Mat& p, cv::Mat& q, const cv::Mat& validMask, double slopeCap) {
+    if (!std::isfinite(slopeCap) || slopeCap <= 0.0) {
+        return;
+    }
+    const float cap = static_cast<float>(slopeCap);
+    for (int y = 0; y < p.rows; ++y) {
+        float* prow = p.ptr<float>(y);
+        float* qrow = q.ptr<float>(y);
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        for (int x = 0; x < p.cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            const float px = prow[x];
+            const float qx = qrow[x];
+            if (!std::isfinite(px) || !std::isfinite(qx)) {
+                prow[x] = 0.0f;
+                qrow[x] = 0.0f;
+                continue;
+            }
+            const float magnitude = std::sqrt(px * px + qx * qx);
+            if (magnitude > cap && magnitude > 1.0e-8f) {
+                const float scale = cap / magnitude;
+                prow[x] *= scale;
+                qrow[x] *= scale;
+            }
+        }
+    }
+}
+
+cv::Mat extendMaskedFloatField(const cv::Mat& src, const cv::Mat& validMask) {
+    cv::Mat filled = cv::Mat::zeros(src.size(), CV_32F);
+    src.copyTo(filled, validMask);
+
+    cv::Mat unknown;
+    cv::bitwise_not(validMask, unknown);
+    if (cv::countNonZero(unknown) == 0 || cv::countNonZero(validMask) == 0) {
+        return filled;
+    }
+
+    cv::Mat knownWeight(src.size(), CV_32F, cv::Scalar(0));
+    knownWeight.setTo(cv::Scalar(1), validMask);
+
+    for (int pass = 0; pass < 7 && cv::countNonZero(unknown) > 0; ++pass) {
+        cv::Mat blurredValue;
+        cv::Mat blurredWeight;
+        cv::GaussianBlur(filled.mul(knownWeight), blurredValue, cv::Size(), 2.0, 2.0, cv::BORDER_REPLICATE);
+        cv::GaussianBlur(knownWeight, blurredWeight, cv::Size(), 2.0, 2.0, cv::BORDER_REPLICATE);
+
+        cv::Mat newlyKnown = unknown & (blurredWeight > 1.0e-5f);
+        for (int y = 0; y < src.rows; ++y) {
+            float* frow = filled.ptr<float>(y);
+            float* wrow = knownWeight.ptr<float>(y);
+            const float* vrow = blurredValue.ptr<float>(y);
+            const float* brow = blurredWeight.ptr<float>(y);
+            const uchar* nrow = newlyKnown.ptr<uchar>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                if (nrow[x] != 0) {
+                    frow[x] = vrow[x] / std::max(brow[x], 1.0e-6f);
+                    wrow[x] = 1.0f;
+                }
+            }
+        }
+        cv::bitwise_not(knownWeight > 0.5f, unknown);
+    }
+
+    return filled;
+}
+
+cv::Mat integrateHeightDct(
     const cv::Mat& normalMap,
     const cv::Mat& validMask,
+    double slopeCap,
     int iterations,
     const std::function<void(int, int)>& progress) {
     (void)iterations;
@@ -1334,21 +1404,20 @@ cv::Mat integrateHeight(
             qrow[x] = nrow[x][1] / nrow[x][2];
         }
     }
+    clampSlopeMagnitude(p, q, validMask, slopeCap);
+    p = extendMaskedFloatField(p, validMask);
+    q = extendMaskedFloatField(q, validMask);
     if (progress) {
         progress(1, 3);
     }
 
     cv::Mat divergence(rows, cols, CV_32F, cv::Scalar(0));
     for (int y = 0; y < rows; ++y) {
-        const uchar* mrow = validMask.ptr<uchar>(y);
         const float* prow = p.ptr<float>(y);
         const float* qrow = q.ptr<float>(y);
         const float* prevQ = y > 0 ? q.ptr<float>(y - 1) : nullptr;
         float* out = divergence.ptr<float>(y);
         for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
-            }
             const float leftP = x > 0 ? prow[x - 1] : 0.0f;
             const float upQ = y > 0 ? prevQ[x] : 0.0f;
             out[x] = (prow[x] - leftP) + (qrow[x] - upQ);
@@ -1424,6 +1493,242 @@ cv::Mat integrateHeight(
     return z;
 }
 
+void normalsToWeightedSlopes(
+    const cv::Mat& normalMap,
+    const cv::Mat& validMask,
+    double slopeCap,
+    cv::Mat& p,
+    cv::Mat& q,
+    cv::Mat& confidence) {
+    const int rows = normalMap.rows;
+    const int cols = normalMap.cols;
+    p = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+    q = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+    confidence = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+    const float cap = static_cast<float>(slopeCap > 0.0 ? slopeCap : 0.0);
+
+    for (int y = 0; y < rows; ++y) {
+        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        float* prow = p.ptr<float>(y);
+        float* qrow = q.ptr<float>(y);
+        float* crow = confidence.ptr<float>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            const cv::Vec3f normal = nrow[x];
+            if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2]) || normal[2] <= 1.0e-4f) {
+                continue;
+            }
+            float px = -normal[0] / normal[2];
+            float qx = normal[1] / normal[2];
+            float magnitude = std::sqrt(px * px + qx * qx);
+            if (!std::isfinite(magnitude)) {
+                continue;
+            }
+            if (cap > 0.0f && magnitude > 1.0e-8f) {
+                const float softMagnitude = cap * std::tanh(magnitude / cap);
+                const float scale = softMagnitude / magnitude;
+                px *= scale;
+                qx *= scale;
+                magnitude = softMagnitude;
+            }
+            const float nzWeight = std::clamp((normal[2] - 0.08f) / 0.72f, 0.0f, 1.0f);
+            const float slopeWeight = cap > 0.0f
+                ? 1.0f / std::sqrt(1.0f + (magnitude / std::max(cap, 1.0e-4f)) * (magnitude / std::max(cap, 1.0e-4f)))
+                : 1.0f;
+            prow[x] = px;
+            qrow[x] = qx;
+            crow[x] = std::max(0.03f, nzWeight * nzWeight * slopeWeight);
+        }
+    }
+}
+
+void centerHeightOverMask(cv::Mat& z, const cv::Mat& validMask) {
+    double sum = 0.0;
+    int count = 0;
+    for (int y = 0; y < z.rows; ++y) {
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        const float* zrow = z.ptr<float>(y);
+        for (int x = 0; x < z.cols; ++x) {
+            if (mrow[x] != 0 && std::isfinite(zrow[x])) {
+                sum += zrow[x];
+                ++count;
+            }
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    const float mean = static_cast<float>(sum / static_cast<double>(count));
+    for (int y = 0; y < z.rows; ++y) {
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        float* zrow = z.ptr<float>(y);
+        for (int x = 0; x < z.cols; ++x) {
+            if (mrow[x] != 0 && std::isfinite(zrow[x])) {
+                zrow[x] -= mean;
+            } else {
+                zrow[x] = 0.0f;
+            }
+        }
+    }
+}
+
+void updateRobustEdgeWeights(
+    const cv::Mat& z,
+    const cv::Mat& validMask,
+    const cv::Mat& p,
+    const cv::Mat& q,
+    const cv::Mat& confidence,
+    cv::Mat& wx,
+    cv::Mat& wy) {
+    const int rows = z.rows;
+    const int cols = z.cols;
+    constexpr float kDelta = 0.55f;
+    wx = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+    wy = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+
+    for (int y = 0; y < rows; ++y) {
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        const uchar* nextMrow = y + 1 < rows ? validMask.ptr<uchar>(y + 1) : nullptr;
+        const float* zrow = z.ptr<float>(y);
+        const float* nextZrow = y + 1 < rows ? z.ptr<float>(y + 1) : nullptr;
+        const float* prow = p.ptr<float>(y);
+        const float* qrow = q.ptr<float>(y);
+        const float* crow = confidence.ptr<float>(y);
+        const float* nextCrow = y + 1 < rows ? confidence.ptr<float>(y + 1) : nullptr;
+        float* wxrow = wx.ptr<float>(y);
+        float* wyrow = wy.ptr<float>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (mrow[x] == 0) {
+                continue;
+            }
+            if (x + 1 < cols && mrow[x + 1] != 0) {
+                const float base = 0.5f * (crow[x] + crow[x + 1]);
+                const float residual = (zrow[x + 1] - zrow[x]) - prow[x];
+                wxrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
+            }
+            if (y + 1 < rows && nextMrow[x] != 0) {
+                const float base = 0.5f * (crow[x] + nextCrow[x]);
+                const float residual = (nextZrow[x] - zrow[x]) - qrow[x];
+                wyrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
+            }
+        }
+    }
+}
+
+void sorHeightSweep(
+    cv::Mat& z,
+    const cv::Mat& validMask,
+    const cv::Mat& p,
+    const cv::Mat& q,
+    const cv::Mat& wx,
+    const cv::Mat& wy,
+    double omega) {
+    const int rows = z.rows;
+    const int cols = z.cols;
+    const float relaxation = static_cast<float>(omega);
+
+    for (int y = 0; y < rows; ++y) {
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        const uchar* prevMrow = y > 0 ? validMask.ptr<uchar>(y - 1) : nullptr;
+        const uchar* nextMrow = y + 1 < rows ? validMask.ptr<uchar>(y + 1) : nullptr;
+        float* zrow = z.ptr<float>(y);
+        const float* prevZrow = y > 0 ? z.ptr<float>(y - 1) : nullptr;
+        const float* nextZrow = y + 1 < rows ? z.ptr<float>(y + 1) : nullptr;
+        const float* prow = p.ptr<float>(y);
+        const float* qrow = q.ptr<float>(y);
+        const float* prevQrow = y > 0 ? q.ptr<float>(y - 1) : nullptr;
+        const float* wxrow = wx.ptr<float>(y);
+        const float* wyrow = wy.ptr<float>(y);
+        const float* prevWyrow = y > 0 ? wy.ptr<float>(y - 1) : nullptr;
+        for (int x = 0; x < cols; ++x) {
+            if (mrow[x] == 0) {
+                zrow[x] = 0.0f;
+                continue;
+            }
+
+            float numerator = 0.0f;
+            float denominator = 0.0f;
+            if (x + 1 < cols && mrow[x + 1] != 0) {
+                const float w = wxrow[x];
+                numerator += w * (zrow[x + 1] - prow[x]);
+                denominator += w;
+            }
+            if (x > 0 && mrow[x - 1] != 0) {
+                const float w = wxrow[x - 1];
+                numerator += w * (zrow[x - 1] + prow[x - 1]);
+                denominator += w;
+            }
+            if (y + 1 < rows && nextMrow[x] != 0) {
+                const float w = wyrow[x];
+                numerator += w * (nextZrow[x] - qrow[x]);
+                denominator += w;
+            }
+            if (y > 0 && prevMrow[x] != 0) {
+                const float w = prevWyrow[x];
+                numerator += w * (prevZrow[x] + prevQrow[x]);
+                denominator += w;
+            }
+            if (denominator > 1.0e-7f) {
+                const float candidate = numerator / denominator;
+                zrow[x] += relaxation * (candidate - zrow[x]);
+            }
+        }
+    }
+}
+
+cv::Mat integrateHeightRobustMasked(
+    const cv::Mat& normalMap,
+    const cv::Mat& validMask,
+    double slopeCap,
+    int iterations,
+    const std::function<void(int, int)>& progress) {
+    cv::Mat p;
+    cv::Mat q;
+    cv::Mat confidence;
+    normalsToWeightedSlopes(normalMap, validMask, slopeCap, p, q, confidence);
+    if (progress) {
+        progress(1, 6);
+    }
+
+    cv::Mat z = integrateHeightDct(normalMap, validMask, slopeCap, iterations, {});
+    centerHeightOverMask(z, validMask);
+    if (progress) {
+        progress(2, 6);
+    }
+
+    cv::Mat wx;
+    cv::Mat wy;
+    const int sweepsPerRound = std::max(12, std::min(45, iterations > 0 ? iterations / 30 : 24));
+    for (int round = 0; round < 4; ++round) {
+        updateRobustEdgeWeights(z, validMask, p, q, confidence, wx, wy);
+        for (int sweep = 0; sweep < sweepsPerRound; ++sweep) {
+            sorHeightSweep(z, validMask, p, q, wx, wy, 1.45);
+        }
+        centerHeightOverMask(z, validMask);
+        if (progress) {
+            progress(3 + round, 6);
+        }
+    }
+
+    return z;
+}
+
+cv::Mat integrateHeight(
+    const cv::Mat& normalMap,
+    const cv::Mat& validMask,
+    HeightSolverMode solverMode,
+    double slopeCap,
+    int iterations,
+    const std::function<void(int, int)>& progress) {
+    if (solverMode == HeightSolverMode::FastDct) {
+        return integrateHeightDct(normalMap, validMask, slopeCap, iterations, progress);
+    }
+    return integrateHeightRobustMasked(normalMap, validMask, slopeCap, iterations, progress);
+}
+
 void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask) {
     double a00 = 0.0;
     double a01 = 0.0;
@@ -1471,6 +1776,89 @@ void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask) {
                 plane[0] * static_cast<double>(x) +
                 plane[1] * static_cast<double>(y) +
                 plane[2];
+            hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
+        }
+    }
+}
+
+void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode) {
+    if (mode == HeightFlattenMode::None || height.empty() || validMask.empty()) {
+        return;
+    }
+
+    const int nTerms = mode == HeightFlattenMode::Quadratic ? 6 : 4;
+    cv::Mat normal = cv::Mat::zeros(nTerms, nTerms, CV_64F);
+    cv::Mat rhs = cv::Mat::zeros(nTerms, 1, CV_64F);
+    const double cx = 0.5 * static_cast<double>(height.cols - 1);
+    const double cy = 0.5 * static_cast<double>(height.rows - 1);
+    const double scale = std::max(1.0, 0.5 * static_cast<double>(std::max(height.cols, height.rows)));
+    int count = 0;
+
+    std::array<double, 6> terms{};
+    for (int y = 0; y < height.rows; ++y) {
+        const float* hrow = height.ptr<float>(y);
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        const double yn = (static_cast<double>(y) - cy) / scale;
+        for (int x = 0; x < height.cols; ++x) {
+            if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
+                continue;
+            }
+            const double xn = (static_cast<double>(x) - cx) / scale;
+            terms[0] = 1.0;
+            terms[1] = xn;
+            terms[2] = yn;
+            if (mode == HeightFlattenMode::Quadratic) {
+                terms[3] = xn * xn;
+                terms[4] = yn * yn;
+                terms[5] = xn * yn;
+            } else {
+                terms[3] = xn * xn + yn * yn;
+            }
+            const double z = static_cast<double>(hrow[x]);
+            for (int r = 0; r < nTerms; ++r) {
+                rhs.at<double>(r, 0) += terms[r] * z;
+                for (int c = 0; c < nTerms; ++c) {
+                    normal.at<double>(r, c) += terms[r] * terms[c];
+                }
+            }
+            ++count;
+        }
+    }
+
+    if (count < nTerms) {
+        return;
+    }
+
+    cv::Mat coeffs;
+    if (!cv::solve(normal, rhs, coeffs, cv::DECOMP_CHOLESKY) &&
+        !cv::solve(normal, rhs, coeffs, cv::DECOMP_SVD)) {
+        return;
+    }
+
+    for (int y = 0; y < height.rows; ++y) {
+        float* hrow = height.ptr<float>(y);
+        const uchar* mrow = validMask.ptr<uchar>(y);
+        const double yn = (static_cast<double>(y) - cy) / scale;
+        for (int x = 0; x < height.cols; ++x) {
+            if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
+                continue;
+            }
+            const double xn = (static_cast<double>(x) - cx) / scale;
+            terms[0] = 1.0;
+            terms[1] = xn;
+            terms[2] = yn;
+            if (mode == HeightFlattenMode::Quadratic) {
+                terms[3] = xn * xn;
+                terms[4] = yn * yn;
+                terms[5] = xn * yn;
+            } else {
+                terms[3] = xn * xn + yn * yn;
+            }
+
+            double trend = 0.0;
+            for (int i = 0; i < nTerms; ++i) {
+                trend += coeffs.at<double>(i, 0) * terms[i];
+            }
             hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
         }
     }

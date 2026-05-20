@@ -40,7 +40,10 @@ void solveUncalibratedPhotometricStereo(
 cv::Mat integrateHeight(
     const cv::Mat& normalMap,
     const cv::Mat& validMask,
+    HeightSolverMode solverMode,
+    double slopeCap,
     int iterations,
     const std::function<void(int, int)>& progress = {});
 void flattenNormalField(cv::Mat& normalMap, const cv::Mat& validMask, FlattenMode mode);
 void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask);
+void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode);

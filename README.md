@@ -19,7 +19,8 @@ The calibrated workflow is a practical photometric-stereo pipeline with optional
 5. Optionally apply relief flattening, which subtracts a broad low-frequency slope trend so smaller topographic features stand out more clearly.
 6. Optionally run experimental PS-FCN neural fusion in calibrated mode. This uses a bundled pretrained neural normal prior, fuses it with the classical normals in slope space, and writes separate classical, neural, and fused normal outputs.
 7. Generate visualization products such as `normal_rgb.png`, `albedo.png`, `residual.png`, and `liquid_metal.png`.
-8. If requested, integrate the classical normal field into a fast relative height preview and optional PLY mesh.
+8. If requested, integrate the classical normal field into a relative height preview and optional PLY mesh.
+9. If requested, export a PTM-style RTI appearance package for Relight/OpenLIME, including a DeepZoom layout option for tiled web viewing.
 
 The important boundary is that neural fusion currently helps the normal-map-style outputs only. Height preview and PLY mesh generation stay on the classical geometry path so the mesh does not inherit exaggerated slopes from the neural prior.
 
@@ -75,11 +76,11 @@ To rebuild the app, package the OpenCV DLLs, and create the installer in one ste
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
 ```
 
-The installer is written to `dist\What-A-Relief-0.1.0-Setup.exe`. It installs under `%LOCALAPPDATA%\Programs\What A Relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
+The installer is written to `dist\What-A-Relief-0.2.0-specular.2-Setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\What A Relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 
-GitHub Actions can also build the Windows installer. Run the **Windows Build** workflow manually to download the installer and portable ZIP as workflow artifacts, or push a version tag such as `v0.1.0` to publish those files on a GitHub Release.
+GitHub Actions can also build the Windows installer. Run the **Windows Build** workflow manually to download the installer and portable ZIP as workflow artifacts, or push a version tag such as `v0.2.0-specular.2` to publish those files on a GitHub Release.
 
 ## Run
 
@@ -91,9 +92,9 @@ For the GUI workflow, run the packaged executable with no arguments:
 .\build-vcpkg-direct\what-a-relief.exe
 ```
 
-The setup window lets you choose the image set, output folder, lighting mode, optional previous `lights.csv` or `light_vectors.csv`, optional near-field ring-light geometry, normal solver, optional relief flattening, sRGB handling, height preview, PLY export, experimental diagnostics, optional experimental neural fusion, and the interactive relight viewer before computation starts. If you use calibrated sphere mode, mark the sphere by clicking three points on its edge, or load a previous calibration CSV to skip sphere marking. For a previous near-field ring run, load the full `lights.csv` so the ring radius, height, and pixel scale are restored along with the light vectors. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve.
+The setup window lets you choose the image set, output folder, lighting mode, optional previous `lights.csv` or `light_vectors.csv`, optional near-field ring-light geometry, image scale, optional specimen mask for height and mesh, normal solver, optional relief flattening, sRGB handling, height solver, height-only curl correction, height preview, PLY export, optional RTI export, experimental diagnostics, optional experimental neural fusion, and the interactive relight viewer before computation starts. If you use calibrated sphere mode, mark the sphere by clicking three points on its edge, or load a previous calibration CSV to skip sphere marking. For a previous near-field ring run, load the full `lights.csv` so the ring radius, height, and pixel scale are restored along with the light vectors. If you skip the sphere, the program uses an unknown-lighting solve and requires at least 4 images. Uncalibrated mode can also crop to the surface region so shiny fixtures, the calibration sphere, and background do not contaminate the solve. The specimen height mask is separate from the solve mask: it limits only `height.png`, `height.pfm`, `height_mask.png`, and optional PLY export.
 
-The program prints progress in the console and shows a completion dialog when outputs are written. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If experimental neural fusion is enabled, the output folder also includes separate classical, neural, and fused normal-map sets so the result can be reviewed directly. Height preview and PLY export stay on the classical geometry path in that mode. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, a 3D mesh made from the reconstructed height field.
+The program prints progress in the console and shows progress in the GUI while long operations run. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If experimental neural fusion is enabled, the output folder also includes separate classical, neural, and fused normal-map sets so the result can be reviewed directly. Height preview, `surface.ply`, and `printable_surface.ply` stay on the classical geometry path in that mode. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, an open inspection mesh made from the reconstructed height field. If printable export is enabled, it also writes `printable_surface.ply`, a watertight solid PLY with a flat base.
 
 ```powershell
 .\build-vcpkg-direct\what-a-relief.exe `
@@ -106,6 +107,10 @@ The program prints progress in the console and shows a completion dialog when ou
 ```
 
 The first image opens in a picker window. Use the mouse wheel or `+`/`-` to zoom, right-drag or use `WASD`/arrow keys to pan, then click three points on the sphere edge. Press Enter or Space to accept, Backspace to remove the last point, `R` to reset the points, `0` to fit the image, or Esc to cancel.
+
+The image-scale line picker also uses a zoomable window. Click `Draw Scale Line...`, click two endpoints on the first image, then enter the known length in millimeters. The program computes the shared `mm/pixel` value used by near-field lighting and future physically scaled mesh exports.
+
+The GUI height-mask tool uses a similar zoomable window. Click around the specimen boundary and press Enter or Space; the program then shows progress while it searches for a nearby image edge, then previews the edge-refined boundary in green over your original outline in yellow. Press Enter or Space to accept the refined boundary, `B` to use your original outline, `R` to return to editing, or Esc to cancel.
 
 For repeat runs, use the sphere values written to `lights.csv`:
 
@@ -125,16 +130,20 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `lights.csv`: selected sphere geometry, estimated highlight points, light vectors, thresholds, peaks, and selected-highlight pixel counts. In uncalibrated mode this file records that no calibrated light vectors were used.
 - `light_vectors.csv`: just the `x,y,z` light vectors, suitable for `--lights-file`. In uncalibrated mode it contains only the header because no physical light vectors are estimated.
 - `normal_rgb.png`: 8-bit RGB visualization of the estimated normal map.
-- `normal_x.png`, `normal_y.png`, `normal_z.png`: 8-bit visual encodings of the normal components. `x` and `y` are mapped from `[-1, 1]` to `[0, 255]`; `z` is mapped from `[0, 1]` to `[0, 255]`.
-- `classical_normal_rgb.png`, `classical_normal_x.png`, `classical_normal_y.png`, `classical_normal_z.png`: written when experimental neural fusion is enabled. These are the classical solver normals before fusion.
-- `neural_normal_rgb.png`, `neural_normal_x.png`, `neural_normal_y.png`, `neural_normal_z.png`: written when experimental neural fusion is enabled. These are the bundled PS-FCN neural-prior normals.
-- `fused_normal_rgb.png`, `fused_normal_x.png`, `fused_normal_y.png`, `fused_normal_z.png`: written when experimental neural fusion is enabled. These are the slope-domain fused normals.
+- `normal_x.png`, `normal_y.png`, `normal_z.png`: 8-bit visual encodings of the normal field. `x` and `y` are mapped from `[-1, 1]` to `[0, 255]`; `z` is mapped from `[0, 1]` to `[0, 255]`.
+- `hillshade_ul.png`: cartographic-style hillshade from the image upper-left.
+- `classical_normal_rgb.png`, `classical_normal_x.png`, `classical_normal_y.png`, `classical_normal_z.png`, `classical_hillshade_ul.png`: written when experimental neural fusion is enabled. These are the classical solver normals before fusion.
+- `neural_normal_rgb.png`, `neural_normal_x.png`, `neural_normal_y.png`, `neural_normal_z.png`, `neural_hillshade_ul.png`: written when experimental neural fusion is enabled. These are the bundled PS-FCN neural-prior normals.
+- `fused_normal_rgb.png`, `fused_normal_x.png`, `fused_normal_y.png`, `fused_normal_z.png`, `fused_hillshade_ul.png`: written when experimental neural fusion is enabled. These are the slope-domain fused normals.
 - `albedo.png`: normalized 8-bit relative albedo or brightness-scale estimate. It is not an absolute reflectance measurement.
 - `liquid_metal.png`: normal-map chrome-style render that uses light smoothing to avoid boosting pixel-scale noise.
 - `liquid_metal_custom.png`: optional render saved from the interactive relight viewer.
 - `height.png`: optional normalized height preview from integrating the normal-derived slopes.
 - `height.pfm`: optional floating-point relative height field. With no additional scale calibration, `x` and `y` are image pixels and `z` is a relative integrated height.
+- `height_mask.png`: pixels used for height integration and PLY export. This matches `valid_mask.png` unless a specimen height mask was supplied or drawn.
 - `surface.ply`: optional binary PLY 3D mesh exported from the height preview. Vertex `x` and `y` are image pixel coordinates, `z` is the relative height preview multiplied by `--height-scale`, and vertex RGB color is grayscale albedo.
+- `printable_surface.ply`: optional binary PLY watertight solid for 3D printing. XY scale is required and coordinates are written in millimeters. The top surface uses the same height preview, the bottom is flat, and boundary edges are closed around the specimen mask.
+- `rti/`: optional RTI package. The `image` and `deepzoom` layouts target Relight/OpenLIME-style PTM exports. In RGB mode, small 3-to-8-image stacks use a stable 3-term PTM and write `plane_0.jpg` through `plane_2.jpg`; better-constrained stacks may use the 6-term PTM and write through `plane_5.jpg`. In LRGB mode, `plane_0` is a base image and the remaining planes store luminance PTM coefficients, so 3-term stacks write `plane_0.jpg` and `plane_1.jpg`. The DeepZoom layout writes `info.json`, `plane_*.dzi`, and `plane_*_files` tile folders. The `webrti` layout targets webRTIViewer and writes `info.xml` plus component tiles named like `1_1.jpg`, `1_2.jpg`, and so on.
 - `residual.png`: normalized per-pixel root-mean-square fit error. Higher values can indicate specular highlights, shadows, saturation, registration errors, non-Lambertian behavior, or bad light estimates.
 - `valid_mask.png`: pixels included in the solve.
 - `robust_weight.png`: diagnostic map from the robust calibrated solver. Darker pixels had more downweighted observations.
@@ -142,7 +151,7 @@ For repeat runs, use the sphere values written to `lights.csv`:
 - `highlight_outlier_count.png`: diagnostic map showing how many observations were rejected as high-intensity outliers.
 - `specular_cue_mask.png`: optional experimental mask of pixels that behaved like shiny or otherwise non-Lambertian outliers. It is a diagnostic, not a calibrated light estimate.
 
-When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `normal_y.png`, and `normal_z.png` are the fused normals.
+When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `normal_y.png`, `normal_z.png`, and `hillshade_ul.png` are based on the fused normals.
 
 ## Options
 
@@ -150,6 +159,7 @@ When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `no
 - `--image path`: add one input image. Use 3 to 25 times, or at least 4 times for `--uncalibrated`.
 - `--out dir`: output directory. Default: `out`.
 - `--mask path`: optional object mask. White pixels are solved. The selected sphere is removed from the solve mask unless `--keep-sphere` is used.
+- `--height-mask path`: optional specimen mask used only for height integration, `height_mask.png`, and PLY export. It does not change normals, albedo, residuals, liquid-metal renders, relighting, or solve diagnostics.
 - `--uncalibrated`: skip sphere calibration and estimate relative normals from unknown lighting. Requires at least 4 images. `--no-sphere` is accepted as an alias.
 - `--crop x y width height`: restrict the solve to a rectangular image region. Especially useful in uncalibrated mode.
 - `--sphere cx cy radius`: use a known sphere circle in image pixels and skip interactive sphere marking.
@@ -157,20 +167,29 @@ When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `no
 - `--solver standard|robust`: calibrated normal solver. `robust` is the default and uses highlight rejection plus Huber-style reweighting when enough observations are available.
 - `--high-outlier-threshold value`: normalized intensity cutoff for robust highlight/saturation rejection. Default: `0.98`.
 - `--near-field-ring radius height`: use a simple point-light ring model for calibrated solving. Radius and height are in millimeters.
-- `--pixel-scale-mm value`: pixel size in millimeters per pixel for near-field solving. Use `0` to auto-read supported TIFF physical scale tags.
+- `--pixel-scale-mm value`: image pixel size in millimeters per pixel. Use `0` to auto-read supported TIFF physical scale tags when a physical scale is required.
 - `--specular-diagnostics`: write experimental shiny-cue diagnostics such as `specular_cue_mask.png`.
 - `--neural-fusion`: run bundled PS-FCN neural inference and slope-domain fusion after the classical calibrated solve. Supports 3 to 25 calibrated images.
 - `--neural-model path`: override the bundled PS-FCN ONNX model path, or point at a directory containing the count-specific ONNX files.
+- `--neural-max-side n`: long-side pixel limit for PS-FCN inference. Default: `2048`; use `0` to try native input size first. If OpenCV DNN fails at the requested size, the program retries at lower resolution before falling back to the classical outputs.
 - `--flatten none|gentle|strong`: optional low-frequency slope flattening before outputs are written. Default: `none`.
 - `--open-relight`: open the interactive specular relight viewer after GUI processing.
 - `--highlight-percentile value`: percentile used to find the specular highlight centroid inside the selected sphere. Default: `99.8`.
 - `--min-highlight value`: minimum highlight intensity after normalization. Default: `0.05`.
 - `--shadow-threshold value`: ignore observations darker than this value. Default: `0.02`.
-- `--integration-iterations n`: legacy option accepted for old scripts; the DCT/Poisson height preview does not iterate.
+- `--integration-iterations n`: controls the work budget for the robust masked height solver. The fast DCT/Poisson solver accepts this option for old scripts but does not iterate.
+- `--height-solver robust|fast`: choose height integration method. `robust` is the default masked, weighted solver; `fast` uses the older DCT/Poisson preview.
+- `--height-flatten none|radial|quadratic`: optional height/PLY-only curl correction after normal integration. `radial` subtracts a broad dome-like trend; `quadratic` subtracts a full second-order surface. Default: `none`.
+- `--height-slope-cap value`: clamp extreme normal-derived slopes before height integration. Default: `3.0`; use `0` to disable. This affects only `height.png`, `height.pfm`, and PLY export.
 - `--no-height`: skip `height.png` and `height.pfm`. `liquid_metal.png` does not require height.
 - `--mesh path.ply`: export a PLY mesh from the height preview. This forces height calculation.
+- `--printable-mesh path.ply`: export a watertight solid PLY for 3D printing. This forces height calculation and requires `--pixel-scale-mm`, TIFF scale metadata, or a GUI scale line.
 - `--mesh-step n`: export every nth pixel to reduce PLY size. Default: `1`.
 - `--height-scale value`: multiply mesh z coordinates. Default: `1.0`.
+- `--printable-thickness-mm value`: base thickness for `--printable-mesh`. Default: `2.0`.
+- `--rti path`: export a Relight/OpenLIME PTM-style RTI package. Requires at least 3 calibrated or loaded light directions.
+- `--rti-layout image|deepzoom|webrti`: choose RTI package layout. `image` writes full-size coefficient plane JPEGs; `deepzoom` writes tiled DeepZoom pyramids; `webrti` writes a webRTIViewer-compatible `info.xml` plus quadtree component JPEGs. Default: `image`.
+- `--rti-color rgb|lrgb`: choose RTI color model. `rgb` fits separate color coefficient planes. `lrgb` writes a base RGB image plus luminance PTM coefficients, following the PTM LRGB convention used by Relight/OpenLIME. Default: `rgb`.
 - `--lights-file path`: skip sphere calibration and read known light vectors. Use a previous run's full `lights.csv` to restore near-field ring metadata, or `light_vectors.csv` when only directional vectors are needed.
 - `--keep-sphere`: keep the calibration sphere in the solve mask. By default, the selected sphere is removed before solving sample normals.
 - `--view-dir x y z`: camera view vector used for mirror-sphere light calibration. Default: `0 0 1`.
@@ -201,19 +220,21 @@ The default input interpretation treats pixel values as already linear with inte
 
 The calibrated normal solve is diffuse Lambertian. At each pixel it uses only observations above `--shadow-threshold` and requires at least 3 usable observations. The default robust solver estimates a per-pixel high-outlier threshold from the local observation distribution, caps it with `--high-outlier-threshold`, rejects very bright observations when enough images remain, and downweights large residuals with a Huber-style iteratively reweighted fit. Specular object pixels, deep shadows, saturation, interreflections, and misregistration can still show up as higher values in `residual.png`.
 
-The default lighting model treats each image as a single directional light. `--near-field-ring` instead treats the calibrated light azimuths as point lights on a ring, using the given ring radius and light height in millimeters. The program keeps the ring geometry in millimeters and converts image pixel coordinates into millimeters using `--pixel-scale-mm`; if the value is `0`, it tries to read common TIFF physical scale tags from the first input image. This can better approximate close microscope ring lights, but it is still a geometric approximation unless the pixel scale and ring geometry match the actual optical setup.
+The default lighting model treats each image as a single directional light. `--near-field-ring` instead treats the calibrated light azimuths as point lights on a ring, using the given ring radius and light height in millimeters. The program keeps the ring geometry in millimeters and converts image pixel coordinates into millimeters using `--pixel-scale-mm`; if the value is `0`, it tries to read common TIFF physical scale tags from the first input image. In the GUI, the same value can be set by drawing a scale line of known length on the first image. This can better approximate close microscope ring lights, but it is still a geometric approximation unless the pixel scale and ring geometry match the actual optical setup.
 
 `--specular-diagnostics` is experimental. It writes a mask of pixels whose observations were rejected or strongly downweighted by the robust solver, which can help identify shiny scene features. The current application does not yet use those pixels to solve lighting directions.
 
-Experimental neural fusion uses bundled PS-FCN ONNX exports for 3 through 25 calibrated images. The network provides a qualitative dense normal prior, which What A Relief fuses with the classical normals in slope space using a confidence term derived from the classical residual and robust diagnostics. Because this neural prior was not trained for near-field microscope metrology, the fused normals are intended for visualization-oriented normal products. Height preview and PLY export remain on the classical geometry path in this mode, and the app warns about that when neural fusion is enabled.
+Experimental neural fusion uses bundled PS-FCN ONNX exports for 3 through 25 calibrated images. The network provides a qualitative dense normal prior, which What A Relief fuses with the classical normals in slope space using a confidence term derived from the classical residual and robust diagnostics. Because this neural prior was not trained for near-field microscope metrology, the fused normals are intended for visualization-oriented normal products. Height preview and PLY export remain on the classical geometry path in this mode, and the app warns about that when neural fusion is enabled. Neural inference runs with a default long-side limit of 2048 pixels to avoid very large OpenCV DNN tensors; `--neural-max-side 0` tries native input size first.
 
-Optional relief flattening removes a broad low-frequency slope trend from the normal field so smaller surface features stand out. This is a visualization control, not calibrated metrological form removal; leave it off when large-scale curvature or tilt is part of the scientific question.
+Optional relief flattening removes a broad low-frequency slope trend from the normal field so smaller surface features stand out. This affects the normal visualizations, liquid-metal render, optional height preview, and optional PLY mesh. It is a visualization control, not calibrated metrological form removal; leave it off when large-scale curvature or tilt is part of the scientific question.
 
 Uncalibrated no-sphere mode is useful for visual relief enhancement when a highlight sphere is not available, but its normals, height, and PLY mesh are relative. The solver stabilizes the visual-relief slopes and removes a best-fit plane from the height preview, but the remaining unknown-lighting ambiguity can still stretch, shear, or rotate the recovered relief. In the current implementation the displayed height preview also has a best-fit plane removed after integration so broad ramps do not dominate the visualization. Use sphere calibration when geometry needs to be physically meaningful.
 
-The height output is an optional DCT/Poisson preview integration of normals, not a calibrated metrology surface. It is fast and useful for visualization, but calibrated depth requires pixel pitch, optical calibration, lens distortion correction, validation of the light directions, and a more rigorous treatment of boundary conditions and missing data.
+The height output is an optional relative integration of normals, not a calibrated metrology surface. Calibrated depth requires pixel pitch, optical calibration, lens distortion correction, validation of the light directions, and careful treatment of boundary conditions and missing data. The default robust masked solver works only inside the height mask, downweights very steep or inconsistent slope constraints, and iteratively solves a weighted Poisson-style problem so large normal errors are less likely to smear into image-wide ramps. The older `--height-solver fast` path remains available when speed matters most; it uses a DCT/Poisson preview and extends the slope field outside the mask before solving to reduce boundary jumps. When the specimen sits above a visible table or background, use the GUI height-mask tool or `--height-mask` to keep the integration and mesh domain on the specimen surface without changing the normal solve. If the integrated height still has broad edge curl, the height-only curl correction can subtract a radial dome or quadratic trend from `height.png`, `height.pfm`, and PLY without changing normal maps, albedo, residuals, or liquid-metal renders.
 
-PLY meshes are written as binary little-endian files for faster export. They use image pixel coordinates for `x` and `y` and the relative height preview for `z`. Use `--height-scale` for visual exaggeration and `--mesh-step` to keep large captures from producing enormous files.
+PLY meshes are written as binary little-endian files for faster export. The regular `surface.ply` uses image pixel coordinates for `x` and `y` and the relative height preview for `z`. Use `--height-scale` for visual exaggeration and `--mesh-step` to keep large captures from producing enormous files. The printable PLY export writes a closed solid with duplicated bottom vertices, reversed bottom faces, and side faces along every open boundary edge. Printable export requires XY scale so coordinates and base thickness are in millimeters.
+
+RTI export writes a practical PTM-style appearance package from the original color image stack and the calibrated or loaded light directions. Three-to-eight-image stacks use a stable first-order 3-term PTM because small ring-light captures do not constrain the quadratic PTM terms well enough. Larger, better-constrained stacks use the six-term PTM when the light geometry is numerically stable, otherwise they also fall back to the 3-term model. RGB mode fits independent color coefficient planes. LRGB mode follows the PTM LRGB model: it stores a base color image and fits the lighting-dependent variation as relative luminance, which can be useful when the viewer should preserve an albedo-like base appearance while relighting. LRGB is still multiplicative in standard RTI viewers, so it is not a separate additive shadow-fill layer. Use the plain image layout for small Relight/OpenLIME data, the DeepZoom layout for tiled OpenLIME-style viewing, and the webRTIViewer layout when your site calls `createRtiViewer(...)` from jcupitt/webRTIViewer. This is an appearance export, not a height or mesh export.
 
 In the interactive specular relight viewer, drag near the image edges for very low raking light that emphasizes broad topographic features.
 
@@ -228,9 +249,14 @@ This project stands on a long line of photometric stereo and shape-reconstructio
 - Tony Lindeberg's scale-space work and ISO 16610-61's areal Gaussian filtering standard are relevant background for the optional low-frequency relief-flattening control. This implementation is only a practical visualization filter.
 - Robert T. Frankot and Rama Chellappa's integrability work is part of the background for turning normal/slope fields into coherent surfaces: "A Method for Enforcing Integrability in Shape from Shading Algorithms," IEEE TPAMI 10(4), 439-451, 1988. DOI: https://doi.org/10.1109/34.3909
 - Tal Simchony, Rama Chellappa, and M. Shao's direct Poisson solvers using fast orthogonal transforms inspired the fast DCT/Poisson height preview: "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems," IEEE TPAMI 12(5), 435-446, 1990. DOI: https://doi.org/10.1109/34.55103
+- Tom Malzbender, Dan Gelb, and Hans Wolters introduced Polynomial Texture Maps and the LRGB PTM representation used by many RTI viewers: "Polynomial Texture Maps," SIGGRAPH 2001, 519-528. DOI: https://doi.org/10.1145/383259.383320
+- Yvain Queau, Jean-Denis Durou, and Jean-Francois Aujol's normal-integration survey and variational-methods papers informed the robust masked height solver and its treatment of non-rectangular domains and unreliable gradients. See "Normal Integration: A Survey," Journal of Mathematical Imaging and Vision 60(4), 576-593, 2018, DOI: https://doi.org/10.1007/s10851-017-0773-x, and "Variational Methods for Normal Integration," Journal of Mathematical Imaging and Vision 60(4), 609-632, 2018, DOI: https://doi.org/10.1007/s10851-017-0777-6
+- Amit Agrawal, Rama Chellappa, and Ramesh Raskar's work on reconstructing from non-integrable gradient fields is relevant background for containing gradient errors instead of letting them create broad warps: "An Algebraic Approach to Surface Reconstruction from Gradient Fields," ICCV 2005, 174-181.
 - Guanying Chen, Kai Han, and Kwan-Yee K. Wong developed PS-FCN, the pretrained neural photometric-stereo model used here as an optional qualitative normal prior for experimental fusion: "PS-FCN: A Flexible Learning Framework for Photometric Stereo," ECCV 2018. DOI: https://doi.org/10.1007/978-3-030-01252-6_1
 
-Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing against Relight helped identify useful workflow ideas, especially explicit robust-normal and flattening controls. What A Relief does not include Relight source code. Relight is available at https://github.com/cnr-isti-vclab/relight, with software releases archived on Zenodo.
+Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing against Relight helped identify useful workflow ideas, especially explicit robust-normal controls, flattening controls, optional radial/quadratic surface flattening for height or mesh outputs, and Relight/OpenLIME-style RTI package export. What A Relief does not include Relight source code. Relight is available at https://github.com/cnr-isti-vclab/relight, with software releases archived on Zenodo.
+
+webRTIViewer and webGLRTIMaker from Gianpaolo Palma, Marco Di Benedetto, CNR-ISTI, and John Cupitt's GitHub mirror are acknowledged for the webRTIViewer component-tile layout supported by `--rti-layout webrti`. What A Relief writes compatible folders but does not include webRTIViewer source code. webRTIViewer is available at https://github.com/jcupitt/webRTIViewer.
 
 The implementation uses OpenCV for image I/O, image processing, DNN inference, and GUI windows, and vcpkg/CMake to make the Windows OpenCV dependency reproducible. Optional experimental neural-fusion builds bundle PS-FCN-derived ONNX assets under the upstream MIT license; see `THIRD_PARTY_NOTICES.md`, `assets\models\NOTICE.txt`, and `assets\models\LICENSE-PS-FCN.txt`.
 

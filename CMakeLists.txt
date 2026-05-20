@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhatARelief
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
@@ -23,14 +23,17 @@ add_executable(what-a-relief
     src/gui_workflow.cpp
     src/image_io.cpp
     src/main.cpp
+    src/mask_ui.cpp
     src/neural_fusion.cpp
     src/photometric.cpp
     src/relight_ui.cpp
+    src/rti_export.cpp
+    src/scale_ui.cpp
     src/sphere_ui.cpp)
 
 target_link_libraries(what-a-relief PRIVATE ${OpenCV_LIBS})
 if(WIN32)
-    target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32 gdi32)
+    target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32 gdi32 comctl32)
 endif()
 target_compile_features(what-a-relief PRIVATE cxx_std_17)
 

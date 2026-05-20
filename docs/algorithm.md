@@ -55,11 +55,11 @@ Fusion is done in slope space rather than by directly averaging RGB normals:
 5. Clamp the fused slope magnitude against the classical slope distribution.
 6. Convert the fused slopes back into a normal map.
 
-The fused normals are used for the visualization-oriented normal outputs. To avoid exaggerated geometry, height preview and PLY mesh generation remain on the classical geometry path even when neural fusion is enabled. Fusion runs write three explicit normal sets: classical, neural, and fused.
+The fused normals are used for the visualization-oriented normal outputs. To avoid exaggerated geometry, height preview and PLY mesh generation remain on the classical geometry path even when neural fusion is enabled. Fusion runs write three explicit normal sets: classical, neural, and fused, including the RGB normal image, X/Y/Z component images, and an upper-left hillshade image.
 
 ## Near-Field Ring Lighting
 
-The standard calibrated solve uses one global light direction per image. This is appropriate when illumination is approximately directional at the sample scale. For close microscope or ring-light geometries, `--near-field-ring radius height` can instead treat each image as a point light on a ring. The sphere-derived or file-supplied light vector provides the azimuth of the light, while the user-provided radius and height define the point-light position in millimeters. Image pixel locations are converted into millimeters using `--pixel-scale-mm`, or by reading common TIFF physical scale tags when possible; the light positions themselves are not stored as image-pixel dimensions.
+The standard calibrated solve uses one global light direction per image. This is appropriate when illumination is approximately directional at the sample scale. For close microscope or ring-light geometries, `--near-field-ring radius height` can instead treat each image as a point light on a ring. The sphere-derived or file-supplied light vector provides the azimuth of the light, while the user-provided radius and height define the point-light position in millimeters. Image pixel locations are converted into millimeters using `--pixel-scale-mm`, by reading common TIFF physical scale tags when possible, or in the GUI by drawing a scale line of known length on the first image; the light positions themselves are not stored as image-pixel dimensions.
 
 For each solved pixel, the light vector is recomputed from the surface pixel to the corresponding point light:
 
@@ -69,7 +69,7 @@ S = (radius_mm * cos(theta), radius_mm * sin(theta), height_mm)
 L = normalize(S - P)
 ```
 
-This is an approximation. It can reduce systematic errors when the light is close, but it does not yet model lens perspective, true 3D sample height, LED size, falloff, or spatial illumination nonuniformity. TIFF metadata support currently covers common classic TIFF resolution tags and the GeoTIFF pixel-scale tag; when those are absent or ambiguous, enter the pixel scale manually.
+This is an approximation. It can reduce systematic errors when the light is close, but it does not yet model lens perspective, true 3D sample height, LED size, falloff, or spatial illumination nonuniformity. TIFF metadata support currently covers common classic TIFF resolution tags and the GeoTIFF pixel-scale tag; when those are absent or ambiguous, enter the pixel scale manually or draw a scale line from a known ruler/scale bar in the image.
 
 This direct solve supports 3 to 25 images. It does not use conventional RTI fitting because these captures usually have too few lighting samples for that style of spherical-harmonic reconstruction.
 
@@ -78,6 +78,8 @@ This direct solve supports 3 to 25 images. It does not use conventional RTI fitt
 Optional relief flattening removes a low-frequency slope trend from the normal field before writing the normal visualizations, relit image, optional height preview, and optional PLY mesh. The program converts normals to slopes, estimates a broad Gaussian low-pass version of those slopes inside the valid mask, subtracts a fraction of that low-frequency component, and converts the remaining slopes back to normals.
 
 The goal is visual: broad sample tilt or curvature can be reduced so smaller topographic features stand out without sharpening pixel-scale noise. This is best understood as scale separation, related to Gaussian scale-space filtering and surface-texture filtering practice, not as calibrated form removal for metrology. Leave this option off when the large-scale shape itself is scientifically important.
+
+Height curl correction is separate. It is applied only after height integration and only affects `height.png`, `height.pfm`, and PLY export. The radial mode subtracts a fitted centered dome term plus residual plane. The quadratic mode subtracts a full second-order surface (`1, x, y, x^2, y^2, xy`) over the height mask. These options are intended for broad integration curl, not for calibrated form removal.
 
 ## Uncalibrated Unknown Lighting
 
@@ -96,11 +98,41 @@ dz/dx   = -nx / nz
 dz/drow =  ny / nz
 ```
 
-The program then solves a Poisson-style integration using a DCT. Invalid pixels have zero gradients in the current preview solver, and the solution is mean-centered over the valid mask.
+The default height solver is a masked, weighted Poisson-style integration. It works on the specimen height mask rather than on the full rectangular image, soft-clamps extremely steep normal-derived slopes, assigns lower confidence to grazing normals, and runs a small iteratively reweighted solve so inconsistent gradient constraints have less ability to produce broad ramps.
 
-The result is useful for visual inspection, while `normal_rgb.png`, the component maps, and `residual.png` remain the primary outputs. In the current implementation, the height preview has a best-fit plane removed after integration so broad image-wide ramps do not dominate the display.
+The faster optional solver uses a DCT/Poisson preview. Because a DCT solve expects a rectangular domain, the program fills the slope field outside the integration mask before solving and then mean-centers the result over the geometry mask.
 
-If requested, the height preview can also be exported as a binary little-endian PLY mesh.
+By default the geometry mask is the solved-pixel mask. If the user supplies or draws a specimen height mask, that mask is intersected with the solved-pixel mask and used only for height integration and PLY export. This is intended for specimens sitting above a visible table or background, where crossing the depth discontinuity can dominate the integrated height. It does not change `normal_rgb.png`, the component maps, albedo, residuals, liquid-metal renders, relighting, or solve diagnostics.
+
+The result is useful for visual inspection, while `normal_rgb.png`, the component maps, and `residual.png` remain the primary outputs. The height preview has a best-fit plane removed after integration so broad image-wide ramps do not dominate the display.
+
+If height-only curl correction is enabled, the program then subtracts a fitted radial dome or quadratic trend over the height mask and removes the best-fit plane again. This follows the same practical idea as RelightLab's optional radial/quadratic flattening controls: reduce broad systematic bias when the specimen is expected to be roughly flat on average, while leaving the primary normal and reflectance products untouched.
+
+If requested, the height preview can also be exported as a binary little-endian PLY mesh. The standard mesh is an open surface for inspection. The printable mesh option creates a second PLY as a watertight solid: it writes the sampled top surface, duplicates the vertices onto a flat bottom plane, writes reversed bottom faces, and closes every boundary edge with a side face. Printable export requires pixel scale and writes coordinates in millimeters.
+
+## RTI Export
+
+Optional RTI export fits a PTM-style polynomial appearance model from the original color image stack and the calibrated or loaded light directions. Small 3-to-8-image stacks use the stable first-order basis:
+
+```text
+I(u,v) = a0 + a1*u + a2*v
+```
+
+Larger, better-constrained stacks use the quadratic basis when the light geometry is numerically stable:
+
+```text
+I(u,v) = a0 + a1*u + a2*v + a3*u^2 + a4*u*v + a5*v^2
+```
+
+The coefficient planes can be stored in three layouts. The plain image and DeepZoom layouts use Relight/OpenLIME-style `info.json` plus coefficient JPEGs. RGB mode stores one RGB JPEG per PTM coefficient. LRGB mode stores an unscaled base image in `plane_0` and stores relative luminance coefficients in the remaining JPEGs; this follows the PTM LRGB convention used by Relight/OpenLIME, where the viewer multiplies the base image by the relit luminance. The plain image layout writes full-size coefficient images, and the DeepZoom layout writes one DZI pyramid per stored plane image.
+
+The webRTIViewer layout writes the older `info.xml` plus quadtree component JPEGs expected by `createRtiViewer(...)` in jcupitt/webRTIViewer. For that layout, coefficients are reordered into the shader's expected PTM order:
+
+```text
+u^2, v^2, uv, u, v, 1
+```
+
+The RGB webRTIViewer export writes six component layers, filling unconstrained high-order terms with zero for first-order exports. The LRGB webRTIViewer export writes three component layers: high-order luminance coefficients, low-order luminance coefficients, and the RGB base image.
 
 ## Related Work
 
@@ -113,8 +145,14 @@ If requested, the height preview can also be exported as a binary little-endian 
 - ISO 16610-61:2015 specifies areal Gaussian filters for separating large- and small-scale surface components in surface texture work.
 - Frankot, R. T., and Chellappa, R. "A Method for Enforcing Integrability in Shape from Shading Algorithms." IEEE Transactions on Pattern Analysis and Machine Intelligence 10(4), 439-451, 1988. https://doi.org/10.1109/34.3909
 - Simchony, T., Chellappa, R., and Shao, M. "Direct Analytical Methods for Solving Poisson Equations in Computer Vision Problems." IEEE Transactions on Pattern Analysis and Machine Intelligence 12(5), 435-446, 1990. https://doi.org/10.1109/34.55103
+- Malzbender, T., Gelb, D., and Wolters, H. "Polynomial Texture Maps." SIGGRAPH 2001, 519-528. https://doi.org/10.1145/383259.383320
+- Queau, Y., Durou, J.-D., and Aujol, J.-F. "Normal Integration: A Survey." Journal of Mathematical Imaging and Vision 60(4), 576-593, 2018. https://doi.org/10.1007/s10851-017-0773-x
+- Queau, Y., Durou, J.-D., and Aujol, J.-F. "Variational Methods for Normal Integration." Journal of Mathematical Imaging and Vision 60(4), 609-632, 2018. https://doi.org/10.1007/s10851-017-0777-6
+- Agrawal, A., Chellappa, R., and Raskar, R. "An Algebraic Approach to Surface Reconstruction from Gradient Fields." ICCV 2005, 174-181.
 - Chen, G., Han, K., and Wong, K.-Y. K. "PS-FCN: A Flexible Learning Framework for Photometric Stereo." ECCV 2018. https://doi.org/10.1007/978-3-030-01252-6_1
 
 The program also depends on OpenCV for image operations and windowing, and uses vcpkg/CMake to build OpenCV reproducibly on Windows. The optional experimental neural-fusion models are exported from the PS-FCN project and are bundled as third-party MIT-licensed assets.
 
 Relight and RelightLab from the CNR-ISTI Visual Computing Lab are acknowledged as important related RTI software. Comparing What A Relief against Relight helped identify useful workflow ideas, such as explicit robust-normal and flattening controls. What A Relief does not include Relight source code.
+
+webRTIViewer and webGLRTIMaker are acknowledged for the `info.xml` plus component-tile RTI layout supported by the `webrti` export mode. What A Relief writes compatible folders but does not include webRTIViewer source code.

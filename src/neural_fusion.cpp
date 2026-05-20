@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -20,6 +22,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kNeuralChannelsPerImage = 3;
+constexpr int kDefaultFallbackNeuralSide = 1024;
 
 [[noreturn]] void die(const std::string& message) {
     throw std::runtime_error(message);
@@ -288,29 +291,44 @@ cv::Vec3f nearFieldRingLightDirection(
         static_cast<float>(direction[2]));
 }
 
-cv::Mat runPsfcnInference(
-    const Options& opt,
+cv::Mat runPsfcnInferenceAtMaxSide(
+    const std::string& modelPath,
     const std::vector<cv::Mat>& images,
-    const std::vector<cv::Vec3f>& lights) {
-    if (images.size() < 3 || images.size() > 25 || lights.size() != images.size()) {
-        die("Experimental neural fusion currently supports 3 to 25 calibrated images.");
-    }
-
+    const std::vector<cv::Vec3f>& lights,
+    int maxSide) {
     const int originalRows = images.front().rows;
     const int originalCols = images.front().cols;
-    const int paddedRows = ((originalRows + 3) / 4) * 4;
-    const int paddedCols = ((originalCols + 3) / 4) * 4;
+    const int originalLongSide = std::max(originalRows, originalCols);
+    const double inferenceScale = maxSide <= 0 || maxSide >= originalLongSide
+        ? 1.0
+        : static_cast<double>(maxSide) / static_cast<double>(originalLongSide);
+    const int inferenceRows = std::max(4, static_cast<int>(std::lround(static_cast<double>(originalRows) * inferenceScale)));
+    const int inferenceCols = std::max(4, static_cast<int>(std::lround(static_cast<double>(originalCols) * inferenceScale)));
+    const int paddedRows = ((inferenceRows + 3) / 4) * 4;
+    const int paddedCols = ((inferenceCols + 3) / 4) * 4;
     const int imageCount = static_cast<int>(images.size());
     const float neuralNormalizeScale = std::sqrt(static_cast<float>(imageCount) / 32.0f);
     const int channels = imageCount * kNeuralChannelsPerImage;
     const int planeSize = paddedRows * paddedCols;
+
+    if (inferenceScale < 0.999) {
+        std::cout << "      PS-FCN neural prior runs at "
+                  << inferenceCols << "x" << inferenceRows
+                  << " and is upsampled to the input image size." << std::endl;
+    }
 
     std::vector<cv::Mat> paddedImages;
     paddedImages.reserve(images.size());
     cv::Mat normAccumulator(paddedRows, paddedCols, CV_32F, cv::Scalar(0));
     for (const cv::Mat& image : images) {
         cv::Mat padded(paddedRows, paddedCols, CV_32F, cv::Scalar(0));
-        image.copyTo(padded(cv::Rect(0, 0, image.cols, image.rows)));
+        cv::Mat inferenceImage;
+        if (inferenceScale < 0.999) {
+            cv::resize(image, inferenceImage, cv::Size(inferenceCols, inferenceRows), 0.0, 0.0, cv::INTER_AREA);
+        } else {
+            inferenceImage = image;
+        }
+        inferenceImage.copyTo(padded(cv::Rect(0, 0, inferenceImage.cols, inferenceImage.rows)));
         paddedImages.push_back(padded);
         cv::Mat squared;
         cv::multiply(padded, padded, squared);
@@ -344,7 +362,7 @@ cv::Mat runPsfcnInference(
         }
     }
 
-    cv::dnn::Net net = cv::dnn::readNetFromONNX(resolveModelPath(opt, images.size()));
+    cv::dnn::Net net = cv::dnn::readNetFromONNX(modelPath);
     net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
     net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     net.setInput(imageBlob, "image_stack");
@@ -357,9 +375,55 @@ cv::Mat runPsfcnInference(
         die("Unexpected PS-FCN output shape from bundled ONNX model.");
     }
 
-    cv::Mat neuralNormal = outputImages[0](cv::Rect(0, 0, originalCols, originalRows)).clone();
+    cv::Mat neuralNormal = outputImages[0](cv::Rect(0, 0, inferenceCols, inferenceRows)).clone();
+    if (inferenceScale < 0.999) {
+        cv::resize(neuralNormal, neuralNormal, cv::Size(originalCols, originalRows), 0.0, 0.0, cv::INTER_LINEAR);
+    }
     normalizeNormalMapInPlace(neuralNormal, cv::Mat(neuralNormal.size(), CV_8U, cv::Scalar(255)));
     return neuralNormal;
+}
+
+cv::Mat runPsfcnInference(
+    const Options& opt,
+    const std::vector<cv::Mat>& images,
+    const std::vector<cv::Vec3f>& lights) {
+    if (images.size() < 3 || images.size() > 25 || lights.size() != images.size()) {
+        die("Experimental neural fusion currently supports 3 to 25 calibrated images.");
+    }
+
+    const int originalLongSide = std::max(images.front().rows, images.front().cols);
+    const std::string modelPath = resolveModelPath(opt, images.size());
+    std::vector<int> attempts;
+    attempts.push_back(opt.neuralMaxSide <= 0 ? originalLongSide : opt.neuralMaxSide);
+    if (attempts.back() > kDefaultFallbackNeuralSide) {
+        attempts.push_back(kDefaultFallbackNeuralSide);
+    }
+    if (attempts.back() > 768) {
+        attempts.push_back(768);
+    }
+
+    std::string lastError;
+    for (int maxSide : attempts) {
+        try {
+            return runPsfcnInferenceAtMaxSide(modelPath, images, lights, maxSide);
+        } catch (const cv::Exception& e) {
+            lastError = e.what();
+            if (maxSide == attempts.back()) {
+                break;
+            }
+            std::cerr << "warning: PS-FCN inference failed at max side "
+                      << maxSide << "; retrying at lower resolution." << std::endl;
+        } catch (const std::bad_alloc& e) {
+            lastError = e.what();
+            if (maxSide == attempts.back()) {
+                break;
+            }
+            std::cerr << "warning: PS-FCN inference ran out of memory at max side "
+                      << maxSide << "; retrying at lower resolution." << std::endl;
+        }
+    }
+
+    die("PS-FCN inference failed at all attempted resolutions. Last error: " + lastError);
 }
 
 cv::Mat fuseNormals(

@@ -27,16 +27,42 @@ enum class LightingModel {
     NearFieldRing
 };
 
+enum class HeightSolverMode {
+    RobustMasked,
+    FastDct
+};
+
+enum class HeightFlattenMode {
+    None,
+    Radial,
+    Quadratic
+};
+
+enum class RtiLayoutMode {
+    Image,
+    DeepZoom,
+    WebRtiViewer
+};
+
+enum class RtiColorMode {
+    Rgb,
+    Lrgb
+};
+
 struct Options {
     std::vector<std::string> imagePaths;
     std::string outputDir = "out";
     std::string maskPath;
+    std::string heightMaskPath;
     std::string lightsFile;
     std::string meshPath;
+    std::string printableMeshPath;
+    std::string rtiPath;
     Sphere sphere;
     cv::Rect crop;
     bool hasSphere = false;
     bool hasCrop = false;
+    bool hasHeightMask = false;
     bool guiMode = false;
     bool noGui = false;
     bool srgb = false;
@@ -46,9 +72,14 @@ struct Options {
     bool openRelightViewer = false;
     bool specularDiagnostics = false;
     bool neuralFusion = false;
+    bool exportRti = false;
     NormalSolverMode solverMode = NormalSolverMode::Robust;
     FlattenMode flattenMode = FlattenMode::None;
     LightingModel lightingModel = LightingModel::Directional;
+    HeightSolverMode heightSolverMode = HeightSolverMode::RobustMasked;
+    HeightFlattenMode heightFlattenMode = HeightFlattenMode::None;
+    RtiLayoutMode rtiLayoutMode = RtiLayoutMode::Image;
+    RtiColorMode rtiColorMode = RtiColorMode::Rgb;
     std::string neuralModelPath;
     double highlightPercentile = 99.8;
     double minHighlight = 0.05;
@@ -59,8 +90,12 @@ struct Options {
     double pixelScaleMm = 0.0;
     int integrationIterations = 800;
     int meshStep = 1;
+    int neuralMaxSide = 2048;
+    double heightSlopeCap = 3.0;
     double heightScale = 1.0;
+    double printableThicknessMm = 2.0;
     cv::Vec3f viewDir = cv::Vec3f(0.0f, 0.0f, 1.0f);
+    cv::Mat heightMask;
 };
 
 struct PhotometricDiagnostics {
