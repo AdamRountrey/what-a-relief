@@ -336,6 +336,8 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"lights_file\": ";
     writePathOrNull(out, opt.lightsFile);
     out << ",\n";
+    out << "    \"lights_file_order_override\": "
+        << (opt.lightsFileByOrder ? "true" : "false") << ",\n";
     out << "    \"solve_mask_file\": ";
     writePathOrNull(out, opt.maskPath);
     out << ",\n";

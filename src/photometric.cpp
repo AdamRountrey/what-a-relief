@@ -699,7 +699,8 @@ bool loadLightsFileMetadata(const std::string& path, Options& opt) {
 std::vector<cv::Vec3f> loadLightsFile(
     const std::string& path,
     const std::vector<std::string>& imagePaths,
-    Options* opt) {
+    Options* opt,
+    bool useFileOrder) {
     if (opt != nullptr) {
         loadLightsFileMetadata(path, *opt);
     }
@@ -755,7 +756,7 @@ std::vector<cv::Vec3f> loadLightsFile(
 
     std::vector<cv::Vec3f> lights;
     lights.reserve(parsedLights.size());
-    if (namedCount == 0) {
+    if (namedCount == 0 || useFileOrder) {
         for (const ParsedLight& light : parsedLights) {
             lights.push_back(light.direction);
         }

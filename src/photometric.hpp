@@ -13,7 +13,8 @@ bool loadLightsFileMetadata(const std::string& path, Options& opt);
 std::vector<cv::Vec3f> loadLightsFile(
     const std::string& path,
     const std::vector<std::string>& imagePaths,
-    Options* opt = nullptr);
+    Options* opt = nullptr,
+    bool useFileOrder = false);
 cv::Mat buildObservationValidityMask(
     const std::vector<cv::Mat>& images,
     const cv::Mat& inputMask,

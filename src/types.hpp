@@ -69,6 +69,7 @@ struct Options {
     bool srgb = false;
     bool keepSphere = false;
     bool uncalibratedLighting = false;
+    bool lightsFileByOrder = false;
     bool calculateHeight = true;
     bool openRelightViewer = false;
     bool specularDiagnostics = false;

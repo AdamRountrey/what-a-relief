@@ -616,12 +616,17 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
         "run manifest must retain geometry parameters and explicit absent selections");
 
     opt.lightsFile = (root / "output" / "lights.csv").string();
+    opt.lightsFileByOrder = true;
     opt.heightMaskPath = (root / "output" / "height_mask.png").string();
     writeImageChecked(opt.heightMaskPath, mask);
     const std::string savedCalibration = readText(opt.lightsFile);
     beginRunManifest(opt);
     context.check(readText(opt.lightsFile) == savedCalibration,
         "repeat-run cleanup must preserve the calibration selected as input");
+    context.check(
+        readText(root / "output" / "run_manifest.json").find("\"lights_file_order_override\": true") !=
+            std::string::npos,
+        "run manifest must record a user-approved calibration row-order override");
     context.check(fs::is_regular_file(opt.heightMaskPath),
         "repeat-run cleanup must preserve a selected height mask until it has been read");
 

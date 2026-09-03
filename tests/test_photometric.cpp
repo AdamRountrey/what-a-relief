@@ -377,6 +377,26 @@ void testCalibrationIdentityAndValidation(TestContext& context) {
         reordered.size() == 2 && reordered[0].dot(normalized(cv::Vec3f(1.0f, 0.0f, 1.0f))) > 0.99999f &&
             reordered[1].dot(normalized(cv::Vec3f(0.0f, 1.0f, 1.0f))) > 0.99999f,
         "named calibration rows must follow selected image identity rather than CSV row order");
+    const std::vector<cv::Vec3f> orderOverride = loadLightsFile(
+        namedPath.string(),
+        {"C:/new/project/renamed_a.tif", "C:/new/project/renamed_b.tif"},
+        nullptr,
+        true);
+    context.check(
+        orderOverride.size() == 2 &&
+            orderOverride[0].dot(normalized(cv::Vec3f(0.0f, 1.0f, 1.0f))) > 0.99999f &&
+            orderOverride[1].dot(normalized(cv::Vec3f(1.0f, 0.0f, 1.0f))) > 0.99999f,
+        "explicit calibration order override must ignore stored image names and preserve CSV row order");
+    expectThrows(
+        context,
+        [&]() {
+            (void)loadLightsFile(
+                namedPath.string(),
+                {"C:/new/project/only_one_image.tif"},
+                nullptr,
+                true);
+        },
+        "calibration order override must still require one light row per selected image");
     expectThrows(
         context,
         [&]() {

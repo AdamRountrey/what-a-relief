@@ -266,11 +266,12 @@ std::string outputStatusText(const std::string& path) {
     return path;
 }
 
-std::string lightsStatusText(const std::string& path) {
-    if (path.empty()) {
+std::string lightsStatusText(const Options& opt) {
+    if (opt.lightsFile.empty()) {
         return "No previous calibration selected";
     }
-    return baseName(path) + " loaded; sphere not needed";
+    return baseName(opt.lightsFile) +
+        (opt.lightsFileByOrder ? " loaded by image order; sphere not needed" : " loaded; sphere not needed");
 }
 
 std::string heightMaskStatusText(const Options& opt) {
@@ -599,6 +600,53 @@ void showOwnerMessage(HWND owner, const std::string& title, const std::string& t
     MessageBoxA(owner, text.c_str(), title.c_str(), MB_OK | icon);
 }
 
+bool confirmLightsFileBinding(
+    HWND owner,
+    const std::string& path,
+    const std::vector<std::string>& imagePaths,
+    bool& useFileOrder) {
+    useFileOrder = false;
+    if (imagePaths.empty()) {
+        return true;
+    }
+
+    try {
+        (void)loadLightsFile(path, imagePaths, nullptr, false);
+        return true;
+    } catch (const std::exception& identityError) {
+        try {
+            (void)loadLightsFile(path, imagePaths, nullptr, true);
+        } catch (const std::exception& fileError) {
+            showOwnerMessage(
+                owner,
+                "Light Vectors",
+                std::string("The calibration file cannot be used with the selected images.\n\n") + fileError.what(),
+                MB_ICONWARNING);
+            return false;
+        }
+
+        std::ostringstream message;
+        message
+            << "The image names recorded in " << baseName(path)
+            << " do not match the selected images.\n\n"
+            << "Use the light vectors in CSV row order instead?\n\n"
+            << "This assumes the selected images are in exactly the same lighting order as the older run. "
+            << "Row 1 will apply to selected image 1, row 2 to selected image 2, and so on.\n\n"
+            << "Choose OK only if the lighting order is the same. Choose Cancel to return to setup.\n\n"
+            << "Name matching failed: " << identityError.what();
+        const int answer = MessageBoxA(
+            owner,
+            message.str().c_str(),
+            "Use Calibration by Image Order?",
+            MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (answer != IDOK) {
+            return false;
+        }
+        useFileOrder = true;
+        return true;
+    }
+}
+
 bool isSectionHeader(const SetupDialogState& state, HWND hwnd) {
     return std::find(state.sectionHeaders.begin(), state.sectionHeaders.end(), hwnd) != state.sectionHeaders.end();
 }
@@ -649,7 +697,7 @@ void updateSetupControls(SetupDialogState& state) {
     Options& opt = *state.opt;
     SetWindowTextA(state.imageStatus, imageStatusText(opt.imagePaths).c_str());
     SetWindowTextA(state.outputStatus, outputStatusText(opt.outputDir).c_str());
-    SetWindowTextA(state.lightsStatus, lightsStatusText(opt.lightsFile).c_str());
+    SetWindowTextA(state.lightsStatus, lightsStatusText(opt).c_str());
     SetWindowTextA(state.sphereStatus, opt.hasSphere ? "Sphere marked" : "No sphere marked");
     SetWindowTextA(state.cropStatus, opt.hasCrop ? "Crop selected" : "No crop selected");
     SetWindowTextA(state.heightMaskStatus, heightMaskStatusText(opt).c_str());
@@ -736,6 +784,7 @@ void selectImages(SetupDialogState& state) {
         state.opt->heightMask.release();
         state.opt->hasHeightMask = false;
         state.opt->heightMaskPath.clear();
+        state.opt->lightsFileByOrder = false;
         if (!state.opt->imagePaths.empty() &&
             (state.opt->outputDir.empty() || state.opt->outputDir == "out")) {
             state.opt->outputDir = (fs::path(state.opt->imagePaths.front()).parent_path() / "what-a-relief").string();
@@ -762,7 +811,14 @@ void selectOutput(SetupDialogState& state) {
 
 void selectLightsFile(SetupDialogState& state) {
     try {
-        state.opt->lightsFile = chooseLightsFile(state.hwnd);
+        const std::string selectedPath = chooseLightsFile(state.hwnd);
+        bool useFileOrder = false;
+        if (!confirmLightsFileBinding(
+                state.hwnd, selectedPath, state.opt->imagePaths, useFileOrder)) {
+            return;
+        }
+        state.opt->lightsFile = selectedPath;
+        state.opt->lightsFileByOrder = useFileOrder;
         state.opt->hasSphere = false;
         const bool hasMetadata = loadLightsFileMetadata(state.opt->lightsFile, *state.opt);
         if (!hasMetadata) {
@@ -791,6 +847,7 @@ void selectLightsFile(SetupDialogState& state) {
 
 void clearLightsFile(SetupDialogState& state) {
     state.opt->lightsFile.clear();
+    state.opt->lightsFileByOrder = false;
     if (state.nearFieldCheck != nullptr) {
         setButtonChecked(state.nearFieldCheck, state.opt->lightingModel == LightingModel::NearFieldRing);
     }
@@ -889,21 +946,32 @@ bool validateAndAccept(SetupDialogState& state) {
     opt.uncalibratedLighting = comboSelection(state.lightingCombo) == 1;
     if (opt.uncalibratedLighting) {
         opt.lightsFile.clear();
+        opt.lightsFileByOrder = false;
     }
     if (opt.uncalibratedLighting && opt.imagePaths.size() < 4) {
         showOwnerMessage(state.hwnd, "Setup", "Uncalibrated no-sphere mode requires at least 4 images.", MB_ICONWARNING);
         return false;
     }
     if (!opt.uncalibratedLighting && !opt.lightsFile.empty()) {
-        try {
-            (void)loadLightsFile(opt.lightsFile, opt.imagePaths, nullptr);
-        } catch (const std::exception& e) {
-            showOwnerMessage(
-                state.hwnd,
-                "Setup",
-                std::string("Loaded calibration does not match the selected images.\n\n") + e.what(),
-                MB_ICONWARNING);
-            return false;
+        if (opt.lightsFileByOrder) {
+            try {
+                (void)loadLightsFile(opt.lightsFile, opt.imagePaths, nullptr, true);
+            } catch (const std::exception& e) {
+                showOwnerMessage(
+                    state.hwnd,
+                    "Setup",
+                    std::string("The order-based calibration is no longer valid.\n\n") + e.what(),
+                    MB_ICONWARNING);
+                return false;
+            }
+        } else {
+            bool useFileOrder = false;
+            if (!confirmLightsFileBinding(
+                    state.hwnd, opt.lightsFile, opt.imagePaths, useFileOrder)) {
+                return false;
+            }
+            opt.lightsFileByOrder = useFileOrder;
+            updateSetupControls(state);
         }
     }
     if (!opt.uncalibratedLighting && buttonChecked(state.neuralFusionCheck) &&

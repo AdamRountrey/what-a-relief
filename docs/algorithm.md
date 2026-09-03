@@ -27,7 +27,7 @@ L = 2 * dot(N, V) * N - V
 
 The default view direction is `(0, 0, 1)`. Errors in the sphere outline, highlight centroid, saturation, sphere roughness, or perspective geometry directly affect the estimated light vectors.
 
-A full `lights.csv` binds each calibration row to the selected image by normalized path, with a unique filename fallback so a complete dataset can be moved to a new folder. Rows are reordered to the selected-image order, and missing or ambiguous names are rejected. The compact `light_vectors.csv` has no image identities and therefore remains explicitly positional: row `i` applies to selected image `i`.
+A full `lights.csv` normally binds each calibration row to the selected image by normalized path, with a unique filename fallback so a complete dataset can be moved to a new folder. Rows are reordered to the selected-image order. When names are missing or ambiguous but the row count and vectors are valid, the GUI can use the CSV rows positionally only after the user confirms a warning that the old and new image sets must have exactly the same lighting order. This override is recorded in `run_manifest.json`; command-line loading of named rows remains identity-matched. The compact `light_vectors.csv` has no image identities and therefore remains explicitly positional: row `i` applies to selected image `i`.
 
 ## Photometric Stereo
 

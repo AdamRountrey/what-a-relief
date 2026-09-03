@@ -127,7 +127,7 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     if (opt.uncalibratedLighting) {
         // No calibrated light vectors are available in this mode.
     } else if (!opt.lightsFile.empty()) {
-        lights = loadLightsFile(opt.lightsFile, opt.imagePaths, &opt);
+        lights = loadLightsFile(opt.lightsFile, opt.imagePaths, &opt, opt.lightsFileByOrder);
         if (opt.lightingModel == LightingModel::NearFieldRing) {
             std::cout << "      loaded near-field ring calibration metadata from: " << opt.lightsFile << std::endl;
         }
