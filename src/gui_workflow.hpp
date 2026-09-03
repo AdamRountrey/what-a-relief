@@ -4,7 +4,7 @@
 
 #include <string>
 
-void launchGuiWorkflow(Options& opt);
+bool launchGuiWorkflow(Options& opt);
 void showGuiInfo(const std::string& title, const std::string& text);
 bool askGuiYesNo(const std::string& title, const std::string& text, bool defaultYes);
 void showGuiProgress(const std::string& title, const std::string& text);

@@ -1251,6 +1251,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     makeLabel(geometryPage, "Mesh Step", kMargin, y, kLabelWidth, kRowHeight);
     state.meshStepEdit = makeControl(geometryPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdMeshStep, kControlX, y, 120, kRowHeight);
     setEditInt(state.meshStepEdit, state.opt->meshStep);
+    makeLabel(geometryPage, "1 = full; 2 = about 1/4 as many vertices", kControlX + 130, y, 300, kRowHeight);
 
     y += 40;
     makeLabel(geometryPage, "Print Base", kMargin, y, kLabelWidth, kRowHeight);
@@ -1652,7 +1653,7 @@ void closeGuiProgress() {
 #endif
 }
 
-void launchGuiWorkflow(Options& opt) {
+bool launchGuiWorkflow(Options& opt) {
 #ifdef _WIN32
     const HINSTANCE instance = GetModuleHandleA(nullptr);
     INITCOMMONCONTROLSEX controls = {};
@@ -1702,9 +1703,7 @@ void launchGuiWorkflow(Options& opt) {
         }
     }
 
-    if (!state.accepted) {
-        throw std::runtime_error("GUI setup was canceled.");
-    }
+    return state.accepted;
 #else
     (void)opt;
     throw std::runtime_error("GUI image loading is only implemented on Windows. Use --image arguments on this platform.");

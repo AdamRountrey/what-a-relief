@@ -762,6 +762,54 @@ void testPrintableMeshTopology(TestContext& context) {
     context.check(
         std::abs((minimumTop - bottom) - 1.5f) < 1.0e-5f,
         "printable PLY base thickness must be expressed in millimetres");
+
+    cv::Mat irregularMask(rows, cols, CV_8U, cv::Scalar(0));
+    for (int y = 1; y + 1 < rows; ++y) {
+        uchar* row = irregularMask.ptr<uchar>(y);
+        for (int x = 1; x + 1 < cols; ++x) {
+            row[x] = 255;
+        }
+    }
+    irregularMask.at<uchar>(3, 1) = 0;
+    irregularMask.at<uchar>(3, 4) = 0;
+    Options irregularOpt = opt;
+    irregularOpt.outputDir = (root / "irregular").string();
+    irregularOpt.meshPath = (root / "irregular" / "surface.ply").string();
+    irregularOpt.printableMeshPath = (root / "irregular" / "printable_surface.ply").string();
+    saveOutputs(
+        irregularOpt,
+        lights,
+        {},
+        normals,
+        albedo,
+        residual,
+        irregularMask,
+        {},
+        height,
+        irregularMask);
+    const PlyData irregularSolid = readBinaryPly(irregularOpt.printableMeshPath);
+    std::map<std::pair<std::int32_t, std::int32_t>, int> irregularEdges;
+    bool irregularIndicesValid = true;
+    for (const std::vector<std::int32_t>& face : irregularSolid.faces) {
+        for (size_t i = 0; i < face.size(); ++i) {
+            const std::int32_t a = face[i];
+            const std::int32_t b = face[(i + 1) % face.size()];
+            if (a < 0 || b < 0 || static_cast<size_t>(a) >= irregularSolid.vertices.size() ||
+                static_cast<size_t>(b) >= irregularSolid.vertices.size() || a == b) {
+                irregularIndicesValid = false;
+                continue;
+            }
+            ++irregularEdges[{std::min(a, b), std::max(a, b)}];
+        }
+    }
+    const bool irregularEdgesClosed = std::all_of(
+        irregularEdges.begin(),
+        irregularEdges.end(),
+        [](const auto& edge) { return edge.second == 2; });
+    context.check(irregularIndicesValid, "irregular printable PLY contains invalid face indices");
+    context.check(
+        irregularEdgesClosed,
+        "concave and internal printable PLY boundaries must remain watertight");
     fs::remove_all(root);
 }
 

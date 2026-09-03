@@ -34,12 +34,14 @@ float srgbToLinear(float encoded) {
 }
 
 void linearizeSrgbChannel(cv::Mat& channel) {
-    for (int y = 0; y < channel.rows; ++y) {
-        float* row = channel.ptr<float>(y);
-        for (int x = 0; x < channel.cols; ++x) {
-            row[x] = srgbToLinear(row[x]);
+    cv::parallel_for_(cv::Range(0, channel.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            float* row = channel.ptr<float>(y);
+            for (int x = 0; x < channel.cols; ++x) {
+                row[x] = srgbToLinear(row[x]);
+            }
         }
-    }
+    });
 }
 
 } // namespace
@@ -103,23 +105,33 @@ cv::Mat convertToLinearLuminance(const cv::Mat& input, bool srgb) {
 }
 
 double normalizeRelativeIntensityStack(std::vector<cv::Mat>& images, bool scalePeakToOne) {
-    double peak = 0.0;
-    for (cv::Mat& image : images) {
+    for (const cv::Mat& image : images) {
         if (image.depth() != CV_32F) {
             throw std::runtime_error("Relative intensity normalization requires floating-point images.");
         }
-        cv::Mat samples = image.reshape(1);
-        for (int y = 0; y < samples.rows; ++y) {
-            float* row = samples.ptr<float>(y);
-            for (int x = 0; x < samples.cols; ++x) {
-                if (!std::isfinite(row[x]) || row[x] < 0.0f) {
-                    row[x] = 0.0f;
-                } else {
-                    peak = std::max(peak, static_cast<double>(row[x]));
+    }
+
+    std::vector<double> imagePeaks(images.size(), 0.0);
+    cv::parallel_for_(cv::Range(0, static_cast<int>(images.size())), [&](const cv::Range& range) {
+        for (int i = range.start; i < range.end; ++i) {
+            cv::Mat samples = images[static_cast<size_t>(i)].reshape(1);
+            double localPeak = 0.0;
+            for (int y = 0; y < samples.rows; ++y) {
+                float* row = samples.ptr<float>(y);
+                for (int x = 0; x < samples.cols; ++x) {
+                    if (!std::isfinite(row[x]) || row[x] < 0.0f) {
+                        row[x] = 0.0f;
+                    } else {
+                        localPeak = std::max(localPeak, static_cast<double>(row[x]));
+                    }
                 }
             }
+            imagePeaks[static_cast<size_t>(i)] = localPeak;
         }
-    }
+    });
+    const double peak = imagePeaks.empty()
+        ? 0.0
+        : *std::max_element(imagePeaks.begin(), imagePeaks.end());
     if (!std::isfinite(peak) || peak <= std::numeric_limits<float>::epsilon()) {
         throw std::runtime_error("Input image stack contains no positive finite intensity values.");
     }

@@ -343,29 +343,33 @@ cv::Mat encodeCoefficientJpeg(const cv::Mat& coeff, int coefficientIndex, std::v
         scales[coefficientIndex * 3 + rgb] = scale;
         biases[coefficientIndex * 3 + rgb] = bias;
 
-        for (int y = 0; y < coeff.rows; ++y) {
-            const cv::Vec3f* src = coeff.ptr<cv::Vec3f>(y);
-            cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
-            for (int x = 0; x < coeff.cols; ++x) {
-                const double unit = (static_cast<double>(src[x][bgr]) - minValue) / scale;
-                dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+        cv::parallel_for_(cv::Range(0, coeff.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                const cv::Vec3f* src = coeff.ptr<cv::Vec3f>(y);
+                cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < coeff.cols; ++x) {
+                    const double unit = (static_cast<double>(src[x][bgr]) - minValue) / scale;
+                    dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+                }
             }
-        }
+        });
     }
     return encoded;
 }
 
 cv::Mat encodeLrgbBaseJpeg(const cv::Mat& baseImage) {
     cv::Mat encoded(baseImage.size(), CV_8UC3);
-    for (int y = 0; y < baseImage.rows; ++y) {
-        const cv::Vec3f* src = baseImage.ptr<cv::Vec3f>(y);
-        cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < baseImage.cols; ++x) {
-            for (int bgr = 0; bgr < 3; ++bgr) {
-                dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(src[x][bgr] * 255.0f), 0.0f, 255.0f));
+    cv::parallel_for_(cv::Range(0, baseImage.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* src = baseImage.ptr<cv::Vec3f>(y);
+            cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < baseImage.cols; ++x) {
+                for (int bgr = 0; bgr < 3; ++bgr) {
+                    dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(src[x][bgr] * 255.0f), 0.0f, 255.0f));
+                }
             }
         }
-    }
+    });
     return encoded;
 }
 
@@ -417,14 +421,16 @@ cv::Mat encodeLrgbCoefficientJpeg(
         scales[static_cast<size_t>(planeIndex)] = scale;
         biases[static_cast<size_t>(planeIndex)] = bias;
 
-        for (int y = 0; y < encoded.rows; ++y) {
-            const float* src = coeffImages[static_cast<size_t>(coeffIndex)].ptr<float>(y);
-            cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
-            for (int x = 0; x < encoded.cols; ++x) {
-                const double unit = (static_cast<double>(src[x]) - minValue) / scale;
-                dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+        cv::parallel_for_(cv::Range(0, encoded.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                const float* src = coeffImages[static_cast<size_t>(coeffIndex)].ptr<float>(y);
+                cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < encoded.cols; ++x) {
+                    const double unit = (static_cast<double>(src[x]) - minValue) / scale;
+                    dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+                }
             }
-        }
+        });
     }
     return encoded;
 }
@@ -473,8 +479,10 @@ void writeDeepZoomPyramid(const cv::Mat& image, const fs::path& basePath, int qu
         fs::create_directories(levelDir);
         const int tilesX = (levelImage.cols + tileSize - 1) / tileSize;
         const int tilesY = (levelImage.rows + tileSize - 1) / tileSize;
-        for (int ty = 0; ty < tilesY; ++ty) {
-            for (int tx = 0; tx < tilesX; ++tx) {
+        cv::parallel_for_(cv::Range(0, tilesX * tilesY), [&](const cv::Range& range) {
+            for (int tileIndex = range.start; tileIndex < range.end; ++tileIndex) {
+                const int tx = tileIndex % tilesX;
+                const int ty = tileIndex / tilesX;
                 const cv::Rect roi(
                     tx * tileSize,
                     ty * tileSize,
@@ -485,7 +493,7 @@ void writeDeepZoomPyramid(const cv::Mat& image, const fs::path& basePath, int qu
                     levelImage(roi),
                     params);
             }
-        }
+        });
     }
 }
 
@@ -641,16 +649,18 @@ cv::Mat encodeWebRtiRgbCoefficient(const cv::Mat& coeff, double& scale, double& 
     scale = maxValue - minValue;
     bias = -minValue / scale * 255.0;
     cv::Mat encoded(coeff.size(), CV_8UC3, cv::Scalar(0, 0, 0));
-    for (int y = 0; y < coeff.rows; ++y) {
-        const cv::Vec3f* src = coeff.ptr<cv::Vec3f>(y);
-        cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < coeff.cols; ++x) {
-            for (int bgr = 0; bgr < 3; ++bgr) {
-                const double unit = (static_cast<double>(src[x][bgr]) - minValue) / scale;
-                dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+    cv::parallel_for_(cv::Range(0, coeff.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* src = coeff.ptr<cv::Vec3f>(y);
+            cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < coeff.cols; ++x) {
+                for (int bgr = 0; bgr < 3; ++bgr) {
+                    const double unit = (static_cast<double>(src[x][bgr]) - minValue) / scale;
+                    dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+                }
             }
         }
-    }
+    });
     return encoded;
 }
 
@@ -678,14 +688,16 @@ cv::Mat encodeWebRtiLrgbGroup(
         const double bias = -minValue / scale * 255.0;
         scales[static_cast<size_t>(webCoeff)] = scale;
         biases[static_cast<size_t>(webCoeff)] = bias;
-        for (int y = 0; y < encoded.rows; ++y) {
-            const float* src = coeff.ptr<float>(y);
-            cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
-            for (int x = 0; x < encoded.cols; ++x) {
-                const double unit = (static_cast<double>(src[x]) - minValue) / scale;
-                dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+        cv::parallel_for_(cv::Range(0, encoded.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                const float* src = coeff.ptr<float>(y);
+                cv::Vec3b* dst = encoded.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < encoded.cols; ++x) {
+                    const double unit = (static_cast<double>(src[x]) - minValue) / scale;
+                    dst[x][bgr] = static_cast<uchar>(std::clamp(std::round(unit * 255.0), 0.0, 255.0));
+                }
             }
-        }
+        });
     }
     return encoded;
 }
@@ -814,16 +826,19 @@ void writeWebRtiLayerTiles(
     layer.copyTo(square(cv::Rect(offsetX, offsetY, imageSize.width, imageSize.height)));
 
     const std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, quality};
-    for (const WebRtiNode& node : nodes) {
-        if (!node.valid) {
-            continue;
+    cv::parallel_for_(cv::Range(0, static_cast<int>(nodes.size())), [&](const cv::Range& range) {
+        for (int i = range.start; i < range.end; ++i) {
+            const WebRtiNode& node = nodes[static_cast<size_t>(i)];
+            if (!node.valid) {
+                continue;
+            }
+            cv::Mat cropped = cropWithBlackBorder(square, node.rect);
+            cv::Mat tile;
+            cv::resize(cropped, tile, cv::Size(tileSize + 2, tileSize + 2), 0.0, 0.0, cv::INTER_AREA);
+            const std::string name = std::to_string(node.index + 1) + "_" + std::to_string(layerIndex) + ".jpg";
+            writeImageChecked(outputDir / name, tile, params);
         }
-        cv::Mat cropped = cropWithBlackBorder(square, node.rect);
-        cv::Mat tile;
-        cv::resize(cropped, tile, cv::Size(tileSize + 2, tileSize + 2), 0.0, 0.0, cv::INTER_AREA);
-        const std::string name = std::to_string(node.index + 1) + "_" + std::to_string(layerIndex) + ".jpg";
-        writeImageChecked(outputDir / name, tile, params);
-    }
+    });
 }
 
 void writeWebRtiInfoXml(
@@ -1003,15 +1018,17 @@ void exportRtiPackage(
         for (cv::Mat& plane : coeffImages) {
             plane = cv::Mat(expectedSize, CV_32F, cv::Scalar(0));
         }
-        for (int y = 0; y < expectedSize.height; ++y) {
-            for (int x = 0; x < expectedSize.width; ++x) {
-                const std::array<double, 6> coeffs =
-                    solvePixelLuminanceCoefficients(images, baseImage, bases, normal, basisCount, x, y);
-                for (int p = 0; p < basisCount; ++p) {
-                    coeffImages[static_cast<size_t>(p)].ptr<float>(y)[x] = static_cast<float>(coeffs[p]);
+        cv::parallel_for_(cv::Range(0, expectedSize.height), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                for (int x = 0; x < expectedSize.width; ++x) {
+                    const std::array<double, 6> coeffs =
+                        solvePixelLuminanceCoefficients(images, baseImage, bases, normal, basisCount, x, y);
+                    for (int p = 0; p < basisCount; ++p) {
+                        coeffImages[static_cast<size_t>(p)].ptr<float>(y)[x] = static_cast<float>(coeffs[p]);
+                    }
                 }
             }
-        }
+        });
 
         if (opt.rtiLayoutMode == RtiLayoutMode::WebRtiViewer) {
             reportProgress(progress, "RTI: writing webRTIViewer LRGB component tiles...");
@@ -1065,20 +1082,22 @@ void exportRtiPackage(
     }
 
     reportProgress(progress, "RTI: fitting PTM coefficient planes...");
-    for (int y = 0; y < expectedSize.height; ++y) {
-        for (int x = 0; x < expectedSize.width; ++x) {
-            std::array<std::array<double, 6>, 3> channelCoeffs{};
-            for (int c = 0; c < 3; ++c) {
-                channelCoeffs[c] = solvePixelCoefficients(images, bases, normal, basisCount, x, y, c);
-            }
-            for (int p = 0; p < basisCount; ++p) {
-                cv::Vec3f& dst = coeffImages[p].ptr<cv::Vec3f>(y)[x];
-                dst[0] = static_cast<float>(channelCoeffs[2][p]);
-                dst[1] = static_cast<float>(channelCoeffs[1][p]);
-                dst[2] = static_cast<float>(channelCoeffs[0][p]);
+    cv::parallel_for_(cv::Range(0, expectedSize.height), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            for (int x = 0; x < expectedSize.width; ++x) {
+                std::array<std::array<double, 6>, 3> channelCoeffs{};
+                for (int c = 0; c < 3; ++c) {
+                    channelCoeffs[c] = solvePixelCoefficients(images, bases, normal, basisCount, x, y, c);
+                }
+                for (int p = 0; p < basisCount; ++p) {
+                    cv::Vec3f& dst = coeffImages[p].ptr<cv::Vec3f>(y)[x];
+                    dst[0] = static_cast<float>(channelCoeffs[2][p]);
+                    dst[1] = static_cast<float>(channelCoeffs[1][p]);
+                    dst[2] = static_cast<float>(channelCoeffs[0][p]);
+                }
             }
         }
-    }
+    });
 
     if (opt.rtiLayoutMode == RtiLayoutMode::WebRtiViewer) {
         reportProgress(progress, "RTI: writing webRTIViewer RGB component tiles...");

@@ -37,6 +37,7 @@ public:
 private:
     std::filesystem::path finalPath_;
     std::filesystem::path temporaryPath_;
+    std::vector<char> buffer_;
     std::ofstream output_;
     bool committed_ = false;
 };

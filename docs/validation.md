@@ -84,6 +84,19 @@ $env:Path = "$PWD\build\ninja-vcpkg\vcpkg_installed\x64-windows\bin;$env:Path"
 
 On the development host, row-parallel execution reduced the fixed benchmark from `0.733 s` to `0.105 s` (about 7 times faster), with the identical checksum `5857367.868086`.
 
+`what-a-relief-output-benchmark` writes the normal products, height products, full-resolution open PLY, and watertight printable PLY for a deterministic 768 x 1024 surface. It is also observational rather than a CI timing gate:
+
+```powershell
+cmake --build build\ninja-vcpkg --target what-a-relief-output-benchmark
+.\build\ninja-vcpkg\what-a-relief-output-benchmark.exe 768 1024 1
+```
+
+The optional fourth argument fixes the OpenCV worker count, which is useful for comparing the row-parallel preparation stages. On the development host, buffered binary records, row-batched PFM output, shared sampled topology, compact printable-boundary bookkeeping, and parallel image preparation reduced this 100.754 MB output benchmark from `2.311 s` to `0.214 s` (about 10.8 times faster). The current implementation took `0.286 s` with one worker in the same cached 768 x 1024 test. At 1536 x 2048, it wrote 401.806 MB in `0.953 s` with one worker and `0.553 s` with the normal 20-worker pool. Exact timings depend strongly on storage and filesystem caching.
+
+The standalone executable copied into the installer and portable package must also be a release build. A fixed five-image development fixture took `10.404 s` without MSVC optimization and `2.771 s` with `/O2` for the normal no-height workflow. The same fixture with an LRGB webRTIViewer export took `18.873 s` and `4.396 s`, respectively. These observations guard against accidentally shipping an unoptimized executable; they are not CI timing thresholds.
+
+On that optimized five-image fixture, enabling fast DCT height increased total runtime only from `2.771 s` to `2.989 s`; robust masked height took `13.398 s`. The robust solver deliberately retains ordered SOR updates, so it is expected to remain the slower choice. Changing that update ordering would require separate numerical-quality validation rather than being treated as a behavior-preserving optimization.
+
 PS-FCN still requires two dense `3 * image_count * height * width` float input tensors. Neural preprocessing now uses one image-sized scratch buffer rather than retaining a second padded copy of every input. This removes exactly `4 * image_count * padded_height * padded_width` bytes from that preprocessing working set, about 400 MiB for 25 images at 2048 x 2048. Network activations can require substantially more memory, so the existing lower-resolution retry remains necessary.
 
 ## Interpretation Limits

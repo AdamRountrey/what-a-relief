@@ -189,33 +189,37 @@ double lightConditionNumber(const std::vector<cv::Vec3f>& lights) {
 cv::Mat maskedGaussianBlurFloat(const cv::Mat& src, const cv::Mat& mask, double sigma) {
     cv::Mat weighted = cv::Mat::zeros(src.size(), CV_32F);
     cv::Mat weights = cv::Mat::zeros(src.size(), CV_32F);
-    for (int y = 0; y < src.rows; ++y) {
-        const float* srow = src.ptr<float>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        float* wrow = weighted.ptr<float>(y);
-        float* weightRow = weights.ptr<float>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            if (mrow[x] == 0 || !std::isfinite(srow[x])) {
-                continue;
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* srow = src.ptr<float>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            float* wrow = weighted.ptr<float>(y);
+            float* weightRow = weights.ptr<float>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                if (mrow[x] == 0 || !std::isfinite(srow[x])) {
+                    continue;
+                }
+                wrow[x] = srow[x];
+                weightRow[x] = 1.0f;
             }
-            wrow[x] = srow[x];
-            weightRow[x] = 1.0f;
         }
-    }
+    });
 
     cv::GaussianBlur(weighted, weighted, cv::Size(), sigma, sigma, cv::BORDER_REPLICATE);
     cv::GaussianBlur(weights, weights, cv::Size(), sigma, sigma, cv::BORDER_REPLICATE);
     cv::Mat result = cv::Mat::zeros(src.size(), CV_32F);
-    for (int y = 0; y < src.rows; ++y) {
-        const float* wrow = weighted.ptr<float>(y);
-        const float* weightRow = weights.ptr<float>(y);
-        float* rrow = result.ptr<float>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            if (weightRow[x] > 1.0e-6f) {
-                rrow[x] = wrow[x] / weightRow[x];
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* wrow = weighted.ptr<float>(y);
+            const float* weightRow = weights.ptr<float>(y);
+            float* rrow = result.ptr<float>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                if (weightRow[x] > 1.0e-6f) {
+                    rrow[x] = wrow[x] / weightRow[x];
+                }
             }
         }
-    }
+    });
     return result;
 }
 
@@ -362,20 +366,22 @@ double curlCostForNormals(const cv::Mat& normalMap, const cv::Mat& validMask, co
 }
 
 void applyNormalRotation(cv::Mat& normalMap, cv::Mat& validMask, const cv::Matx33d& rotation) {
-    for (int y = 0; y < normalMap.rows; ++y) {
-        cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        uchar* mrow = validMask.ptr<uchar>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            uchar* mrow = validMask.ptr<uchar>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                cv::Vec3d r = normalizeVec3d(rotation * cv::Vec3d(nrow[x][0], nrow[x][1], nrow[x][2]));
+                if (r[2] < 0.0) {
+                    r = -r;
+                }
+                nrow[x] = cv::Vec3f(static_cast<float>(r[0]), static_cast<float>(r[1]), static_cast<float>(r[2]));
             }
-            cv::Vec3d r = normalizeVec3d(rotation * cv::Vec3d(nrow[x][0], nrow[x][1], nrow[x][2]));
-            if (r[2] < 0.0) {
-                r = -r;
-            }
-            nrow[x] = cv::Vec3f(static_cast<float>(r[0]), static_cast<float>(r[1]), static_cast<float>(r[2]));
         }
-    }
+    });
 }
 
 float finitePercentile(std::vector<float>& values, float percentileValue, float fallback) {
@@ -428,27 +434,29 @@ void stabilizeVisualReliefNormals(
     const float pTotalScale = pScale * magScale;
     const float qTotalScale = qScale * magScale;
 
-    for (int y = 0; y < normalMap.rows; ++y) {
-        cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                const cv::Vec3f n = nrow[x];
+                const float nz = std::max(std::abs(n[2]), kMinNz);
+                float p = (-n[0] / nz) * pTotalScale;
+                float q = (n[1] / nz) * qTotalScale;
+                const float mag = std::sqrt(p * p + q * q);
+                if (mag > 1.50f) {
+                    const float s = 1.50f / mag;
+                    p *= s;
+                    q *= s;
+                }
+                const float invLength = 1.0f / std::sqrt(p * p + q * q + 1.0f);
+                nrow[x] = cv::Vec3f(-p * invLength, q * invLength, invLength);
             }
-            const cv::Vec3f n = nrow[x];
-            const float nz = std::max(std::abs(n[2]), kMinNz);
-            float p = (-n[0] / nz) * pTotalScale;
-            float q = (n[1] / nz) * qTotalScale;
-            const float mag = std::sqrt(p * p + q * q);
-            if (mag > 1.50f) {
-                const float s = 1.50f / mag;
-                p *= s;
-                q *= s;
-            }
-            const float invLength = 1.0f / std::sqrt(p * p + q * q + 1.0f);
-            nrow[x] = cv::Vec3f(-p * invLength, q * invLength, invLength);
         }
-    }
+    });
 
     reportProgress(
         progress,
@@ -817,30 +825,32 @@ cv::Mat buildObservationValidityMask(
     }
 
     cv::Mat validity(size, CV_8U, cv::Scalar(0));
-    std::vector<const float*> imageRows(images.size(), nullptr);
-    for (int y = 0; y < size.height; ++y) {
-        for (size_t i = 0; i < images.size(); ++i) {
-            imageRows[i] = images[i].ptr<float>(y);
-        }
-        const uchar* inputRow = inputMask.ptr<uchar>(y);
-        uchar* validityRow = validity.ptr<uchar>(y);
-        for (int x = 0; x < size.width; ++x) {
-            if (inputRow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, size.height), [&](const cv::Range& range) {
+        std::vector<const float*> imageRows(images.size(), nullptr);
+        for (int y = range.start; y < range.end; ++y) {
+            for (size_t i = 0; i < images.size(); ++i) {
+                imageRows[i] = images[i].ptr<float>(y);
             }
-            int usable = 0;
-            for (const float* imageRow : imageRows) {
-                const float intensity = imageRow[x];
-                if (std::isfinite(intensity) && intensity > minimumIntensity) {
-                    ++usable;
-                    if (usable >= minimumObservations) {
-                        validityRow[x] = 255;
-                        break;
+            const uchar* inputRow = inputMask.ptr<uchar>(y);
+            uchar* validityRow = validity.ptr<uchar>(y);
+            for (int x = 0; x < size.width; ++x) {
+                if (inputRow[x] == 0) {
+                    continue;
+                }
+                int usable = 0;
+                for (const float* imageRow : imageRows) {
+                    const float intensity = imageRow[x];
+                    if (std::isfinite(intensity) && intensity > minimumIntensity) {
+                        ++usable;
+                        if (usable >= minimumObservations) {
+                            validityRow[x] = 255;
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
+    });
     return validity;
 }
 
@@ -1541,19 +1551,21 @@ void flattenNormalField(cv::Mat& normalMap, const cv::Mat& validMask, FlattenMod
     cv::Mat p(rows, cols, CV_32F, cv::Scalar(0));
     cv::Mat q(rows, cols, CV_32F, cv::Scalar(0));
 
-    for (int y = 0; y < rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        float* prow = p.ptr<float>(y);
-        float* qrow = q.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
-                continue;
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            float* prow = p.ptr<float>(y);
+            float* qrow = q.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
+                    continue;
+                }
+                prow[x] = -nrow[x][0] / nrow[x][2];
+                qrow[x] = nrow[x][1] / nrow[x][2];
             }
-            prow[x] = -nrow[x][0] / nrow[x][2];
-            qrow[x] = nrow[x][1] / nrow[x][2];
         }
-    }
+    });
 
     const double minDim = static_cast<double>(std::max(1, std::min(rows, cols)));
     const double sigma = mode == FlattenMode::Gentle ? minDim * 0.075 : minDim * 0.14;
@@ -1561,26 +1573,28 @@ void flattenNormalField(cv::Mat& normalMap, const cv::Mat& validMask, FlattenMod
     const cv::Mat lowP = maskedGaussianBlurFloat(p, validMask, sigma);
     const cv::Mat lowQ = maskedGaussianBlurFloat(q, validMask, sigma);
 
-    for (int y = 0; y < rows; ++y) {
-        cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        const float* prow = p.ptr<float>(y);
-        const float* qrow = q.ptr<float>(y);
-        const float* lprow = lowP.ptr<float>(y);
-        const float* lqrow = lowQ.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
-                continue;
-            }
-            const float highP = prow[x] - amount * lprow[x];
-            const float highQ = qrow[x] - amount * lqrow[x];
-            cv::Vec3f next(-highP, highQ, 1.0f);
-            const float norm = std::sqrt(next.dot(next));
-            if (norm > 1.0e-6f && std::isfinite(norm)) {
-                nrow[x] = next / norm;
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            const float* prow = p.ptr<float>(y);
+            const float* qrow = q.ptr<float>(y);
+            const float* lprow = lowP.ptr<float>(y);
+            const float* lqrow = lowQ.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
+                    continue;
+                }
+                const float highP = prow[x] - amount * lprow[x];
+                const float highQ = qrow[x] - amount * lqrow[x];
+                cv::Vec3f next(-highP, highQ, 1.0f);
+                const float norm = std::sqrt(next.dot(next));
+                if (norm > 1.0e-6f && std::isfinite(norm)) {
+                    nrow[x] = next / norm;
+                }
             }
         }
-    }
+    });
 }
 
 void clampSlopeMagnitude(cv::Mat& p, cv::Mat& q, const cv::Mat& validMask, double slopeCap) {
@@ -1588,29 +1602,31 @@ void clampSlopeMagnitude(cv::Mat& p, cv::Mat& q, const cv::Mat& validMask, doubl
         return;
     }
     const float cap = static_cast<float>(slopeCap);
-    for (int y = 0; y < p.rows; ++y) {
-        float* prow = p.ptr<float>(y);
-        float* qrow = q.ptr<float>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        for (int x = 0; x < p.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
-            }
-            const float px = prow[x];
-            const float qx = qrow[x];
-            if (!std::isfinite(px) || !std::isfinite(qx)) {
-                prow[x] = 0.0f;
-                qrow[x] = 0.0f;
-                continue;
-            }
-            const float magnitude = std::sqrt(px * px + qx * qx);
-            if (magnitude > cap && magnitude > 1.0e-8f) {
-                const float scale = cap / magnitude;
-                prow[x] *= scale;
-                qrow[x] *= scale;
+    cv::parallel_for_(cv::Range(0, p.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            float* prow = p.ptr<float>(y);
+            float* qrow = q.ptr<float>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            for (int x = 0; x < p.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                const float px = prow[x];
+                const float qx = qrow[x];
+                if (!std::isfinite(px) || !std::isfinite(qx)) {
+                    prow[x] = 0.0f;
+                    qrow[x] = 0.0f;
+                    continue;
+                }
+                const float magnitude = std::sqrt(px * px + qx * qx);
+                if (magnitude > cap && magnitude > 1.0e-8f) {
+                    const float scale = cap / magnitude;
+                    prow[x] *= scale;
+                    qrow[x] *= scale;
+                }
             }
         }
-    }
+    });
 }
 
 cv::Mat extendMaskedFloatField(const cv::Mat& src, const cv::Mat& validMask) {
@@ -1633,19 +1649,21 @@ cv::Mat extendMaskedFloatField(const cv::Mat& src, const cv::Mat& validMask) {
         cv::GaussianBlur(knownWeight, blurredWeight, cv::Size(), 2.0, 2.0, cv::BORDER_REPLICATE);
 
         cv::Mat newlyKnown = unknown & (blurredWeight > 1.0e-5f);
-        for (int y = 0; y < src.rows; ++y) {
-            float* frow = filled.ptr<float>(y);
-            float* wrow = knownWeight.ptr<float>(y);
-            const float* vrow = blurredValue.ptr<float>(y);
-            const float* brow = blurredWeight.ptr<float>(y);
-            const uchar* nrow = newlyKnown.ptr<uchar>(y);
-            for (int x = 0; x < src.cols; ++x) {
-                if (nrow[x] != 0) {
-                    frow[x] = vrow[x] / std::max(brow[x], 1.0e-6f);
-                    wrow[x] = 1.0f;
+        cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                float* frow = filled.ptr<float>(y);
+                float* wrow = knownWeight.ptr<float>(y);
+                const float* vrow = blurredValue.ptr<float>(y);
+                const float* brow = blurredWeight.ptr<float>(y);
+                const uchar* nrow = newlyKnown.ptr<uchar>(y);
+                for (int x = 0; x < src.cols; ++x) {
+                    if (nrow[x] != 0) {
+                        frow[x] = vrow[x] / std::max(brow[x], 1.0e-6f);
+                        wrow[x] = 1.0f;
+                    }
                 }
             }
-        }
+        });
         cv::bitwise_not(knownWeight > 0.5f, unknown);
     }
 
@@ -1664,19 +1682,21 @@ cv::Mat integrateHeightDct(
     cv::Mat p(rows, cols, CV_32F, cv::Scalar(0));
     cv::Mat q(rows, cols, CV_32F, cv::Scalar(0));
 
-    for (int y = 0; y < rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        float* prow = p.ptr<float>(y);
-        float* qrow = q.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
-                continue;
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            float* prow = p.ptr<float>(y);
+            float* qrow = q.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mrow[x] == 0 || nrow[x][2] <= 1.0e-4f) {
+                    continue;
+                }
+                prow[x] = -nrow[x][0] / nrow[x][2];
+                qrow[x] = nrow[x][1] / nrow[x][2];
             }
-            prow[x] = -nrow[x][0] / nrow[x][2];
-            qrow[x] = nrow[x][1] / nrow[x][2];
         }
-    }
+    });
     clampSlopeMagnitude(p, q, validMask, slopeCap);
     p = extendMaskedFloatField(p, validMask);
     q = extendMaskedFloatField(q, validMask);
@@ -1685,17 +1705,19 @@ cv::Mat integrateHeightDct(
     }
 
     cv::Mat divergence(rows, cols, CV_32F, cv::Scalar(0));
-    for (int y = 0; y < rows; ++y) {
-        const float* prow = p.ptr<float>(y);
-        const float* qrow = q.ptr<float>(y);
-        const float* prevQ = y > 0 ? q.ptr<float>(y - 1) : nullptr;
-        float* out = divergence.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            const float leftP = x > 0 ? prow[x - 1] : 0.0f;
-            const float upQ = y > 0 ? prevQ[x] : 0.0f;
-            out[x] = (prow[x] - leftP) + (qrow[x] - upQ);
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* prow = p.ptr<float>(y);
+            const float* qrow = q.ptr<float>(y);
+            const float* prevQ = y > 0 ? q.ptr<float>(y - 1) : nullptr;
+            float* out = divergence.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                const float leftP = x > 0 ? prow[x - 1] : 0.0f;
+                const float upQ = y > 0 ? prevQ[x] : 0.0f;
+                out[x] = (prow[x] - leftP) + (qrow[x] - upQ);
+            }
         }
-    }
+    });
 
     const int dctRows = 2 * cv::getOptimalDFTSize((rows + 1) / 2);
     const int dctCols = 2 * cv::getOptimalDFTSize((cols + 1) / 2);
@@ -1716,19 +1738,21 @@ cv::Mat integrateHeightDct(
         progress(2, 3);
     }
 
-    for (int y = 0; y < dctRows; ++y) {
-        float* row = dctCoeffs.ptr<float>(y);
-        const double cy = std::cos(CV_PI * static_cast<double>(y) / static_cast<double>(dctRows));
-        for (int x = 0; x < dctCols; ++x) {
-            if (x == 0 && y == 0) {
-                row[x] = 0.0f;
-                continue;
+    cv::parallel_for_(cv::Range(0, dctRows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            float* row = dctCoeffs.ptr<float>(y);
+            const double cy = std::cos(CV_PI * static_cast<double>(y) / static_cast<double>(dctRows));
+            for (int x = 0; x < dctCols; ++x) {
+                if (x == 0 && y == 0) {
+                    row[x] = 0.0f;
+                    continue;
+                }
+                const double cx = std::cos(CV_PI * static_cast<double>(x) / static_cast<double>(dctCols));
+                const double denom = 2.0 * cx + 2.0 * cy - 4.0;
+                row[x] = static_cast<float>(static_cast<double>(row[x]) / denom);
             }
-            const double cx = std::cos(CV_PI * static_cast<double>(x) / static_cast<double>(dctCols));
-            const double denom = 2.0 * cx + 2.0 * cy - 4.0;
-            row[x] = static_cast<float>(static_cast<double>(row[x]) / denom);
         }
-    }
+    });
 
     cv::Mat paddedZ;
     cv::dct(dctCoeffs, paddedZ, cv::DCT_INVERSE);
@@ -1750,15 +1774,17 @@ cv::Mat integrateHeightDct(
     }
     if (countValid > 0) {
         const float mean = static_cast<float>(sum / static_cast<double>(countValid));
-        for (int y = 0; y < rows; ++y) {
-            const uchar* mrow = validMask.ptr<uchar>(y);
-            float* zrow = z.ptr<float>(y);
-            for (int x = 0; x < cols; ++x) {
-                if (mrow[x] != 0) {
-                    zrow[x] -= mean;
+        cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                const uchar* mrow = validMask.ptr<uchar>(y);
+                float* zrow = z.ptr<float>(y);
+                for (int x = 0; x < cols; ++x) {
+                    if (mrow[x] != 0) {
+                        zrow[x] -= mean;
+                    }
                 }
             }
-        }
+        });
     }
     if (progress) {
         progress(3, 3);
@@ -1780,42 +1806,44 @@ void normalsToWeightedSlopes(
     confidence = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     const float cap = static_cast<float>(slopeCap > 0.0 ? slopeCap : 0.0);
 
-    for (int y = 0; y < rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        float* prow = p.ptr<float>(y);
-        float* qrow = q.ptr<float>(y);
-        float* crow = confidence.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            float* prow = p.ptr<float>(y);
+            float* qrow = q.ptr<float>(y);
+            float* crow = confidence.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                const cv::Vec3f normal = nrow[x];
+                if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2]) || normal[2] <= 1.0e-4f) {
+                    continue;
+                }
+                float px = -normal[0] / normal[2];
+                float qx = normal[1] / normal[2];
+                float magnitude = std::sqrt(px * px + qx * qx);
+                if (!std::isfinite(magnitude)) {
+                    continue;
+                }
+                if (cap > 0.0f && magnitude > 1.0e-8f) {
+                    const float softMagnitude = cap * std::tanh(magnitude / cap);
+                    const float scale = softMagnitude / magnitude;
+                    px *= scale;
+                    qx *= scale;
+                    magnitude = softMagnitude;
+                }
+                const float nzWeight = std::clamp((normal[2] - 0.08f) / 0.72f, 0.0f, 1.0f);
+                const float slopeWeight = cap > 0.0f
+                    ? 1.0f / std::sqrt(1.0f + (magnitude / std::max(cap, 1.0e-4f)) * (magnitude / std::max(cap, 1.0e-4f)))
+                    : 1.0f;
+                prow[x] = px;
+                qrow[x] = qx;
+                crow[x] = std::max(0.03f, nzWeight * nzWeight * slopeWeight);
             }
-            const cv::Vec3f normal = nrow[x];
-            if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2]) || normal[2] <= 1.0e-4f) {
-                continue;
-            }
-            float px = -normal[0] / normal[2];
-            float qx = normal[1] / normal[2];
-            float magnitude = std::sqrt(px * px + qx * qx);
-            if (!std::isfinite(magnitude)) {
-                continue;
-            }
-            if (cap > 0.0f && magnitude > 1.0e-8f) {
-                const float softMagnitude = cap * std::tanh(magnitude / cap);
-                const float scale = softMagnitude / magnitude;
-                px *= scale;
-                qx *= scale;
-                magnitude = softMagnitude;
-            }
-            const float nzWeight = std::clamp((normal[2] - 0.08f) / 0.72f, 0.0f, 1.0f);
-            const float slopeWeight = cap > 0.0f
-                ? 1.0f / std::sqrt(1.0f + (magnitude / std::max(cap, 1.0e-4f)) * (magnitude / std::max(cap, 1.0e-4f)))
-                : 1.0f;
-            prow[x] = px;
-            qrow[x] = qx;
-            crow[x] = std::max(0.03f, nzWeight * nzWeight * slopeWeight);
         }
-    }
+    });
 }
 
 void centerHeightOverMask(cv::Mat& z, const cv::Mat& validMask) {
@@ -1835,17 +1863,19 @@ void centerHeightOverMask(cv::Mat& z, const cv::Mat& validMask) {
         return;
     }
     const float mean = static_cast<float>(sum / static_cast<double>(count));
-    for (int y = 0; y < z.rows; ++y) {
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        float* zrow = z.ptr<float>(y);
-        for (int x = 0; x < z.cols; ++x) {
-            if (mrow[x] != 0 && std::isfinite(zrow[x])) {
-                zrow[x] -= mean;
-            } else {
-                zrow[x] = 0.0f;
+    cv::parallel_for_(cv::Range(0, z.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            float* zrow = z.ptr<float>(y);
+            for (int x = 0; x < z.cols; ++x) {
+                if (mrow[x] != 0 && std::isfinite(zrow[x])) {
+                    zrow[x] -= mean;
+                } else {
+                    zrow[x] = 0.0f;
+                }
             }
         }
-    }
+    });
 }
 
 void updateRobustEdgeWeights(
@@ -1862,33 +1892,35 @@ void updateRobustEdgeWeights(
     wx = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     wy = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
 
-    for (int y = 0; y < rows; ++y) {
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        const uchar* nextMrow = y + 1 < rows ? validMask.ptr<uchar>(y + 1) : nullptr;
-        const float* zrow = z.ptr<float>(y);
-        const float* nextZrow = y + 1 < rows ? z.ptr<float>(y + 1) : nullptr;
-        const float* prow = p.ptr<float>(y);
-        const float* qrow = q.ptr<float>(y);
-        const float* crow = confidence.ptr<float>(y);
-        const float* nextCrow = y + 1 < rows ? confidence.ptr<float>(y + 1) : nullptr;
-        float* wxrow = wx.ptr<float>(y);
-        float* wyrow = wy.ptr<float>(y);
-        for (int x = 0; x < cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
-            }
-            if (x + 1 < cols && mrow[x + 1] != 0) {
-                const float base = 0.5f * (crow[x] + crow[x + 1]);
-                const float residual = (zrow[x + 1] - zrow[x]) - prow[x];
-                wxrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
-            }
-            if (y + 1 < rows && nextMrow[x] != 0) {
-                const float base = 0.5f * (crow[x] + nextCrow[x]);
-                const float residual = (nextZrow[x] - zrow[x]) - qrow[x];
-                wyrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            const uchar* nextMrow = y + 1 < rows ? validMask.ptr<uchar>(y + 1) : nullptr;
+            const float* zrow = z.ptr<float>(y);
+            const float* nextZrow = y + 1 < rows ? z.ptr<float>(y + 1) : nullptr;
+            const float* prow = p.ptr<float>(y);
+            const float* qrow = q.ptr<float>(y);
+            const float* crow = confidence.ptr<float>(y);
+            const float* nextCrow = y + 1 < rows ? confidence.ptr<float>(y + 1) : nullptr;
+            float* wxrow = wx.ptr<float>(y);
+            float* wyrow = wy.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                if (x + 1 < cols && mrow[x + 1] != 0) {
+                    const float base = 0.5f * (crow[x] + crow[x + 1]);
+                    const float residual = (zrow[x + 1] - zrow[x]) - prow[x];
+                    wxrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
+                }
+                if (y + 1 < rows && nextMrow[x] != 0) {
+                    const float base = 0.5f * (crow[x] + nextCrow[x]);
+                    const float residual = (nextZrow[x] - zrow[x]) - qrow[x];
+                    wyrow[x] = base / std::sqrt(1.0f + (residual / kDelta) * (residual / kDelta));
+                }
             }
         }
-    }
+    });
 }
 
 void sorHeightSweep(
@@ -2038,20 +2070,22 @@ void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask) {
         return;
     }
 
-    for (int y = 0; y < height.rows; ++y) {
-        float* hrow = height.ptr<float>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        for (int x = 0; x < height.cols; ++x) {
-            if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
-                continue;
+    cv::parallel_for_(cv::Range(0, height.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            float* hrow = height.ptr<float>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            for (int x = 0; x < height.cols; ++x) {
+                if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
+                    continue;
+                }
+                const double trend =
+                    plane[0] * static_cast<double>(x) +
+                    plane[1] * static_cast<double>(y) +
+                    plane[2];
+                hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
             }
-            const double trend =
-                plane[0] * static_cast<double>(x) +
-                plane[1] * static_cast<double>(y) +
-                plane[2];
-            hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
         }
-    }
+    });
 }
 
 void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode) {
@@ -2109,33 +2143,36 @@ void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMo
         return;
     }
 
-    for (int y = 0; y < height.rows; ++y) {
-        float* hrow = height.ptr<float>(y);
-        const uchar* mrow = validMask.ptr<uchar>(y);
-        const double yn = (static_cast<double>(y) - cy) / scale;
-        for (int x = 0; x < height.cols; ++x) {
-            if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
-                continue;
-            }
-            const double xn = (static_cast<double>(x) - cx) / scale;
-            terms[0] = 1.0;
-            terms[1] = xn;
-            terms[2] = yn;
-            if (mode == HeightFlattenMode::Quadratic) {
-                terms[3] = xn * xn;
-                terms[4] = yn * yn;
-                terms[5] = xn * yn;
-            } else {
-                terms[3] = xn * xn + yn * yn;
-            }
+    cv::parallel_for_(cv::Range(0, height.rows), [&](const cv::Range& range) {
+        std::array<double, 6> localTerms{};
+        for (int y = range.start; y < range.end; ++y) {
+            float* hrow = height.ptr<float>(y);
+            const uchar* mrow = validMask.ptr<uchar>(y);
+            const double yn = (static_cast<double>(y) - cy) / scale;
+            for (int x = 0; x < height.cols; ++x) {
+                if (mrow[x] == 0 || !std::isfinite(hrow[x])) {
+                    continue;
+                }
+                const double xn = (static_cast<double>(x) - cx) / scale;
+                localTerms[0] = 1.0;
+                localTerms[1] = xn;
+                localTerms[2] = yn;
+                if (mode == HeightFlattenMode::Quadratic) {
+                    localTerms[3] = xn * xn;
+                    localTerms[4] = yn * yn;
+                    localTerms[5] = xn * yn;
+                } else {
+                    localTerms[3] = xn * xn + yn * yn;
+                }
 
-            double trend = 0.0;
-            for (int i = 0; i < nTerms; ++i) {
-                trend += coeffs.at<double>(i, 0) * terms[i];
+                double trend = 0.0;
+                for (int i = 0; i < nTerms; ++i) {
+                    trend += coeffs.at<double>(i, 0) * localTerms[i];
+                }
+                hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
             }
-            hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
         }
-    }
+    });
 }
 
 void applyHeightFlattening(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode) {

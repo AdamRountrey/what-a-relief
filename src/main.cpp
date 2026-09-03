@@ -354,7 +354,9 @@ int main(int argc, char** argv) {
         Options opt = parseArgs(argc, argv);
         guiMode = opt.guiMode;
         if (opt.guiMode) {
-            launchGuiWorkflow(opt);
+            if (!launchGuiWorkflow(opt)) {
+                return 0;
+            }
             showGuiProgress("what-a-relief Processing", "Starting photometric stereo...");
             progressShown = true;
         }

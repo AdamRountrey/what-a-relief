@@ -18,7 +18,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -371,18 +372,31 @@ double readClassicTiffPixelScaleMm(const std::string& path) {
 }
 
 void minMaxMasked(const cv::Mat& src, const cv::Mat& mask, double& minValue, double& maxValue) {
+    std::vector<double> rowMinimums(static_cast<size_t>(src.rows), std::numeric_limits<double>::infinity());
+    std::vector<double> rowMaximums(static_cast<size_t>(src.rows), -std::numeric_limits<double>::infinity());
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* row = src.ptr<float>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            double rowMinimum = std::numeric_limits<double>::infinity();
+            double rowMaximum = -std::numeric_limits<double>::infinity();
+            for (int x = 0; x < src.cols; ++x) {
+                if (mrow[x] == 0 || !std::isfinite(row[x])) {
+                    continue;
+                }
+                rowMinimum = std::min(rowMinimum, static_cast<double>(row[x]));
+                rowMaximum = std::max(rowMaximum, static_cast<double>(row[x]));
+            }
+            rowMinimums[static_cast<size_t>(y)] = rowMinimum;
+            rowMaximums[static_cast<size_t>(y)] = rowMaximum;
+        }
+    });
+
     minValue = std::numeric_limits<double>::infinity();
     maxValue = -std::numeric_limits<double>::infinity();
     for (int y = 0; y < src.rows; ++y) {
-        const float* row = src.ptr<float>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            if (mrow[x] == 0 || !std::isfinite(row[x])) {
-                continue;
-            }
-            minValue = std::min(minValue, static_cast<double>(row[x]));
-            maxValue = std::max(maxValue, static_cast<double>(row[x]));
-        }
+        minValue = std::min(minValue, rowMinimums[static_cast<size_t>(y)]);
+        maxValue = std::max(maxValue, rowMaximums[static_cast<size_t>(y)]);
     }
     if (!std::isfinite(minValue) || !std::isfinite(maxValue) || minValue == maxValue) {
         minValue = 0.0;
@@ -399,38 +413,42 @@ cv::Mat normalizeFloatTo8U(const cv::Mat& src, const cv::Mat& mask, bool forceZe
     }
     const double scale = 255.0 / std::max(1.0e-12, maxValue - minValue);
     cv::Mat out(src.rows, src.cols, CV_8U, cv::Scalar(0));
-    for (int y = 0; y < src.rows; ++y) {
-        const float* row = src.ptr<float>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        uchar* orow = out.ptr<uchar>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            if (mrow[x] == 0 || !std::isfinite(row[x])) {
-                continue;
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* row = src.ptr<float>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            uchar* orow = out.ptr<uchar>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                if (mrow[x] == 0 || !std::isfinite(row[x])) {
+                    continue;
+                }
+                const double v = (static_cast<double>(row[x]) - minValue) * scale;
+                orow[x] = static_cast<uchar>(std::clamp(v, 0.0, 255.0));
             }
-            const double v = (static_cast<double>(row[x]) - minValue) * scale;
-            orow[x] = static_cast<uchar>(std::clamp(v, 0.0, 255.0));
         }
-    }
+    });
     return out;
 }
 
 cv::Mat normalComponentTo8U(const cv::Mat& normalMap, const cv::Mat& mask, int component, bool signedComponent) {
     cv::Mat out(normalMap.rows, normalMap.cols, CV_8U, cv::Scalar(0));
-    for (int y = 0; y < normalMap.rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        uchar* orow = out.ptr<uchar>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            uchar* orow = out.ptr<uchar>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                double value = nrow[x][component];
+                if (signedComponent) {
+                    value = value * 0.5 + 0.5;
+                }
+                orow[x] = static_cast<uchar>(std::clamp(value * 255.0, 0.0, 255.0));
             }
-            double value = nrow[x][component];
-            if (signedComponent) {
-                value = value * 0.5 + 0.5;
-            }
-            orow[x] = static_cast<uchar>(std::clamp(value * 255.0, 0.0, 255.0));
         }
-    }
+    });
     return out;
 }
 
@@ -441,43 +459,47 @@ cv::Mat hillshadeTo8U(const cv::Mat& normalMap, const cv::Mat& mask, const cv::V
     constexpr double kDiffuse = 0.82;
     constexpr double kGamma = 0.78;
     cv::Mat out(normalMap.rows, normalMap.cols, CV_8U, cv::Scalar(0));
-    for (int y = 0; y < normalMap.rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        uchar* orow = out.ptr<uchar>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            uchar* orow = out.ptr<uchar>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                const double ndotl =
+                    static_cast<double>(nrow[x][0]) * light[0] +
+                    static_cast<double>(nrow[x][1]) * light[1] +
+                    static_cast<double>(nrow[x][2]) * light[2];
+                const double hillshade = std::pow(std::clamp(ndotl, 0.0, 1.0), kGamma);
+                const double value = kAmbient + kDiffuse * hillshade;
+                orow[x] = static_cast<uchar>(std::clamp(value * 255.0, 0.0, 255.0));
             }
-            const double ndotl =
-                static_cast<double>(nrow[x][0]) * light[0] +
-                static_cast<double>(nrow[x][1]) * light[1] +
-                static_cast<double>(nrow[x][2]) * light[2];
-            const double hillshade = std::pow(std::clamp(ndotl, 0.0, 1.0), kGamma);
-            const double value = kAmbient + kDiffuse * hillshade;
-            orow[x] = static_cast<uchar>(std::clamp(value * 255.0, 0.0, 255.0));
         }
-    }
+    });
     return out;
 }
 
 cv::Mat normalRgbTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
     cv::Mat out(normalMap.rows, normalMap.cols, CV_8UC3, cv::Scalar(0, 0, 0));
-    for (int y = 0; y < normalMap.rows; ++y) {
-        const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        cv::Vec3b* orow = out.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* nrow = normalMap.ptr<cv::Vec3f>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            cv::Vec3b* orow = out.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                const cv::Vec3f n = nrow[x];
+                const uchar r = static_cast<uchar>(std::clamp((n[0] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
+                const uchar g = static_cast<uchar>(std::clamp((n[1] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
+                const uchar b = static_cast<uchar>(std::clamp((n[2] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
+                orow[x] = cv::Vec3b(b, g, r);
             }
-            const cv::Vec3f n = nrow[x];
-            const uchar r = static_cast<uchar>(std::clamp((n[0] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
-            const uchar g = static_cast<uchar>(std::clamp((n[1] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
-            const uchar b = static_cast<uchar>(std::clamp((n[2] * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
-            orow[x] = cv::Vec3b(b, g, r);
         }
-    }
+    });
     return out;
 }
 
@@ -540,14 +562,16 @@ cv::Mat maskedGaussianBlur(const cv::Mat& src, const cv::Mat& mask, double sigma
     mask.convertTo(maskFloat, CV_32F, 1.0 / 255.0);
 
     cv::Mat weighted(src.size(), CV_32F, cv::Scalar(0));
-    for (int y = 0; y < src.rows; ++y) {
-        const float* srcRow = src.ptr<float>(y);
-        const float* maskRow = maskFloat.ptr<float>(y);
-        float* weightedRow = weighted.ptr<float>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            weightedRow[x] = std::isfinite(srcRow[x]) ? srcRow[x] * maskRow[x] : 0.0f;
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* srcRow = src.ptr<float>(y);
+            const float* maskRow = maskFloat.ptr<float>(y);
+            float* weightedRow = weighted.ptr<float>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                weightedRow[x] = std::isfinite(srcRow[x]) ? srcRow[x] * maskRow[x] : 0.0f;
+            }
         }
-    }
+    });
 
     cv::Mat numerator;
     cv::Mat denominator;
@@ -555,14 +579,16 @@ cv::Mat maskedGaussianBlur(const cv::Mat& src, const cv::Mat& mask, double sigma
     cv::GaussianBlur(maskFloat, denominator, cv::Size(0, 0), sigma);
 
     cv::Mat out(src.size(), CV_32F, cv::Scalar(0));
-    for (int y = 0; y < src.rows; ++y) {
-        const float* numRow = numerator.ptr<float>(y);
-        const float* denRow = denominator.ptr<float>(y);
-        float* outRow = out.ptr<float>(y);
-        for (int x = 0; x < src.cols; ++x) {
-            outRow[x] = denRow[x] > 1.0e-6f ? numRow[x] / denRow[x] : 0.0f;
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* numRow = numerator.ptr<float>(y);
+            const float* denRow = denominator.ptr<float>(y);
+            float* outRow = out.ptr<float>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                outRow[x] = denRow[x] > 1.0e-6f ? numRow[x] / denRow[x] : 0.0f;
+            }
         }
-    }
+    });
     return out;
 }
 
@@ -577,7 +603,11 @@ cv::Mat maskedGaussianBlurVec3(const cv::Mat& src, const cv::Mat& mask, double s
     return out;
 }
 
-float maskedColorLuminancePercentile(const cv::Mat& image, const cv::Mat& mask, float percentileValue) {
+std::pair<float, float> maskedColorLuminanceRange(
+    const cv::Mat& image,
+    const cv::Mat& mask,
+    float lowPercentile,
+    float highPercentile) {
     std::vector<float> values;
     values.reserve(static_cast<size_t>(image.rows * image.cols / 4));
     for (int y = 0; y < image.rows; ++y) {
@@ -594,17 +624,20 @@ float maskedColorLuminancePercentile(const cv::Mat& image, const cv::Mat& mask, 
         }
     }
     if (values.empty()) {
-        return 0.0f;
+        return {0.0f, 0.0f};
     }
-    const size_t index = static_cast<size_t>(
-        std::clamp(percentileValue, 0.0f, 1.0f) * static_cast<float>(values.size() - 1));
-    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(index), values.end());
-    return values[index];
+    const size_t lowIndex = static_cast<size_t>(
+        std::clamp(lowPercentile, 0.0f, 1.0f) * static_cast<float>(values.size() - 1));
+    const size_t highIndex = static_cast<size_t>(
+        std::clamp(highPercentile, 0.0f, 1.0f) * static_cast<float>(values.size() - 1));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(lowIndex), values.end());
+    const float low = values[lowIndex];
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(highIndex), values.end());
+    return {low, values[highIndex]};
 }
 
 cv::Mat stretchColorByMaskedLuminance(const cv::Mat& image, const cv::Mat& mask) {
-    const float low = maskedColorLuminancePercentile(image, mask, 0.01f);
-    const float high = maskedColorLuminancePercentile(image, mask, 0.992f);
+    const auto [low, high] = maskedColorLuminanceRange(image, mask, 0.01f, 0.992f);
     if (high - low < 8.0f) {
         return image;
     }
@@ -613,19 +646,21 @@ cv::Mat stretchColorByMaskedLuminance(const cv::Mat& image, const cv::Mat& mask)
     const float outHigh = 248.0f;
     const float scale = (outHigh - outLow) / (high - low);
     cv::Mat stretched = image.clone();
-    for (int y = 0; y < image.rows; ++y) {
-        const uchar* mrow = mask.ptr<uchar>(y);
-        cv::Vec3b* row = stretched.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < image.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
-            }
-            for (int c = 0; c < 3; ++c) {
-                const float v = (static_cast<float>(row[x][c]) - low) * scale + outLow;
-                row[x][c] = static_cast<uchar>(std::clamp(v, 0.0f, 255.0f));
+    cv::parallel_for_(cv::Range(0, image.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const uchar* mrow = mask.ptr<uchar>(y);
+            cv::Vec3b* row = stretched.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < image.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+                for (int c = 0; c < 3; ++c) {
+                    const float v = (static_cast<float>(row[x][c]) - low) * scale + outLow;
+                    row[x][c] = static_cast<uchar>(std::clamp(v, 0.0f, 255.0f));
+                }
             }
         }
-    }
+    });
     return stretched;
 }
 
@@ -640,47 +675,49 @@ cv::Mat liquidMetalTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
     const cv::Vec3f warmGold(0.95f, 0.76f, 0.42f);
 
     cv::Mat out(normalMap.rows, normalMap.cols, CV_8UC3, cv::Scalar(0, 0, 0));
-    for (int y = 0; y < normalMap.rows; ++y) {
-        const cv::Vec3f* rawRow = normalMap.ptr<cv::Vec3f>(y);
-        const cv::Vec3f* nrow = smoothNormals.ptr<cv::Vec3f>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        cv::Vec3b* outRow = out.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < normalMap.cols; ++x) {
-            if (mrow[x] == 0) {
-                continue;
+    cv::parallel_for_(cv::Range(0, normalMap.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const cv::Vec3f* rawRow = normalMap.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* nrow = smoothNormals.ptr<cv::Vec3f>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            cv::Vec3b* outRow = out.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < normalMap.cols; ++x) {
+                if (mrow[x] == 0) {
+                    continue;
+                }
+
+                const cv::Vec3f n = normalizeVector(mixColor(rawRow[x], nrow[x], 0.18f));
+                const cv::Vec3f reflectedView = normalizeVector(reflectVector(-view, n));
+                const float ndv = std::clamp(n.dot(view), 0.0f, 1.0f);
+                const float key = std::max(0.0f, n.dot(keyLight));
+                const float fill = std::max(0.0f, n.dot(fillLight));
+                const float stripe = smoothstep(0.32f, 0.86f, 0.5f + 0.5f * (reflectedView[0] * 0.70f + reflectedView[1] * 0.30f));
+
+                cv::Vec3f base = mixColor(darkSteel, silver, stripe);
+                base = mixColor(base, coolCyan, 0.20f * smoothstep(0.05f, 0.90f, reflectedView[1] * 0.5f + 0.5f));
+                base = mixColor(base, warmGold, 0.16f * smoothstep(0.25f, 1.00f, reflectedView[0] * -0.5f + 0.5f));
+
+                const cv::Vec3f keyReflection = reflectVector(-keyLight, n);
+                const cv::Vec3f fillReflection = reflectVector(-fillLight, n);
+                const float specKey = std::pow(std::max(0.0f, keyReflection.dot(view)), 60.0f);
+                const float specFill = std::pow(std::max(0.0f, fillReflection.dot(view)), 32.0f);
+                const float rim = std::pow(1.0f - ndv, 2.0f);
+
+                cv::Vec3f rgb = base * (0.42f + 0.46f * key + 0.18f * fill);
+                rgb += cv::Vec3f(1.0f, 0.96f, 0.88f) * (1.00f * specKey + 0.36f * specFill);
+                rgb += coolCyan * (0.20f * rim);
+
+                for (int c = 0; c < 3; ++c) {
+                    rgb[c] = 1.0f - std::exp(-std::max(0.0f, rgb[c]) * 1.35f);
+                    rgb[c] = std::pow(std::clamp(rgb[c], 0.0f, 1.0f), 1.0f / 2.2f);
+                }
+                outRow[x] = cv::Vec3b(
+                    static_cast<uchar>(std::clamp(rgb[2] * 255.0f, 0.0f, 255.0f)),
+                    static_cast<uchar>(std::clamp(rgb[1] * 255.0f, 0.0f, 255.0f)),
+                    static_cast<uchar>(std::clamp(rgb[0] * 255.0f, 0.0f, 255.0f)));
             }
-
-            const cv::Vec3f n = normalizeVector(mixColor(rawRow[x], nrow[x], 0.18f));
-            const cv::Vec3f reflectedView = normalizeVector(reflectVector(-view, n));
-            const float ndv = std::clamp(n.dot(view), 0.0f, 1.0f);
-            const float key = std::max(0.0f, n.dot(keyLight));
-            const float fill = std::max(0.0f, n.dot(fillLight));
-            const float stripe = smoothstep(0.32f, 0.86f, 0.5f + 0.5f * (reflectedView[0] * 0.70f + reflectedView[1] * 0.30f));
-
-            cv::Vec3f base = mixColor(darkSteel, silver, stripe);
-            base = mixColor(base, coolCyan, 0.20f * smoothstep(0.05f, 0.90f, reflectedView[1] * 0.5f + 0.5f));
-            base = mixColor(base, warmGold, 0.16f * smoothstep(0.25f, 1.00f, reflectedView[0] * -0.5f + 0.5f));
-
-            const cv::Vec3f keyReflection = reflectVector(-keyLight, n);
-            const cv::Vec3f fillReflection = reflectVector(-fillLight, n);
-            const float specKey = std::pow(std::max(0.0f, keyReflection.dot(view)), 60.0f);
-            const float specFill = std::pow(std::max(0.0f, fillReflection.dot(view)), 32.0f);
-            const float rim = std::pow(1.0f - ndv, 2.0f);
-
-            cv::Vec3f rgb = base * (0.42f + 0.46f * key + 0.18f * fill);
-            rgb += cv::Vec3f(1.0f, 0.96f, 0.88f) * (1.00f * specKey + 0.36f * specFill);
-            rgb += coolCyan * (0.20f * rim);
-
-            for (int c = 0; c < 3; ++c) {
-                rgb[c] = 1.0f - std::exp(-std::max(0.0f, rgb[c]) * 1.35f);
-                rgb[c] = std::pow(std::clamp(rgb[c], 0.0f, 1.0f), 1.0f / 2.2f);
-            }
-            outRow[x] = cv::Vec3b(
-                static_cast<uchar>(std::clamp(rgb[2] * 255.0f, 0.0f, 255.0f)),
-                static_cast<uchar>(std::clamp(rgb[1] * 255.0f, 0.0f, 255.0f)),
-                static_cast<uchar>(std::clamp(rgb[0] * 255.0f, 0.0f, 255.0f)));
         }
-    }
+    });
     return stretchColorByMaskedLuminance(out, mask);
 }
 
@@ -688,13 +725,17 @@ void writePfm(const fs::path& path, const cv::Mat& image, const cv::Mat& mask) {
     CheckedOutputFile checked(path);
     std::ostream& out = checked.stream();
     out << "Pf\n" << image.cols << " " << image.rows << "\n-1.0\n";
+    std::vector<float> outputRow(static_cast<size_t>(image.cols));
     for (int y = image.rows - 1; y >= 0; --y) {
         const float* row = image.ptr<float>(y);
         const uchar* mrow = mask.ptr<uchar>(y);
         for (int x = 0; x < image.cols; ++x) {
-            float v = (mrow[x] != 0 && std::isfinite(row[x])) ? row[x] : 0.0f;
-            out.write(reinterpret_cast<const char*>(&v), sizeof(float));
+            outputRow[static_cast<size_t>(x)] =
+                (mrow[x] != 0 && std::isfinite(row[x])) ? row[x] : 0.0f;
         }
+        out.write(
+            reinterpret_cast<const char*>(outputRow.data()),
+            static_cast<std::streamsize>(outputRow.size() * sizeof(float)));
     }
     checked.commit();
 }
@@ -758,119 +799,253 @@ void writeLightVectorsCsv(const fs::path& path, const std::vector<cv::Vec3f>& li
     checked.commit();
 }
 
+class PlyBinaryWriter {
+public:
+    explicit PlyBinaryWriter(std::ostream& out)
+        : out_(out), buffer_(4 * 1024 * 1024) {}
+
+    void writeVertex(float x, float y, float z, std::uint8_t color) {
+        ensure(sizeof(float) * 3 + 3);
+        appendUnchecked(x);
+        appendUnchecked(y);
+        appendUnchecked(z);
+        buffer_[used_++] = static_cast<char>(color);
+        buffer_[used_++] = static_cast<char>(color);
+        buffer_[used_++] = static_cast<char>(color);
+    }
+
+    void writeTriangle(std::int32_t a, std::int32_t b, std::int32_t c) {
+        ensure(1 + sizeof(std::int32_t) * 3);
+        buffer_[used_++] = 3;
+        appendUnchecked(a);
+        appendUnchecked(b);
+        appendUnchecked(c);
+    }
+
+    void writeQuad(std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
+        ensure(1 + sizeof(std::int32_t) * 4);
+        buffer_[used_++] = 4;
+        appendUnchecked(a);
+        appendUnchecked(b);
+        appendUnchecked(c);
+        appendUnchecked(d);
+    }
+
+    void flush() {
+        if (used_ == 0) {
+            return;
+        }
+        out_.write(buffer_.data(), static_cast<std::streamsize>(used_));
+        used_ = 0;
+    }
+
+private:
+    template <typename T>
+    void appendUnchecked(const T& value) {
+        static_assert(std::is_trivially_copyable<T>::value, "PLY fields must be trivially copyable");
+        std::memcpy(buffer_.data() + used_, &value, sizeof(T));
+        used_ += sizeof(T);
+    }
+
+    void ensure(size_t bytes) {
+        if (used_ + bytes > buffer_.size()) {
+            flush();
+        }
+    }
+
+    std::ostream& out_;
+    std::vector<char> buffer_;
+    size_t used_ = 0;
+};
+
+struct PlyGridTopology {
+    int step = 1;
+    int sampleRows = 0;
+    int sampleCols = 0;
+    std::int32_t vertexCount = 0;
+    std::uint64_t topFaceCount = 0;
+    std::uint64_t boundaryFaceCount = 0;
+    double minimumHeight = std::numeric_limits<double>::infinity();
+    double maximumHeight = -std::numeric_limits<double>::infinity();
+    std::vector<std::int32_t> indices;
+    std::vector<std::int8_t> horizontalEdgeBalance;
+    std::vector<std::int8_t> verticalEdgeBalance;
+    std::vector<std::int8_t> diagonalEdgeBalance;
+
+    std::int32_t index(int row, int col) const {
+        return indices[static_cast<size_t>(row) * static_cast<size_t>(sampleCols) + static_cast<size_t>(col)];
+    }
+};
+
+void addEdgeBalance(std::int8_t& balance, int contribution) {
+    balance = static_cast<std::int8_t>(static_cast<int>(balance) + contribution);
+}
+
+PlyGridTopology buildPlyGridTopology(
+    const cv::Mat& height,
+    const cv::Mat& mask,
+    int step,
+    bool includeBoundary,
+    const std::function<void(const std::string&)>& progress) {
+    if (height.empty() || height.type() != CV_32F || mask.type() != CV_8U || mask.size() != height.size()) {
+        die("PLY height and mask inputs must be nonempty, matching single-channel images.");
+    }
+    if (step < 1) {
+        die("PLY mesh step must be at least 1.");
+    }
+
+    PlyGridTopology topology;
+    topology.step = step;
+    topology.sampleRows = (height.rows - 1) / step + 1;
+    topology.sampleCols = (height.cols - 1) / step + 1;
+    const size_t sampleCount =
+        static_cast<size_t>(topology.sampleRows) * static_cast<size_t>(topology.sampleCols);
+    topology.indices.assign(sampleCount, -1);
+
+    reportProgress(progress, "PLY: indexing sampled vertices...");
+    for (int row = 0; row < topology.sampleRows; ++row) {
+        const int y = row * step;
+        const float* heightRow = height.ptr<float>(y);
+        const uchar* maskRow = mask.ptr<uchar>(y);
+        for (int col = 0; col < topology.sampleCols; ++col) {
+            const int x = col * step;
+            if (maskRow[x] == 0 || !std::isfinite(heightRow[x])) {
+                continue;
+            }
+            if (topology.vertexCount == std::numeric_limits<std::int32_t>::max()) {
+                die("PLY has too many vertices for 32-bit face indices. Increase the mesh step.");
+            }
+            topology.indices[static_cast<size_t>(row) * static_cast<size_t>(topology.sampleCols) +
+                static_cast<size_t>(col)] = topology.vertexCount++;
+            topology.minimumHeight = std::min(topology.minimumHeight, static_cast<double>(heightRow[x]));
+            topology.maximumHeight = std::max(topology.maximumHeight, static_cast<double>(heightRow[x]));
+        }
+    }
+
+    if (includeBoundary) {
+        topology.horizontalEdgeBalance.assign(
+            static_cast<size_t>(topology.sampleRows) *
+                static_cast<size_t>(std::max(0, topology.sampleCols - 1)),
+            0);
+        topology.verticalEdgeBalance.assign(
+            static_cast<size_t>(std::max(0, topology.sampleRows - 1)) *
+                static_cast<size_t>(topology.sampleCols),
+            0);
+        topology.diagonalEdgeBalance.assign(
+            static_cast<size_t>(std::max(0, topology.sampleRows - 1)) *
+                static_cast<size_t>(std::max(0, topology.sampleCols - 1)),
+            0);
+    }
+
+    reportProgress(progress, includeBoundary ? "PLY: building shared faces and printable boundary..." : "PLY: counting faces...");
+    const int cellCols = std::max(0, topology.sampleCols - 1);
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            const std::int32_t a = topology.index(row, col);
+            const std::int32_t b = topology.index(row, col + 1);
+            const std::int32_t c = topology.index(row + 1, col);
+            const std::int32_t d = topology.index(row + 1, col + 1);
+            if (a >= 0 && b >= 0 && c >= 0) {
+                ++topology.topFaceCount;
+                if (includeBoundary) {
+                    addEdgeBalance(topology.verticalEdgeBalance[
+                        static_cast<size_t>(row) * static_cast<size_t>(topology.sampleCols) +
+                        static_cast<size_t>(col)], 1);
+                    addEdgeBalance(topology.diagonalEdgeBalance[
+                        static_cast<size_t>(row) * static_cast<size_t>(cellCols) +
+                        static_cast<size_t>(col)], -1);
+                    addEdgeBalance(topology.horizontalEdgeBalance[
+                        static_cast<size_t>(row) * static_cast<size_t>(cellCols) +
+                        static_cast<size_t>(col)], -1);
+                }
+            }
+            if (b >= 0 && d >= 0 && c >= 0) {
+                ++topology.topFaceCount;
+                if (includeBoundary) {
+                    addEdgeBalance(topology.diagonalEdgeBalance[
+                        static_cast<size_t>(row) * static_cast<size_t>(cellCols) +
+                        static_cast<size_t>(col)], 1);
+                    addEdgeBalance(topology.horizontalEdgeBalance[
+                        static_cast<size_t>(row + 1) * static_cast<size_t>(cellCols) +
+                        static_cast<size_t>(col)], 1);
+                    addEdgeBalance(topology.verticalEdgeBalance[
+                        static_cast<size_t>(row) * static_cast<size_t>(topology.sampleCols) +
+                        static_cast<size_t>(col + 1)], -1);
+                }
+            }
+        }
+    }
+    if (includeBoundary) {
+        const auto countBoundary = [](const std::vector<std::int8_t>& balances) {
+            return static_cast<std::uint64_t>(std::count_if(
+                balances.begin(), balances.end(), [](std::int8_t value) { return value != 0; }));
+        };
+        topology.boundaryFaceCount =
+            countBoundary(topology.horizontalEdgeBalance) +
+            countBoundary(topology.verticalEdgeBalance) +
+            countBoundary(topology.diagonalEdgeBalance);
+    }
+    return topology;
+}
+
 void writePlyMesh(
     const fs::path& path,
     const cv::Mat& height,
-    const cv::Mat& mask,
     const cv::Mat& vertexColor,
-    int step,
     double heightScale,
+    const PlyGridTopology& topology,
     const std::function<void(const std::string&)>& progress) {
-    const int rows = height.rows;
-    const int cols = height.cols;
-    cv::Mat index(rows, cols, CV_32S, cv::Scalar(-1));
-
-    reportProgress(progress, "PLY: indexing vertices...");
-    int vertexCount = 0;
-    for (int y = 0; y < rows; y += step) {
-        const float* hrow = height.ptr<float>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        int* irow = index.ptr<int>(y);
-        for (int x = 0; x < cols; x += step) {
-            if (mrow[x] != 0 && std::isfinite(hrow[x])) {
-                irow[x] = vertexCount++;
-            }
-        }
-    }
-
-    reportProgress(progress, "PLY: counting faces...");
-    int faceCount = 0;
-    for (int y = 0; y + step < rows; y += step) {
-        const int* row0 = index.ptr<int>(y);
-        const int* row1 = index.ptr<int>(y + step);
-        for (int x = 0; x + step < cols; x += step) {
-            const int a = row0[x];
-            const int b = row0[x + step];
-            const int c = row1[x];
-            const int d = row1[x + step];
-            if (a >= 0 && b >= 0 && c >= 0) {
-                ++faceCount;
-            }
-            if (b >= 0 && d >= 0 && c >= 0) {
-                ++faceCount;
-            }
-        }
-    }
-
     CheckedOutputFile checked(path);
     std::ostream& out = checked.stream();
 
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
     out << "comment generated by What A Relief\n";
-    out << "element vertex " << vertexCount << "\n";
+    out << "element vertex " << topology.vertexCount << "\n";
     out << "property float x\n";
     out << "property float y\n";
     out << "property float z\n";
     out << "property uchar red\n";
     out << "property uchar green\n";
     out << "property uchar blue\n";
-    out << "element face " << faceCount << "\n";
+    out << "element face " << topology.topFaceCount << "\n";
     out << "property list uchar int vertex_indices\n";
     out << "end_header\n";
 
+    PlyBinaryWriter binary(out);
     reportProgress(progress, "PLY: writing binary vertices...");
-    for (int y = 0; y < rows; y += step) {
+    for (int row = 0; row < topology.sampleRows; ++row) {
+        const int y = row * topology.step;
         const float* hrow = height.ptr<float>(y);
-        const int* irow = index.ptr<int>(y);
         const uchar* colorRow = vertexColor.empty() ? nullptr : vertexColor.ptr<uchar>(y);
-        for (int x = 0; x < cols; x += step) {
-            if (irow[x] >= 0) {
+        for (int col = 0; col < topology.sampleCols; ++col) {
+            const int x = col * topology.step;
+            if (topology.index(row, col) >= 0) {
                 const float vx = static_cast<float>(x);
                 const float vy = static_cast<float>(-y);
                 const float vz = static_cast<float>(static_cast<double>(hrow[x]) * heightScale);
                 const std::uint8_t color = colorRow == nullptr ? 200 : colorRow[x];
-                out.write(reinterpret_cast<const char*>(&vx), sizeof(vx));
-                out.write(reinterpret_cast<const char*>(&vy), sizeof(vy));
-                out.write(reinterpret_cast<const char*>(&vz), sizeof(vz));
-                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
-                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
-                out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                binary.writeVertex(vx, vy, vz, color);
             }
         }
     }
 
     reportProgress(progress, "PLY: writing binary faces...");
-    for (int y = 0; y + step < rows; y += step) {
-        const int* row0 = index.ptr<int>(y);
-        const int* row1 = index.ptr<int>(y + step);
-        for (int x = 0; x + step < cols; x += step) {
-            const int a = row0[x];
-            const int b = row0[x + step];
-            const int c = row1[x];
-            const int d = row1[x + step];
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            const std::int32_t a = topology.index(row, col);
+            const std::int32_t b = topology.index(row, col + 1);
+            const std::int32_t c = topology.index(row + 1, col);
+            const std::int32_t d = topology.index(row + 1, col + 1);
             if (a >= 0 && b >= 0 && c >= 0) {
-                const std::uint8_t count = 3;
-                const std::int32_t ia = static_cast<std::int32_t>(a);
-                const std::int32_t ib = static_cast<std::int32_t>(c);
-                const std::int32_t ic = static_cast<std::int32_t>(b);
-                out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-                out.write(reinterpret_cast<const char*>(&ia), sizeof(ia));
-                out.write(reinterpret_cast<const char*>(&ib), sizeof(ib));
-                out.write(reinterpret_cast<const char*>(&ic), sizeof(ic));
+                binary.writeTriangle(a, c, b);
             }
             if (b >= 0 && d >= 0 && c >= 0) {
-                const std::uint8_t count = 3;
-                const std::int32_t ia = static_cast<std::int32_t>(b);
-                const std::int32_t ib = static_cast<std::int32_t>(c);
-                const std::int32_t ic = static_cast<std::int32_t>(d);
-                out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-                out.write(reinterpret_cast<const char*>(&ia), sizeof(ia));
-                out.write(reinterpret_cast<const char*>(&ib), sizeof(ib));
-                out.write(reinterpret_cast<const char*>(&ic), sizeof(ic));
+                binary.writeTriangle(b, c, d);
             }
         }
     }
+    binary.flush();
 
     if (!out) {
         die("Failed while writing PLY mesh: " + path.string());
@@ -878,122 +1053,59 @@ void writePlyMesh(
     checked.commit();
     reportProgress(
         progress,
-        "PLY: done (" + std::to_string(vertexCount) + " vertices, " +
-            std::to_string(faceCount) + " faces).");
+        "PLY: done (" + std::to_string(topology.vertexCount) + " vertices, " +
+            std::to_string(topology.topFaceCount) + " faces).");
 }
 
-struct PlyBoundaryEdge {
-    std::int32_t a = -1;
-    std::int32_t b = -1;
-    int count = 0;
-};
-
-std::uint64_t plyEdgeKey(std::int32_t a, std::int32_t b) {
-    const std::uint32_t lo = static_cast<std::uint32_t>(std::min(a, b));
-    const std::uint32_t hi = static_cast<std::uint32_t>(std::max(a, b));
-    return (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
-}
-
-void addPlyEdge(std::unordered_map<std::uint64_t, PlyBoundaryEdge>& edges, std::int32_t a, std::int32_t b) {
-    PlyBoundaryEdge& edge = edges[plyEdgeKey(a, b)];
-    if (edge.count == 0) {
-        edge.a = a;
-        edge.b = b;
+void writeBoundaryQuad(
+    PlyBinaryWriter& binary,
+    std::int8_t balance,
+    std::int32_t canonicalStart,
+    std::int32_t canonicalEnd,
+    std::int32_t bottomOffset) {
+    if (balance > 0) {
+        binary.writeQuad(
+            canonicalEnd,
+            canonicalStart,
+            canonicalStart + bottomOffset,
+            canonicalEnd + bottomOffset);
+    } else if (balance < 0) {
+        binary.writeQuad(
+            canonicalStart,
+            canonicalEnd,
+            canonicalEnd + bottomOffset,
+            canonicalStart + bottomOffset);
     }
-    ++edge.count;
-}
-
-void addPlyTriangleEdges(std::unordered_map<std::uint64_t, PlyBoundaryEdge>& edges, std::int32_t a, std::int32_t b, std::int32_t c) {
-    addPlyEdge(edges, a, b);
-    addPlyEdge(edges, b, c);
-    addPlyEdge(edges, c, a);
-}
-
-void writePlyTriangle(std::ostream& out, std::int32_t a, std::int32_t b, std::int32_t c) {
-    const std::uint8_t count = 3;
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    out.write(reinterpret_cast<const char*>(&a), sizeof(a));
-    out.write(reinterpret_cast<const char*>(&b), sizeof(b));
-    out.write(reinterpret_cast<const char*>(&c), sizeof(c));
-}
-
-void writePlyQuad(std::ostream& out, std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
-    const std::uint8_t count = 4;
-    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    out.write(reinterpret_cast<const char*>(&a), sizeof(a));
-    out.write(reinterpret_cast<const char*>(&b), sizeof(b));
-    out.write(reinterpret_cast<const char*>(&c), sizeof(c));
-    out.write(reinterpret_cast<const char*>(&d), sizeof(d));
 }
 
 void writePrintablePlyMesh(
     const fs::path& path,
     const cv::Mat& height,
-    const cv::Mat& mask,
     const cv::Mat& vertexColor,
-    int step,
     double heightScale,
     double pixelScaleMm,
     double baseThicknessMm,
+    const PlyGridTopology& topology,
     const std::function<void(const std::string&)>& progress) {
-    const int rows = height.rows;
-    const int cols = height.cols;
     const double xyScale = pixelScaleMm > 0.0 ? pixelScaleMm : 1.0;
     const double zScale = xyScale * heightScale;
     const double baseThickness = pixelScaleMm > 0.0 ? baseThicknessMm : baseThicknessMm / xyScale;
-    cv::Mat index(rows, cols, CV_32S, cv::Scalar(-1));
-
-    reportProgress(progress, "Printable PLY: indexing top vertices...");
-    int topVertexCount = 0;
-    double minZ = std::numeric_limits<double>::infinity();
-    for (int y = 0; y < rows; y += step) {
-        const float* hrow = height.ptr<float>(y);
-        const uchar* mrow = mask.ptr<uchar>(y);
-        int* irow = index.ptr<int>(y);
-        for (int x = 0; x < cols; x += step) {
-            if (mrow[x] != 0 && std::isfinite(hrow[x])) {
-                irow[x] = topVertexCount++;
-                minZ = std::min(minZ, static_cast<double>(hrow[x]) * zScale);
-            }
-        }
-    }
-    if (topVertexCount < 3 || !std::isfinite(minZ)) {
+    if (topology.vertexCount < 3 ||
+        !std::isfinite(topology.minimumHeight) || !std::isfinite(topology.maximumHeight)) {
         die("Printable PLY needs at least three finite height pixels inside the geometry mask.");
     }
-
-    reportProgress(progress, "Printable PLY: counting faces...");
-    std::unordered_map<std::uint64_t, PlyBoundaryEdge> edges;
-    edges.reserve(static_cast<std::size_t>(topVertexCount) * 3);
-    int topFaceCount = 0;
-    for (int y = 0; y + step < rows; y += step) {
-        const int* row0 = index.ptr<int>(y);
-        const int* row1 = index.ptr<int>(y + step);
-        for (int x = 0; x + step < cols; x += step) {
-            const int a = row0[x];
-            const int b = row0[x + step];
-            const int c = row1[x];
-            const int d = row1[x + step];
-            if (a >= 0 && b >= 0 && c >= 0) {
-                addPlyTriangleEdges(edges, a, c, b);
-                ++topFaceCount;
-            }
-            if (b >= 0 && d >= 0 && c >= 0) {
-                addPlyTriangleEdges(edges, b, c, d);
-                ++topFaceCount;
-            }
-        }
-    }
-    int boundaryFaceCount = 0;
-    for (const auto& item : edges) {
-        if (item.second.count == 1) {
-            ++boundaryFaceCount;
-        }
-    }
-    if (topFaceCount == 0) {
+    if (topology.topFaceCount == 0) {
         die("Printable PLY has no surface faces. Use a smaller mesh step or a larger height mask.");
     }
-    const int vertexCount = topVertexCount * 2;
-    const int faceCount = topFaceCount * 2 + boundaryFaceCount;
+    if (topology.vertexCount > std::numeric_limits<std::int32_t>::max() / 2) {
+        die("Printable PLY has too many vertices for 32-bit face indices. Increase the mesh step.");
+    }
+    const std::int32_t topVertexCount = topology.vertexCount;
+    const std::int64_t vertexCount = static_cast<std::int64_t>(topVertexCount) * 2;
+    const std::uint64_t faceCount = topology.topFaceCount * 2 + topology.boundaryFaceCount;
+    const double minZ = zScale >= 0.0
+        ? topology.minimumHeight * zScale
+        : topology.maximumHeight * zScale;
     const double baseZ = minZ - std::max(0.0, baseThickness);
 
     CheckedOutputFile checked(path);
@@ -1014,56 +1126,84 @@ void writePrintablePlyMesh(
     out << "property list uchar int vertex_indices\n";
     out << "end_header\n";
 
+    PlyBinaryWriter binary(out);
     reportProgress(progress, "Printable PLY: writing vertices...");
     for (int layer = 0; layer < 2; ++layer) {
-        for (int y = 0; y < rows; y += step) {
+        for (int row = 0; row < topology.sampleRows; ++row) {
+            const int y = row * topology.step;
             const float* hrow = height.ptr<float>(y);
-            const int* irow = index.ptr<int>(y);
             const uchar* colorRow = vertexColor.empty() ? nullptr : vertexColor.ptr<uchar>(y);
-            for (int x = 0; x < cols; x += step) {
-                if (irow[x] >= 0) {
+            for (int col = 0; col < topology.sampleCols; ++col) {
+                const int x = col * topology.step;
+                if (topology.index(row, col) >= 0) {
                     const float vx = static_cast<float>(static_cast<double>(x) * xyScale);
                     const float vy = static_cast<float>(static_cast<double>(-y) * xyScale);
                     const float vz = layer == 0
                         ? static_cast<float>(static_cast<double>(hrow[x]) * zScale)
                         : static_cast<float>(baseZ);
                     const std::uint8_t color = colorRow == nullptr ? 200 : colorRow[x];
-                    out.write(reinterpret_cast<const char*>(&vx), sizeof(vx));
-                    out.write(reinterpret_cast<const char*>(&vy), sizeof(vy));
-                    out.write(reinterpret_cast<const char*>(&vz), sizeof(vz));
-                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
-                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
-                    out.write(reinterpret_cast<const char*>(&color), sizeof(color));
+                    binary.writeVertex(vx, vy, vz, color);
                 }
             }
         }
     }
 
     reportProgress(progress, "Printable PLY: writing closed faces...");
-    for (int y = 0; y + step < rows; y += step) {
-        const int* row0 = index.ptr<int>(y);
-        const int* row1 = index.ptr<int>(y + step);
-        for (int x = 0; x + step < cols; x += step) {
-            const int a = row0[x];
-            const int b = row0[x + step];
-            const int c = row1[x];
-            const int d = row1[x + step];
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            const std::int32_t a = topology.index(row, col);
+            const std::int32_t b = topology.index(row, col + 1);
+            const std::int32_t c = topology.index(row + 1, col);
+            const std::int32_t d = topology.index(row + 1, col + 1);
             if (a >= 0 && b >= 0 && c >= 0) {
-                writePlyTriangle(out, a, c, b);
-                writePlyTriangle(out, b + topVertexCount, c + topVertexCount, a + topVertexCount);
+                binary.writeTriangle(a, c, b);
+                binary.writeTriangle(b + topVertexCount, c + topVertexCount, a + topVertexCount);
             }
             if (b >= 0 && d >= 0 && c >= 0) {
-                writePlyTriangle(out, b, c, d);
-                writePlyTriangle(out, d + topVertexCount, c + topVertexCount, b + topVertexCount);
+                binary.writeTriangle(b, c, d);
+                binary.writeTriangle(d + topVertexCount, c + topVertexCount, b + topVertexCount);
             }
         }
     }
-    for (const auto& item : edges) {
-        const PlyBoundaryEdge& edge = item.second;
-        if (edge.count == 1) {
-            writePlyQuad(out, edge.b, edge.a, edge.a + topVertexCount, edge.b + topVertexCount);
+
+    const int cellCols = std::max(0, topology.sampleCols - 1);
+    for (int row = 0; row < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            const std::int8_t balance = topology.horizontalEdgeBalance[
+                static_cast<size_t>(row) * static_cast<size_t>(cellCols) + static_cast<size_t>(col)];
+            writeBoundaryQuad(
+                binary,
+                balance,
+                topology.index(row, col),
+                topology.index(row, col + 1),
+                topVertexCount);
         }
     }
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col < topology.sampleCols; ++col) {
+            const std::int8_t balance = topology.verticalEdgeBalance[
+                static_cast<size_t>(row) * static_cast<size_t>(topology.sampleCols) + static_cast<size_t>(col)];
+            writeBoundaryQuad(
+                binary,
+                balance,
+                topology.index(row, col),
+                topology.index(row + 1, col),
+                topVertexCount);
+        }
+    }
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            const std::int8_t balance = topology.diagonalEdgeBalance[
+                static_cast<size_t>(row) * static_cast<size_t>(cellCols) + static_cast<size_t>(col)];
+            writeBoundaryQuad(
+                binary,
+                balance,
+                topology.index(row, col + 1),
+                topology.index(row + 1, col),
+                topVertexCount);
+        }
+    }
+    binary.flush();
 
     if (!out) {
         die("Failed while writing printable PLY mesh: " + path.string());
@@ -1233,20 +1373,33 @@ void saveOutputs(
         writeImageChecked(outDir / "height_mask.png", geometryMask);
         writeImageChecked(outDir / "height.png", normalizeFloatTo8U(height, geometryMask, false));
         writePfm(outDir / "height.pfm", height, geometryMask);
-        if (!opt.meshPath.empty()) {
-            writePlyMesh(opt.meshPath, height, geometryMask, albedo8, opt.meshStep, opt.heightScale, progress);
-        }
-        if (!opt.printableMeshPath.empty()) {
-            writePrintablePlyMesh(
-                opt.printableMeshPath,
+        if (!opt.meshPath.empty() || !opt.printableMeshPath.empty()) {
+            const PlyGridTopology topology = buildPlyGridTopology(
                 height,
                 geometryMask,
-                albedo8,
                 opt.meshStep,
-                opt.heightScale,
-                opt.pixelScaleMm,
-                opt.printableThicknessMm,
+                !opt.printableMeshPath.empty(),
                 progress);
+            if (!opt.meshPath.empty()) {
+                writePlyMesh(
+                    opt.meshPath,
+                    height,
+                    albedo8,
+                    opt.heightScale,
+                    topology,
+                    progress);
+            }
+            if (!opt.printableMeshPath.empty()) {
+                writePrintablePlyMesh(
+                    opt.printableMeshPath,
+                    height,
+                    albedo8,
+                    opt.heightScale,
+                    opt.pixelScaleMm,
+                    opt.printableThicknessMm,
+                    topology,
+                    progress);
+            }
         }
     }
 }

@@ -94,8 +94,10 @@ void replaceDirectoryTransactionally(const fs::path& stagingPath, const fs::path
 
 CheckedOutputFile::CheckedOutputFile(const fs::path& finalPath, std::ios::openmode mode)
     : finalPath_(finalPath),
-      temporaryPath_(makeUniqueSiblingPath(finalPath, "part", true)) {
+      temporaryPath_(makeUniqueSiblingPath(finalPath, "part", true)),
+      buffer_(1024 * 1024) {
     ensureParentDirectory(finalPath_);
+    output_.rdbuf()->pubsetbuf(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
     output_.open(temporaryPath_, mode | std::ios::trunc);
     if (!output_) {
         throw std::runtime_error("Could not open temporary output for " + finalPath_.string());
