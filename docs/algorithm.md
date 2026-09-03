@@ -87,13 +87,13 @@ Optional relief flattening removes a low-frequency slope trend from the normal f
 
 The goal is visual: broad sample tilt or curvature can be reduced so smaller topographic features stand out without sharpening pixel-scale noise. This is best understood as scale separation, related to Gaussian scale-space filtering and surface-texture filtering practice, not as calibrated form removal for metrology. Leave this option off when the large-scale shape itself is scientifically important.
 
-Height form removal is separate. It is applied only after height integration and only affects `height.png`, `height.pfm`, and PLY export. `None` leaves the integrated field untouched. Plane leveling subtracts a least-squares affine surface (`1, x, y`). Radial mode jointly fits that plane and one centered dome term. Quadratic mode jointly fits a full second-order surface (`1, x, y, x^2, y^2, xy`) over the height mask. These options are intended for broad integration curl or visual leveling, not calibrated form removal.
+Height drift correction is separate. It is applied only after height integration and only affects `height.png`, `height.pfm`, and PLY export. `None` leaves the integrated field untouched. Plane leveling subtracts a least-squares affine surface (`1, x, y`). Radial mode jointly fits that plane and one centered dome term. Quadratic mode jointly fits a full second-order surface (`1, x, y, x^2, y^2, xy`) over the height mask. These options are intended for broad integration drift, curl, or visual leveling, not calibrated form removal.
 
 ## Uncalibrated Unknown Lighting
 
 Uncalibrated mode skips the sphere and estimates a relative normal field from the image stack. It needs at least 4 images. The implementation builds an image covariance over valid pixels, tries a rank-4 first-order unknown-lighting factorization, then falls back to a rank-3 PCA relief estimate when the metric constraint is degenerate.
 
-Because unknown-lighting photometric stereo has an unavoidable ambiguity, uncalibrated mode is intended for visual relief enhancement rather than calibrated geometry. The program orients normals toward the camera, searches a rotation about the view axis that reduces a curl-like integrability cost, and stabilizes extreme slopes. Height form is retained when height flattening is `None`; plane, radial, or quadratic removal must be selected explicitly.
+Because unknown-lighting photometric stereo has an unavoidable ambiguity, uncalibrated mode is intended for visual relief enhancement rather than calibrated geometry. The program orients normals toward the camera, searches a rotation about the view axis that reduces a curl-like integrability cost, and stabilizes extreme slopes. No height drift correction is applied when height flattening is `None`; plane, radial, or quadratic correction must be selected explicitly.
 
 Uncalibrated mode is sensitive to non-object pixels and to non-Lambertian structure. Use a crop or mask so shiny fixtures, the calibration sphere, and background do not dominate the factorization. Treat uncalibrated `normal_rgb.png`, `height.pfm`, and `surface.ply` as relative visual products.
 

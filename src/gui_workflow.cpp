@@ -26,6 +26,10 @@
 
 namespace fs = std::filesystem;
 
+#ifndef WHAT_A_RELIEF_VERSION
+#define WHAT_A_RELIEF_VERSION "0.2.1"
+#endif
+
 namespace {
 
 constexpr size_t kMinImages = 3;
@@ -1151,7 +1155,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     SendMessageA(state.heightSolverCombo, CB_SETCURSEL, state.opt->heightSolverMode == HeightSolverMode::FastDct ? 1 : 0, 0);
 
     y += 40;
-    makeLabel(geometryPage, "Height Form", kMargin, y, kLabelWidth, kRowHeight);
+    makeLabel(geometryPage, "Height Drift Correction", kMargin, y, kLabelWidth, kRowHeight);
     state.heightFlattenCombo = makeCombo(geometryPage, kIdHeightFlatten, kControlX, y, kControlWidth);
     addComboItem(state.heightFlattenCombo, "None (keep broad integrated shape)");
     addComboItem(state.heightFlattenCombo, "Plane leveling (least-squares; height and PLY only)");
@@ -1599,10 +1603,11 @@ void launchGuiWorkflow(Options& opt) {
 
     SetupDialogState state;
     state.opt = &opt;
+    const std::string windowTitle = "what-a-relief " WHAT_A_RELIEF_VERSION;
     HWND hwnd = CreateWindowExA(
         WS_EX_DLGMODALFRAME,
         className,
-        "What A Relief Setup",
+        windowTitle.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT,
         CW_USEDEFAULT,

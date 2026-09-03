@@ -159,7 +159,7 @@ void printUsage() {
         << "  --integration-iterations n   Work budget for robust height; fast DCT/Poisson ignores it.\n"
         << "  --height-solver robust|fast  Height integration. Default: robust\n"
         << "  --height-flatten none|plane|radial|quadratic\n"
-        << "                               Height/PLY-only curl correction after integration. Default: none\n"
+        << "                               Height/PLY-only drift correction after integration. Default: none\n"
         << "  --height-slope-cap s         Clamp extreme normal-derived height slopes; 0 disables. Default: 3.0\n"
         << "  --no-height                  Skip height.png and height.pfm.\n"
         << "  --mesh path.ply              Export a PLY mesh from the height preview.\n"

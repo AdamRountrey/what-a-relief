@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
         guiMode = opt.guiMode;
         if (opt.guiMode) {
             launchGuiWorkflow(opt);
-            showGuiProgress("What A Relief Processing", "Starting photometric stereo...");
+            showGuiProgress("what-a-relief Processing", "Starting photometric stereo...");
             progressShown = true;
         }
         runPhotometricStereo(
@@ -370,7 +370,7 @@ int main(int argc, char** argv) {
             progressShown = false;
         }
         if (opt.guiMode) {
-            showGuiInfo("What A Relief Complete", "Outputs were written to:\n\n" + opt.outputDir);
+            showGuiInfo("what-a-relief Complete", "Outputs were written to:\n\n" + opt.outputDir);
         }
         return 0;
     } catch (const std::exception& e) {
@@ -379,7 +379,7 @@ int main(int argc, char** argv) {
             closeGuiProgress();
         }
         if (guiMode) {
-            showGuiInfo("What A Relief Error", e.what());
+            showGuiInfo("what-a-relief Error", e.what());
         }
         return 1;
     }
