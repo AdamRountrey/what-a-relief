@@ -97,7 +97,7 @@ Copy-Item -LiteralPath (Join-Path $repo "AI_ATTRIBUTION.md") -Destination $paylo
 Copy-Item -LiteralPath (Join-Path $repo "THIRD_PARTY_NOTICES.md") -Destination $payload -Force
 Copy-Item -LiteralPath (Join-Path $repo "docs\algorithm.md") -Destination (Join-Path $payload "ALGORITHM.md") -Force
 if (Test-Path (Join-Path $buildOut "models")) {
-    Copy-Item -LiteralPath (Join-Path $buildOut "models") -Destination (Join-Path $payload "models") -Recurse -Force
+    Copy-Item -Path (Join-Path $buildOut "models\*") -Destination $payload -Force
 }
 Write-ThirdPartyLicenseBundle -OutputPath (Join-Path $payload "THIRD_PARTY_LICENSES.txt") -ShareDir $share
 
@@ -226,7 +226,13 @@ internal static class InstallerStub {
                 continue;
             }
 
-            string destinationPath = Path.Combine(installDir, name);
+            bool isModel = name.StartsWith("psfcn_", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "LICENSE-PS-FCN.txt", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "NOTICE.txt", StringComparison.OrdinalIgnoreCase);
+            string destinationPath = isModel
+                ? Path.Combine(installDir, "models", name)
+                : Path.Combine(installDir, name);
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath));
             if (Directory.Exists(sourcePath)) {
                 CopyDirectory(sourcePath, destinationPath);
             } else {
@@ -357,6 +363,19 @@ try {
     $stream.Write($lengthBytes, 0, $lengthBytes.Length)
 } finally {
     $stream.Dispose()
+}
+
+$verify = Join-Path $work "verify"
+New-Item -ItemType Directory -Force $verify | Out-Null
+$verifyProcess = Start-Process -FilePath $installerOut -ArgumentList @("--extract", $verify) -WindowStyle Hidden -Wait -PassThru
+if ($verifyProcess.ExitCode -ne 0) {
+    throw "Installer self-extraction verification failed with exit code $($verifyProcess.ExitCode)."
+}
+foreach ($required in @($exeName, "README.md", "THIRD_PARTY_LICENSES.txt", "psfcn_3_normalize.onnx", "psfcn_25_normalize.onnx")) {
+    $requiredPath = Join-Path $verify $required
+    if (-not (Test-Path -LiteralPath $requiredPath) -or (Get-Item -LiteralPath $requiredPath).Length -eq 0) {
+        throw "Installer verification did not find a nonempty $required file."
+    }
 }
 
 if (Test-Path $work) {

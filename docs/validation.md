@@ -20,6 +20,10 @@ ctest --test-dir build\ninja-vcpkg --output-on-failure
 
 The Windows direct-build script runs the same suite before producing the standalone executable. GitHub Actions uses that script, so a compiler-only success is not sufficient for an installer or tagged release.
 
+## Windows Package Gates
+
+The installer build self-extracts its completed artifact and requires a nonempty executable, README, third-party license bundle, and the 3-image and 25-image PS-FCN models. The portable-package script stages only documented runtime files, recursively includes `models/`, inspects the completed ZIP, and rejects entries from local input, object, or smoke-run folders. On the development host, the extracted 0.2.1 installer executable also completed the eight-image neural workflow with a valid 0.2.1 manifest and all 32 expected outputs.
+
 ## Quantitative Acceptance Criteria
 
 Angular errors are mean per-pixel angles between recovered and known unit normals. Height errors are RMSE after removing only the unavoidable additive offset and normalizing by the known height range.

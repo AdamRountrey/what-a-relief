@@ -53,7 +53,7 @@ jobs:
           .\scripts\build-vcpkg-direct-msvc.ps1 -VsDevCmd "$env:VSDEVCMD" -CMake "$env:CMAKE_EXE" -Version $version
           .\scripts\package-vcpkg-runtime.ps1
           .\scripts\build-windows-installer.ps1 -SkipBuild -Version $version
-          Compress-Archive -Path build-vcpkg-direct\* -DestinationPath "dist\What-A-Relief-$version-portable-windows.zip" -Force
+          .\scripts\build-portable-windows.ps1 -Version $version
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
           $notesFile = "docs/release-notes/v$version.md"
           if (Test-Path $notesFile) {

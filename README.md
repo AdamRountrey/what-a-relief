@@ -90,7 +90,7 @@ The installer is written to `dist\What-A-Relief-0.2.1-Setup.exe` by default. It 
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 
-GitHub Actions can also build the Windows installer. Run the **Windows Build** workflow manually to download the installer and portable ZIP as workflow artifacts, or push a version tag such as `v0.2.1` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installer with the same tag-derived version.
+GitHub Actions can also build the Windows installer. Run the **Windows Build** workflow manually to download the installer and portable ZIP as workflow artifacts, or push a version tag such as `v0.2.1` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installer with the same tag-derived version. Both package builders verify required neural-model and license files; the portable ZIP is assembled from an explicit runtime whitelist, so old smoke runs or input data in the build folder cannot enter the artifact.
 
 ## Run
 

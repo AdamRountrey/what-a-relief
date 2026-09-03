@@ -62,6 +62,7 @@ std::string resolveModelPath(const Options& opt, size_t imageCount) {
 
     const fs::path exeDir = executableDirectory();
     candidates.emplace_back(exeDir / "models" / modelName);
+    candidates.emplace_back(exeDir / modelName);
     candidates.emplace_back(fs::current_path() / "models" / modelName);
     candidates.emplace_back(fs::current_path() / "assets" / "models" / modelName);
 
