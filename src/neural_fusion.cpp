@@ -1,4 +1,5 @@
 #include "neural_fusion.hpp"
+#include "photometric.hpp"
 
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
@@ -32,14 +33,6 @@ cv::Vec3f normalizeVec3(const cv::Vec3f& value) {
     const float length = std::sqrt(value.dot(value));
     if (!std::isfinite(length) || length <= 1.0e-8f) {
         return cv::Vec3f(0.0f, 0.0f, 1.0f);
-    }
-    return value / length;
-}
-
-cv::Vec3d normalizeVec3d(const cv::Vec3d& value) {
-    const double length = std::sqrt(value.dot(value));
-    if (!std::isfinite(length) || length <= 1.0e-12) {
-        return cv::Vec3d(0.0, 0.0, 1.0);
     }
     return value / length;
 }
@@ -216,7 +209,13 @@ void normalizeNormalMapInPlace(cv::Mat& normalMap, const cv::Mat& mask) {
         const uchar* maskRow = mask.ptr<uchar>(y);
         for (int x = 0; x < normalMap.cols; ++x) {
             if (maskRow[x] != 0) {
-                row[x] = normalizeVec3(row[x]);
+                const float length = std::sqrt(row[x].dot(row[x]));
+                if (std::isfinite(row[x][0]) && std::isfinite(row[x][1]) &&
+                    std::isfinite(row[x][2]) && std::isfinite(length) && length > 1.0e-8f) {
+                    row[x] /= length;
+                } else {
+                    row[x] = cv::Vec3f(0.0f, 0.0f, 0.0f);
+                }
             } else {
                 row[x] = cv::Vec3f(0.0f, 0.0f, 0.0f);
             }
@@ -257,7 +256,7 @@ cv::Mat computeClassicalConfidence(
     return confidence;
 }
 
-cv::Vec3f nearFieldRingLightDirection(
+cv::Vec3f nearFieldRingLightVector(
     const cv::Vec3f& reference,
     int index,
     int count,
@@ -284,11 +283,19 @@ cv::Vec3f nearFieldRingLightDirection(
         (static_cast<double>(x) - center.x) * pixelScaleMm,
         (center.y - static_cast<double>(y)) * pixelScaleMm,
         0.0);
-    const cv::Vec3d direction = normalizeVec3d(lightPosition - surfacePoint);
+    const cv::Vec3d displacement = lightPosition - surfacePoint;
+    const double distanceSquared = displacement.dot(displacement);
+    const double referenceDistanceSquared = radiusMm * radiusMm + heightMm * heightMm;
+    if (!std::isfinite(distanceSquared) || distanceSquared <= 1.0e-12 ||
+        !std::isfinite(referenceDistanceSquared) || referenceDistanceSquared <= 0.0) {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    const cv::Vec3d direction = displacement / std::sqrt(distanceSquared);
+    const double relativeIrradiance = referenceDistanceSquared / distanceSquared;
     return cv::Vec3f(
-        static_cast<float>(direction[0]),
-        static_cast<float>(direction[1]),
-        static_cast<float>(direction[2]));
+        static_cast<float>(relativeIrradiance * direction[0]),
+        static_cast<float>(relativeIrradiance * direction[1]),
+        static_cast<float>(relativeIrradiance * direction[2]));
 }
 
 cv::Mat runPsfcnInferenceAtMaxSide(
@@ -309,7 +316,7 @@ cv::Mat runPsfcnInferenceAtMaxSide(
     const int imageCount = static_cast<int>(images.size());
     const float neuralNormalizeScale = std::sqrt(static_cast<float>(imageCount) / 32.0f);
     const int channels = imageCount * kNeuralChannelsPerImage;
-    const int planeSize = paddedRows * paddedCols;
+    const size_t planeSize = static_cast<size_t>(paddedRows) * static_cast<size_t>(paddedCols);
 
     if (inferenceScale < 0.999) {
         std::cout << "      PS-FCN neural prior runs at "
@@ -317,8 +324,6 @@ cv::Mat runPsfcnInferenceAtMaxSide(
                   << " and is upsampled to the input image size." << std::endl;
     }
 
-    std::vector<cv::Mat> paddedImages;
-    paddedImages.reserve(images.size());
     cv::Mat normAccumulator(paddedRows, paddedCols, CV_32F, cv::Scalar(0));
     for (const cv::Mat& image : images) {
         cv::Mat padded(paddedRows, paddedCols, CV_32F, cv::Scalar(0));
@@ -329,7 +334,6 @@ cv::Mat runPsfcnInferenceAtMaxSide(
             inferenceImage = image;
         }
         inferenceImage.copyTo(padded(cv::Rect(0, 0, inferenceImage.cols, inferenceImage.rows)));
-        paddedImages.push_back(padded);
         cv::Mat squared;
         cv::multiply(padded, padded, squared);
         normAccumulator += squared * 3.0f;
@@ -342,22 +346,39 @@ cv::Mat runPsfcnInferenceAtMaxSide(
     float* imageData = reinterpret_cast<float*>(imageBlob.data);
     float* lightData = reinterpret_cast<float*>(lightBlob.data);
 
-    for (size_t i = 0; i < paddedImages.size(); ++i) {
+    const double inputTensorMiB =
+        2.0 * static_cast<double>(channels) * static_cast<double>(planeSize) * sizeof(float) /
+        (1024.0 * 1024.0);
+    std::cout << "      PS-FCN input tensors require approximately "
+              << std::lround(inputTensorMiB) << " MiB." << std::endl;
+
+    for (size_t i = 0; i < images.size(); ++i) {
+        cv::Mat padded(paddedRows, paddedCols, CV_32F, cv::Scalar(0));
+        cv::Mat inferenceImage;
+        if (inferenceScale < 0.999) {
+            cv::resize(images[i], inferenceImage, cv::Size(inferenceCols, inferenceRows), 0.0, 0.0, cv::INTER_AREA);
+        } else {
+            inferenceImage = images[i];
+        }
+        inferenceImage.copyTo(padded(cv::Rect(0, 0, inferenceImage.cols, inferenceImage.rows)));
+
         const cv::Vec3f light = normalizeVec3(lights[i]);
+        const int channelBase = static_cast<int>(i) * kNeuralChannelsPerImage;
+        for (int channel = 0; channel < kNeuralChannelsPerImage; ++channel) {
+            const size_t offset = static_cast<size_t>(channelBase + channel) * planeSize;
+            std::fill(lightData + offset, lightData + offset + planeSize, light[channel]);
+        }
         for (int y = 0; y < paddedRows; ++y) {
-            const float* imageRow = paddedImages[i].ptr<float>(y);
+            const float* imageRow = padded.ptr<float>(y);
             const float* normRow = normAccumulator.ptr<float>(y);
             for (int x = 0; x < paddedCols; ++x) {
-                const int pixelIndex = y * paddedCols + x;
+                const size_t pixelIndex =
+                    static_cast<size_t>(y) * static_cast<size_t>(paddedCols) + static_cast<size_t>(x);
                 const float denominator = std::max(normRow[x], 1.0e-10f);
                 const float normalizedValue = imageRow[x] / denominator * neuralNormalizeScale;
-                const int channelBase = static_cast<int>(i) * kNeuralChannelsPerImage;
-                imageData[(channelBase + 0) * planeSize + pixelIndex] = normalizedValue;
-                imageData[(channelBase + 1) * planeSize + pixelIndex] = normalizedValue;
-                imageData[(channelBase + 2) * planeSize + pixelIndex] = normalizedValue;
-                lightData[(channelBase + 0) * planeSize + pixelIndex] = light[0];
-                lightData[(channelBase + 1) * planeSize + pixelIndex] = light[1];
-                lightData[(channelBase + 2) * planeSize + pixelIndex] = light[2];
+                imageData[static_cast<size_t>(channelBase + 0) * planeSize + pixelIndex] = normalizedValue;
+                imageData[static_cast<size_t>(channelBase + 1) * planeSize + pixelIndex] = normalizedValue;
+                imageData[static_cast<size_t>(channelBase + 2) * planeSize + pixelIndex] = normalizedValue;
             }
         }
     }
@@ -430,6 +451,7 @@ cv::Mat fuseNormals(
     const cv::Mat& classicalNormal,
     const cv::Mat& classicalValidMask,
     const cv::Mat& neuralNormal,
+    const cv::Mat& neuralValidMask,
     const cv::Mat& fusionMask,
     const cv::Mat& confidence) {
     cv::Mat classicalP;
@@ -437,12 +459,12 @@ cv::Mat fuseNormals(
     cv::Mat neuralP;
     cv::Mat neuralQ;
     normalToSlopes(classicalNormal, classicalValidMask, classicalP, classicalQ);
-    normalToSlopes(neuralNormal, fusionMask, neuralP, neuralQ);
+    normalToSlopes(neuralNormal, neuralValidMask, neuralP, neuralQ);
 
     cv::Mat classicalPLow = maskedGaussianBlurFloat(classicalP, classicalValidMask, 5.0);
     cv::Mat classicalQLow = maskedGaussianBlurFloat(classicalQ, classicalValidMask, 5.0);
-    cv::Mat neuralPLow = maskedGaussianBlurFloat(neuralP, fusionMask, 4.5);
-    cv::Mat neuralQLow = maskedGaussianBlurFloat(neuralQ, fusionMask, 4.5);
+    cv::Mat neuralPLow = maskedGaussianBlurFloat(neuralP, neuralValidMask, 4.5);
+    cv::Mat neuralQLow = maskedGaussianBlurFloat(neuralQ, neuralValidMask, 4.5);
 
     std::vector<float> classicalSlopeMagnitudes;
     classicalSlopeMagnitudes.reserve(static_cast<size_t>(classicalNormal.rows * classicalNormal.cols / 4));
@@ -468,6 +490,7 @@ cv::Mat fuseNormals(
         const float* neuralPLowRow = neuralPLow.ptr<float>(y);
         const float* neuralQLowRow = neuralQLow.ptr<float>(y);
         const uchar* classicalValidRow = classicalValidMask.ptr<uchar>(y);
+        const uchar* neuralValidRow = neuralValidMask.ptr<uchar>(y);
         const uchar* fusionMaskRow = fusionMask.ptr<uchar>(y);
         const float* confidenceRow = confidence.ptr<float>(y);
         float* fusedPRow = fusedP.ptr<float>(y);
@@ -476,11 +499,18 @@ cv::Mat fuseNormals(
             if (fusionMaskRow[x] == 0) {
                 continue;
             }
+            if (classicalValidRow[x] != 0 && neuralValidRow[x] == 0) {
+                fusedPRow[x] = classicalPRow[x];
+                fusedQRow[x] = classicalQRow[x];
+                continue;
+            }
 
             const float confidenceValue = confidenceRow[x];
-            const float neuralWeight = classicalValidRow[x] != 0
-                ? (0.04f + 0.28f * (1.0f - confidenceValue))
-                : 0.85f;
+            const float neuralWeight = neuralValidRow[x] == 0
+                ? 0.0f
+                : classicalValidRow[x] != 0
+                    ? (0.04f + 0.28f * (1.0f - confidenceValue))
+                    : 1.0f;
             const float classicalWeight = 1.0f - neuralWeight;
 
             const float baseP = classicalWeight * classicalPLowRow[x] + neuralWeight * neuralPLowRow[x];
@@ -523,7 +553,7 @@ void refitDiffuseOutputs(
     const int lightCount = static_cast<int>(lights.size());
     albedo = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     residual = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
-    validMask = solveMask.clone();
+    validMask = cv::Mat(rows, cols, CV_8U, cv::Scalar(0));
 
     for (int y = 0; y < rows; ++y) {
         const uchar* maskRow = solveMask.ptr<uchar>(y);
@@ -542,7 +572,13 @@ void refitDiffuseOutputs(
                 validRow[x] = 0;
                 continue;
             }
-            const cv::Vec3f normal = normalizeVec3(normalRow[x]);
+            cv::Vec3f normal = normalRow[x];
+            const float normalLength = std::sqrt(normal.dot(normal));
+            if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+                !std::isfinite(normal[2]) || !std::isfinite(normalLength) || normalLength <= 1.0e-8f) {
+                continue;
+            }
+            normal /= normalLength;
             double numerator = 0.0;
             double denominator = 0.0;
             int usedObservations = 0;
@@ -553,7 +589,7 @@ void refitDiffuseOutputs(
 
             for (int i = 0; i < lightCount; ++i) {
                 const cv::Vec3f light = opt.lightingModel == LightingModel::NearFieldRing
-                    ? nearFieldRingLightDirection(
+                    ? nearFieldRingLightVector(
                           lights[i],
                           i,
                           lightCount,
@@ -576,13 +612,14 @@ void refitDiffuseOutputs(
                 ++usedObservations;
             }
 
-            const double rho = denominator > 1.0e-8 ? numerator / denominator : 0.0;
-            albedoRow[x] = static_cast<float>(std::max(0.0, rho));
-
-            if (usedObservations == 0) {
-                residualRow[x] = 0.0f;
+            if (usedObservations < 3 || denominator <= 1.0e-8) {
                 continue;
             }
+            const double rho = numerator / denominator;
+            if (!std::isfinite(rho) || rho <= 1.0e-8) {
+                continue;
+            }
+            albedoRow[x] = static_cast<float>(rho);
 
             double error = 0.0;
             for (size_t i = 0; i < nDotL.size(); ++i) {
@@ -590,6 +627,7 @@ void refitDiffuseOutputs(
                 error += diff * diff;
             }
             residualRow[x] = static_cast<float>(std::sqrt(error / static_cast<double>(nDotL.size())));
+            validRow[x] = 255;
         }
     }
 }
@@ -617,12 +655,40 @@ void applyNeuralFusion(
     const cv::Mat classicalNormal = normalMap.clone();
     const cv::Mat classicalValidMask = validMask.clone();
     const cv::Mat confidence = computeClassicalConfidence(residual, classicalValidMask, diagnostics);
-    const cv::Mat neuralNormal = runPsfcnInference(opt, images, lights);
-    const cv::Mat fusedNormal = fuseNormals(classicalNormal, classicalValidMask, neuralNormal, solveMask, confidence);
+    cv::Mat neuralNormal = runPsfcnInference(opt, images, lights);
+    cv::Mat neuralValidMask = buildObservationValidityMask(
+        images,
+        solveMask,
+        static_cast<float>(opt.shadowThreshold),
+        3);
+    for (int y = 0; y < neuralNormal.rows; ++y) {
+        cv::Vec3f* normalRow = neuralNormal.ptr<cv::Vec3f>(y);
+        uchar* validRow = neuralValidMask.ptr<uchar>(y);
+        for (int x = 0; x < neuralNormal.cols; ++x) {
+            const float length = std::sqrt(normalRow[x].dot(normalRow[x]));
+            if (validRow[x] == 0 || !std::isfinite(normalRow[x][0]) ||
+                !std::isfinite(normalRow[x][1]) || !std::isfinite(normalRow[x][2]) ||
+                !std::isfinite(length) || length <= 1.0e-8f) {
+                validRow[x] = 0;
+                normalRow[x] = cv::Vec3f(0.0f, 0.0f, 0.0f);
+            }
+        }
+    }
+    cv::Mat fusionMask;
+    cv::bitwise_or(classicalValidMask, neuralValidMask, fusionMask);
+    const cv::Mat fusedNormal = fuseNormals(
+        classicalNormal,
+        classicalValidMask,
+        neuralNormal,
+        neuralValidMask,
+        fusionMask,
+        confidence);
 
     normalMap = fusedNormal;
     diagnostics.classicalConfidence = confidence;
+    diagnostics.classicalValidMask = classicalValidMask;
     diagnostics.classicalNormal = classicalNormal;
+    diagnostics.neuralValidMask = neuralValidMask;
     diagnostics.neuralNormal = neuralNormal;
-    refitDiffuseOutputs(opt, images, lights, solveMask, normalMap, lightingCenter, albedo, residual, validMask);
+    refitDiffuseOutputs(opt, images, lights, fusionMask, normalMap, lightingCenter, albedo, residual, validMask);
 }

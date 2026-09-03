@@ -1,4 +1,6 @@
 #include "image_io.hpp"
+#include "checked_io.hpp"
+#include "radiometry.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -66,6 +68,13 @@ double imageDescriptionUnitMm(const std::string& description) {
     }
     if (unit.find("nanometer") != std::string::npos || unit.find("nm") != std::string::npos) {
         return 0.000001;
+    }
+    if (unit.find("centimeter") != std::string::npos || unit.find("centimetre") != std::string::npos ||
+        unit.find("cm") != std::string::npos) {
+        return 10.0;
+    }
+    if (unit.find("meter") != std::string::npos || unit.find("metre") != std::string::npos) {
+        return 1000.0;
     }
     return 0.0;
 }
@@ -197,6 +206,73 @@ size_t tiffEntryValueOffset(const ClassicTiffReader& reader, size_t entry, std::
     return reader.readU32(entry + 8);
 }
 
+double epsgLinearUnitMm(std::uint16_t code) {
+    // Common EPSG length-unit codes used by GeoTIFF. Unknown units are not guessed.
+    switch (code) {
+    case 9001: // metre
+        return 1000.0;
+    case 9002: // international foot
+        return 304.8;
+    case 9003: // US survey foot
+        return 1200.0 / 3.937;
+    case 9030: // nautical mile
+        return 1852000.0;
+    case 9036: // kilometre
+        return 1000000.0;
+    default:
+        return 0.0;
+    }
+}
+
+double geoTiffModelUnitMm(
+    const ClassicTiffReader& reader,
+    size_t geoKeyOffset,
+    std::uint32_t geoKeyCount,
+    size_t geoDoubleOffset,
+    std::uint32_t geoDoubleCount) {
+    constexpr std::uint16_t kProjLinearUnitsGeoKey = 3076;
+    constexpr std::uint16_t kProjLinearUnitSizeGeoKey = 3077;
+    constexpr std::uint16_t kGeoDoubleParamsTag = 34736;
+    constexpr std::uint16_t kUserDefined = 32767;
+
+    if (geoKeyCount < 4 || geoKeyOffset > reader.data().size() ||
+        static_cast<size_t>(geoKeyCount) > (reader.data().size() - geoKeyOffset) / 2) {
+        return 0.0;
+    }
+
+    const std::uint16_t keyCount = reader.readU16(geoKeyOffset + 6);
+    if (static_cast<size_t>(keyCount) > (static_cast<size_t>(geoKeyCount) - 4) / 4) {
+        return 0.0;
+    }
+
+    std::uint16_t linearUnitCode = 0;
+    double userUnitMeters = 0.0;
+    for (std::uint16_t i = 0; i < keyCount; ++i) {
+        const size_t key = geoKeyOffset + 8 + static_cast<size_t>(i) * 8;
+        const std::uint16_t keyId = reader.readU16(key);
+        const std::uint16_t location = reader.readU16(key + 2);
+        const std::uint16_t count = reader.readU16(key + 4);
+        const std::uint16_t valueOffset = reader.readU16(key + 6);
+        if (keyId == kProjLinearUnitsGeoKey && location == 0 && count == 1) {
+            linearUnitCode = valueOffset;
+        } else if (
+            keyId == kProjLinearUnitSizeGeoKey && location == kGeoDoubleParamsTag && count >= 1 &&
+            valueOffset < geoDoubleCount && geoDoubleOffset <= reader.data().size() &&
+            static_cast<size_t>(valueOffset) < (reader.data().size() - geoDoubleOffset) / 8) {
+            userUnitMeters = reader.readDouble(geoDoubleOffset + static_cast<size_t>(valueOffset) * 8);
+        }
+    }
+
+    const double registeredUnitMm = epsgLinearUnitMm(linearUnitCode);
+    if (registeredUnitMm > 0.0) {
+        return registeredUnitMm;
+    }
+    if (linearUnitCode == kUserDefined && userUnitMeters > 0.0 && std::isfinite(userUnitMeters)) {
+        return 1000.0 * userUnitMeters;
+    }
+    return 0.0;
+}
+
 double readClassicTiffPixelScaleMm(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -221,6 +297,10 @@ double readClassicTiffPixelScaleMm(const std::string& path) {
     double modelScaleY = 0.0;
     int resolutionUnit = 0;
     std::string imageDescription;
+    size_t geoKeyOffset = 0;
+    std::uint32_t geoKeyCount = 0;
+    size_t geoDoubleOffset = 0;
+    std::uint32_t geoDoubleCount = 0;
 
     for (std::uint16_t i = 0; i < entries; ++i) {
         const size_t entry = ifd + 2 + static_cast<size_t>(i) * 12;
@@ -248,6 +328,12 @@ double readClassicTiffPixelScaleMm(const std::string& path) {
         } else if (tag == 33550 && type == 12 && count >= 2) {
             modelScaleX = reader.readDouble(valueOffset);
             modelScaleY = reader.readDouble(valueOffset + 8);
+        } else if (tag == 34735 && type == 3 && count >= 4) {
+            geoKeyOffset = valueOffset;
+            geoKeyCount = count;
+        } else if (tag == 34736 && type == 12 && count >= 1) {
+            geoDoubleOffset = valueOffset;
+            geoDoubleCount = count;
         }
     }
 
@@ -267,43 +353,21 @@ double readClassicTiffPixelScaleMm(const std::string& path) {
 
     const double modelScale = averagePositive(modelScaleX, modelScaleY);
     if (modelScale > 0.0 && std::isfinite(modelScale)) {
-        return modelScale;
-    }
-    return 0.0;
-}
-
-cv::Mat toFloatLuminance(const cv::Mat& input, bool srgb) {
-    const int depth = input.depth();
-    double scale = 1.0;
-    if (depth == CV_8U) {
-        scale = 1.0 / 255.0;
-    } else if (depth == CV_16U) {
-        scale = 1.0 / 65535.0;
-    } else if (depth == CV_16S) {
-        scale = 1.0 / 32767.0;
-    }
-
-    cv::Mat f;
-    input.convertTo(f, CV_MAKETYPE(CV_32F, input.channels()), scale);
-
-    cv::Mat gray;
-    if (f.channels() == 1) {
-        gray = f;
-    } else {
-        std::vector<cv::Mat> channels;
-        cv::split(f, channels);
-        if (channels.size() < 3) {
-            gray = channels[0];
-        } else {
-            gray = 0.0722f * channels[0] + 0.7152f * channels[1] + 0.2126f * channels[2];
+        const double geoUnitMm = geoTiffModelUnitMm(
+            reader,
+            geoKeyOffset,
+            geoKeyCount,
+            geoDoubleOffset,
+            geoDoubleCount);
+        if (geoUnitMm > 0.0) {
+            return modelScale * geoUnitMm;
+        }
+        const double descriptionUnitMm = imageDescriptionUnitMm(imageDescription);
+        if (descriptionUnitMm > 0.0) {
+            return modelScale * descriptionUnitMm;
         }
     }
-
-    cv::max(gray, 0.0f, gray);
-    if (srgb) {
-        cv::pow(gray, 2.2, gray);
-    }
-    return gray;
+    return 0.0;
 }
 
 void minMaxMasked(const cv::Mat& src, const cv::Mat& mask, double& minValue, double& maxValue) {
@@ -422,11 +486,11 @@ void writeNormalSet(
     const std::string& prefix,
     const cv::Mat& normalMap,
     const cv::Mat& mask) {
-    cv::imwrite((outDir / (prefix + "_normal_rgb.png")).string(), normalRgbTo8U(normalMap, mask));
-    cv::imwrite((outDir / (prefix + "_normal_x.png")).string(), normalComponentTo8U(normalMap, mask, 0, true));
-    cv::imwrite((outDir / (prefix + "_normal_y.png")).string(), normalComponentTo8U(normalMap, mask, 1, true));
-    cv::imwrite((outDir / (prefix + "_hillshade_ul.png")).string(), hillshadeTo8U(normalMap, mask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
-    cv::imwrite((outDir / (prefix + "_normal_z.png")).string(), normalComponentTo8U(normalMap, mask, 2, false));
+    writeImageChecked(outDir / (prefix + "_normal_rgb.png"), normalRgbTo8U(normalMap, mask));
+    writeImageChecked(outDir / (prefix + "_normal_x.png"), normalComponentTo8U(normalMap, mask, 0, true));
+    writeImageChecked(outDir / (prefix + "_normal_y.png"), normalComponentTo8U(normalMap, mask, 1, true));
+    writeImageChecked(outDir / (prefix + "_hillshade_ul.png"), hillshadeTo8U(normalMap, mask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
+    writeImageChecked(outDir / (prefix + "_normal_z.png"), normalComponentTo8U(normalMap, mask, 2, false));
 }
 
 cv::Vec3f normalizeVector(const cv::Vec3f& v) {
@@ -621,10 +685,8 @@ cv::Mat liquidMetalTo8U(const cv::Mat& normalMap, const cv::Mat& mask) {
 }
 
 void writePfm(const fs::path& path, const cv::Mat& image, const cv::Mat& mask) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        die("Failed to write PFM: " + path.string());
-    }
+    CheckedOutputFile checked(path);
+    std::ostream& out = checked.stream();
     out << "Pf\n" << image.cols << " " << image.rows << "\n-1.0\n";
     for (int y = image.rows - 1; y >= 0; --y) {
         const float* row = image.ptr<float>(y);
@@ -634,6 +696,7 @@ void writePfm(const fs::path& path, const cv::Mat& image, const cv::Mat& mask) {
             out.write(reinterpret_cast<const char*>(&v), sizeof(float));
         }
     }
+    checked.commit();
 }
 
 void writeLightsCsv(
@@ -641,10 +704,8 @@ void writeLightsCsv(
     const Options& opt,
     const std::vector<cv::Vec3f>& lights,
     const std::vector<HighlightEstimate>& estimates) {
-    std::ofstream out(path);
-    if (!out) {
-        die("Failed to write lights CSV: " + path.string());
-    }
+    CheckedOutputFile checked(path);
+    std::ostream& out = checked.stream();
     if (opt.uncalibratedLighting) {
         out << "mode,uncalibrated_unknown_lighting\n";
         out << "note,No sphere or calibrated light vectors were used. Normals and height are relative and ambiguous.\n";
@@ -652,6 +713,7 @@ void writeLightsCsv(
         for (const std::string& imagePath : opt.imagePaths) {
             out << '"' << imagePath << '"' << '\n';
         }
+        checked.commit();
         return;
     }
     out << "lighting_model," << (opt.lightingModel == LightingModel::NearFieldRing ? "near_field_ring" : "directional") << "\n";
@@ -682,18 +744,18 @@ void writeLightsCsv(
         }
         out << '\n';
     }
+    checked.commit();
 }
 
 void writeLightVectorsCsv(const fs::path& path, const std::vector<cv::Vec3f>& lights) {
-    std::ofstream out(path);
-    if (!out) {
-        die("Failed to write light vector CSV: " + path.string());
-    }
+    CheckedOutputFile checked(path);
+    std::ostream& out = checked.stream();
     out << "x,y,z\n";
     out << std::fixed << std::setprecision(8);
     for (const cv::Vec3f& light : lights) {
         out << light[0] << ',' << light[1] << ',' << light[2] << '\n';
     }
+    checked.commit();
 }
 
 void writePlyMesh(
@@ -740,11 +802,8 @@ void writePlyMesh(
         }
     }
 
-    fs::create_directories(path.parent_path().empty() ? fs::path(".") : path.parent_path());
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        die("Failed to write PLY mesh: " + path.string());
-    }
+    CheckedOutputFile checked(path);
+    std::ostream& out = checked.stream();
 
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
@@ -816,6 +875,7 @@ void writePlyMesh(
     if (!out) {
         die("Failed while writing PLY mesh: " + path.string());
     }
+    checked.commit();
     reportProgress(
         progress,
         "PLY: done (" + std::to_string(vertexCount) + " vertices, " +
@@ -849,7 +909,7 @@ void addPlyTriangleEdges(std::unordered_map<std::uint64_t, PlyBoundaryEdge>& edg
     addPlyEdge(edges, c, a);
 }
 
-void writePlyTriangle(std::ofstream& out, std::int32_t a, std::int32_t b, std::int32_t c) {
+void writePlyTriangle(std::ostream& out, std::int32_t a, std::int32_t b, std::int32_t c) {
     const std::uint8_t count = 3;
     out.write(reinterpret_cast<const char*>(&count), sizeof(count));
     out.write(reinterpret_cast<const char*>(&a), sizeof(a));
@@ -857,7 +917,7 @@ void writePlyTriangle(std::ofstream& out, std::int32_t a, std::int32_t b, std::i
     out.write(reinterpret_cast<const char*>(&c), sizeof(c));
 }
 
-void writePlyQuad(std::ofstream& out, std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
+void writePlyQuad(std::ostream& out, std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
     const std::uint8_t count = 4;
     out.write(reinterpret_cast<const char*>(&count), sizeof(count));
     out.write(reinterpret_cast<const char*>(&a), sizeof(a));
@@ -936,11 +996,8 @@ void writePrintablePlyMesh(
     const int faceCount = topFaceCount * 2 + boundaryFaceCount;
     const double baseZ = minZ - std::max(0.0, baseThickness);
 
-    fs::create_directories(path.parent_path().empty() ? fs::path(".") : path.parent_path());
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        die("Failed to write printable PLY mesh: " + path.string());
-    }
+    CheckedOutputFile checked(path);
+    std::ostream& out = checked.stream();
 
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
@@ -1011,6 +1068,7 @@ void writePrintablePlyMesh(
     if (!out) {
         die("Failed while writing printable PLY mesh: " + path.string());
     }
+    checked.commit();
     reportProgress(
         progress,
         "Printable PLY: done (" + std::to_string(vertexCount) + " vertices, " +
@@ -1036,7 +1094,7 @@ std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, 
         if (raw.empty()) {
             die("Failed to read image: " + path);
         }
-        cv::Mat gray = toFloatLuminance(raw, srgb);
+        cv::Mat gray = convertToLinearLuminance(raw, srgb);
         if (expected.empty()) {
             expected = gray.size();
         } else if (gray.size() != expected) {
@@ -1044,6 +1102,7 @@ std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, 
         }
         images.push_back(gray);
     }
+    normalizeRelativeIntensityStack(images);
     return images;
 }
 
@@ -1133,37 +1192,46 @@ void saveOutputs(
     writeLightVectorsCsv(outDir / "light_vectors.csv", lights);
     reportProgress(progress, "Writing image outputs...");
     const cv::Mat albedo8 = normalizeFloatTo8U(albedo, validMask, true);
-    cv::imwrite((outDir / "normal_rgb.png").string(), normalRgbTo8U(normalMap, validMask));
-    cv::imwrite((outDir / "normal_x.png").string(), normalComponentTo8U(normalMap, validMask, 0, true));
-    cv::imwrite((outDir / "normal_y.png").string(), normalComponentTo8U(normalMap, validMask, 1, true));
-    cv::imwrite((outDir / "hillshade_ul.png").string(), hillshadeTo8U(normalMap, validMask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
-    cv::imwrite((outDir / "normal_z.png").string(), normalComponentTo8U(normalMap, validMask, 2, false));
-    cv::imwrite((outDir / "albedo.png").string(), albedo8);
-    cv::imwrite((outDir / "residual.png").string(), normalizeFloatTo8U(residual, validMask, true));
-    cv::imwrite((outDir / "valid_mask.png").string(), validMask);
-    cv::imwrite((outDir / "liquid_metal.png").string(), liquidMetalTo8U(normalMap, validMask));
+    writeImageChecked(outDir / "normal_rgb.png", normalRgbTo8U(normalMap, validMask));
+    writeImageChecked(outDir / "normal_x.png", normalComponentTo8U(normalMap, validMask, 0, true));
+    writeImageChecked(outDir / "normal_y.png", normalComponentTo8U(normalMap, validMask, 1, true));
+    writeImageChecked(outDir / "hillshade_ul.png", hillshadeTo8U(normalMap, validMask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
+    writeImageChecked(outDir / "normal_z.png", normalComponentTo8U(normalMap, validMask, 2, false));
+    writeImageChecked(outDir / "albedo.png", albedo8);
+    writeImageChecked(outDir / "residual.png", normalizeFloatTo8U(residual, validMask, true));
+    writeImageChecked(outDir / "valid_mask.png", validMask);
+    writeImageChecked(outDir / "liquid_metal.png", liquidMetalTo8U(normalMap, validMask));
     if (opt.neuralFusion && !diagnostics.neuralNormal.empty()) {
         writeNormalSet(outDir, "fused", normalMap, validMask);
         if (!diagnostics.classicalNormal.empty()) {
-            writeNormalSet(outDir, "classical", diagnostics.classicalNormal, validMask);
+            const cv::Mat& classicalMask = diagnostics.classicalValidMask.empty()
+                ? validMask
+                : diagnostics.classicalValidMask;
+            writeNormalSet(outDir, "classical", diagnostics.classicalNormal, classicalMask);
         }
-        cv::Mat neuralMask(diagnostics.neuralNormal.size(), CV_8U, cv::Scalar(255));
+        const cv::Mat neuralMask = diagnostics.neuralValidMask.empty()
+            ? cv::Mat(diagnostics.neuralNormal.size(), CV_8U, cv::Scalar(0))
+            : diagnostics.neuralValidMask;
         writeNormalSet(outDir, "neural", diagnostics.neuralNormal, neuralMask);
-        cv::imwrite((outDir / "fused_classical_confidence.png").string(), normalizeFloatTo8U(diagnostics.classicalConfidence, validMask, true));
+        writeImageChecked(outDir / "neural_valid_mask.png", neuralMask);
+        writeImageChecked(outDir / "fused_classical_confidence.png", normalizeFloatTo8U(diagnostics.classicalConfidence, validMask, true));
     }
     if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustWeight.empty()) {
-        cv::imwrite((outDir / "robust_weight.png").string(), normalizeFloatTo8U(diagnostics.robustWeight, validMask, true));
-        cv::imwrite((outDir / "shadow_count.png").string(), normalizeFloatTo8U(diagnostics.shadowCount, validMask, true));
-        cv::imwrite((outDir / "highlight_outlier_count.png").string(), normalizeFloatTo8U(diagnostics.highlightOutlierCount, validMask, true));
+        writeImageChecked(outDir / "robust_weight.png", normalizeFloatTo8U(diagnostics.robustWeight, validMask, true));
+        if (!diagnostics.robustFallbackMask.empty()) {
+            writeImageChecked(outDir / "robust_fallback_mask.png", diagnostics.robustFallbackMask);
+        }
+        writeImageChecked(outDir / "shadow_count.png", normalizeFloatTo8U(diagnostics.shadowCount, validMask, true));
+        writeImageChecked(outDir / "highlight_outlier_count.png", normalizeFloatTo8U(diagnostics.highlightOutlierCount, validMask, true));
     }
     if (opt.specularDiagnostics && !diagnostics.specularCueMask.empty()) {
-        cv::imwrite((outDir / "specular_cue_mask.png").string(), diagnostics.specularCueMask);
+        writeImageChecked(outDir / "specular_cue_mask.png", diagnostics.specularCueMask);
     }
     if (!height.empty()) {
         reportProgress(progress, "Writing height outputs...");
         const cv::Mat& geometryMask = heightMask.empty() ? validMask : heightMask;
-        cv::imwrite((outDir / "height_mask.png").string(), geometryMask);
-        cv::imwrite((outDir / "height.png").string(), normalizeFloatTo8U(height, geometryMask, false));
+        writeImageChecked(outDir / "height_mask.png", geometryMask);
+        writeImageChecked(outDir / "height.png", normalizeFloatTo8U(height, geometryMask, false));
         writePfm(outDir / "height.pfm", height, geometryMask);
         if (!opt.meshPath.empty()) {
             writePlyMesh(opt.meshPath, height, geometryMask, albedo8, opt.meshStep, opt.heightScale, progress);

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.0-specular.2",
+    [string]$Version = "0.2.1",
     [switch]$SkipBuild
 )
 
@@ -74,7 +74,7 @@ function Write-ThirdPartyLicenseBundle {
 }
 
 if (-not $SkipBuild) {
-    & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build-vcpkg-direct-msvc.ps1")
+    & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build-vcpkg-direct-msvc.ps1") -Version $Version
     & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "package-vcpkg-runtime.ps1")
 }
 

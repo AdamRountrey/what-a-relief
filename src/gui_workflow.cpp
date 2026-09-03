@@ -892,7 +892,7 @@ bool validateAndAccept(SetupDialogState& state) {
     }
     if (!opt.uncalibratedLighting && !opt.lightsFile.empty()) {
         try {
-            (void)loadLightsFile(opt.lightsFile, opt.imagePaths.size(), nullptr);
+            (void)loadLightsFile(opt.lightsFile, opt.imagePaths, nullptr);
         } catch (const std::exception& e) {
             showOwnerMessage(
                 state.hwnd,
@@ -995,9 +995,12 @@ bool validateAndAccept(SetupDialogState& state) {
     opt.heightSolverMode = comboSelection(state.heightSolverCombo) == 1 ? HeightSolverMode::FastDct : HeightSolverMode::RobustMasked;
     switch (comboSelection(state.heightFlattenCombo)) {
     case 1:
-        opt.heightFlattenMode = HeightFlattenMode::Radial;
+        opt.heightFlattenMode = HeightFlattenMode::Plane;
         break;
     case 2:
+        opt.heightFlattenMode = HeightFlattenMode::Radial;
+        break;
+    case 3:
         opt.heightFlattenMode = HeightFlattenMode::Quadratic;
         break;
     default:
@@ -1148,16 +1151,19 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     SendMessageA(state.heightSolverCombo, CB_SETCURSEL, state.opt->heightSolverMode == HeightSolverMode::FastDct ? 1 : 0, 0);
 
     y += 40;
-    makeLabel(geometryPage, "Height Curl", kMargin, y, kLabelWidth, kRowHeight);
+    makeLabel(geometryPage, "Height Form", kMargin, y, kLabelWidth, kRowHeight);
     state.heightFlattenCombo = makeCombo(geometryPage, kIdHeightFlatten, kControlX, y, kControlWidth);
     addComboItem(state.heightFlattenCombo, "None (keep broad integrated shape)");
+    addComboItem(state.heightFlattenCombo, "Plane leveling (least-squares; height and PLY only)");
     addComboItem(state.heightFlattenCombo, "Radial/dome correction (height and PLY only)");
     addComboItem(state.heightFlattenCombo, "Quadratic correction (height and PLY only)");
     int heightFlattenIndex = 0;
-    if (state.opt->heightFlattenMode == HeightFlattenMode::Radial) {
+    if (state.opt->heightFlattenMode == HeightFlattenMode::Plane) {
         heightFlattenIndex = 1;
-    } else if (state.opt->heightFlattenMode == HeightFlattenMode::Quadratic) {
+    } else if (state.opt->heightFlattenMode == HeightFlattenMode::Radial) {
         heightFlattenIndex = 2;
+    } else if (state.opt->heightFlattenMode == HeightFlattenMode::Quadratic) {
+        heightFlattenIndex = 3;
     }
     SendMessageA(state.heightFlattenCombo, CB_SETCURSEL, heightFlattenIndex, 0);
 
@@ -1188,7 +1194,10 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     addComboItem(state.solverCombo, "Standard least squares");
     SendMessageA(state.solverCombo, CB_SETCURSEL, state.opt->solverMode == NormalSolverMode::Standard ? 1 : 0, 0);
 
-    y += 42;
+    y += 28;
+    makeLabel(processingPage, "Robust rejection needs 4+ usable lights per pixel; 3-light pixels use least squares.", kControlX, y, kControlWidth, kRowHeight);
+
+    y += 36;
     makeLabel(processingPage, "Relief Flattening", kMargin, y, kLabelWidth, kRowHeight);
     state.flattenCombo = makeCombo(processingPage, kIdFlatten, kControlX, y, kControlWidth);
     addComboItem(state.flattenCombo, "None (no slope filtering)");

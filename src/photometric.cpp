@@ -4,9 +4,11 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <array>
 #include <functional>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -14,6 +16,8 @@
 #include <vector>
 
 namespace {
+
+namespace fs = std::filesystem;
 
 [[noreturn]] void die(const std::string& message) {
     throw std::runtime_error(message);
@@ -120,7 +124,7 @@ bool parseDoubleField(const std::string& s, double& value) {
     try {
         size_t end = 0;
         value = std::stod(s, &end);
-        return end == s.size();
+        return end == s.size() && std::isfinite(value);
     } catch (const std::exception&) {
         return false;
     }
@@ -140,6 +144,46 @@ bool parseVec3Fields(const std::vector<std::string>& fields, size_t first, cv::V
     }
     v = cv::Vec3f(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
     return true;
+}
+
+std::string normalizedPathKey(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    path = fs::path(path).lexically_normal().generic_string();
+#ifdef _WIN32
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+#endif
+    return path;
+}
+
+std::string filenameKey(const std::string& path) {
+    return fs::path(normalizedPathKey(path)).filename().generic_string();
+}
+
+double lightConditionNumber(const std::vector<cv::Vec3f>& lights) {
+    cv::Matx33d gram = cv::Matx33d::zeros();
+    for (const cv::Vec3f& light : lights) {
+        const double length = std::sqrt(static_cast<double>(light.dot(light)));
+        if (!std::isfinite(length) || length <= 1.0e-8) {
+            die("Every light direction must be finite and non-zero.");
+        }
+        const cv::Vec3d unit(light[0] / length, light[1] / length, light[2] / length);
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                gram(row, col) += unit[row] * unit[col];
+            }
+        }
+    }
+
+    cv::Vec3d eigenvalues;
+    cv::eigen(gram, eigenvalues);
+    const double largest = eigenvalues[0];
+    const double smallest = eigenvalues[2];
+    if (!std::isfinite(largest) || !std::isfinite(smallest) || largest <= 0.0 || smallest <= largest * 1.0e-12) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return std::sqrt(largest / smallest);
 }
 
 cv::Mat maskedGaussianBlurFloat(const cv::Mat& src, const cv::Mat& mask, double sigma) {
@@ -230,7 +274,7 @@ cv::Matx33d rotationAroundZ(double radians) {
         0.0, 0.0, 1.0);
 }
 
-cv::Vec3f nearFieldRingLightDirection(
+cv::Vec3f nearFieldRingLightVector(
     const cv::Vec3f& reference,
     int index,
     int count,
@@ -257,11 +301,15 @@ cv::Vec3f nearFieldRingLightDirection(
         (static_cast<double>(x) - center.x) * pixelScaleMm,
         (center.y - static_cast<double>(y)) * pixelScaleMm,
         0.0);
-    const cv::Vec3d direction = normalizeVec3d(lightPosition - surfacePoint);
+    const cv::Vec3d displacement = lightPosition - surfacePoint;
+    const double distanceSquared = displacement.dot(displacement);
+    const double referenceDistanceSquared = radiusMm * radiusMm + heightMm * heightMm;
+    const cv::Vec3d direction = normalizeVec3d(displacement);
+    const double relativeIrradiance = referenceDistanceSquared / distanceSquared;
     return cv::Vec3f(
-        static_cast<float>(direction[0]),
-        static_cast<float>(direction[1]),
-        static_cast<float>(direction[2]));
+        static_cast<float>(relativeIrradiance * direction[0]),
+        static_cast<float>(relativeIrradiance * direction[1]),
+        static_cast<float>(relativeIrradiance * direction[2]));
 }
 
 double curlCostForNormals(const cv::Mat& normalMap, const cv::Mat& validMask, const cv::Matx33d& rotation) {
@@ -648,7 +696,10 @@ bool loadLightsFileMetadata(const std::string& path, Options& opt) {
     return found;
 }
 
-std::vector<cv::Vec3f> loadLightsFile(const std::string& path, size_t expectedCount, Options* opt) {
+std::vector<cv::Vec3f> loadLightsFile(
+    const std::string& path,
+    const std::vector<std::string>& imagePaths,
+    Options* opt) {
     if (opt != nullptr) {
         loadLightsFileMetadata(path, *opt);
     }
@@ -658,7 +709,11 @@ std::vector<cv::Vec3f> loadLightsFile(const std::string& path, size_t expectedCo
         die("Failed to open lights file: " + path);
     }
 
-    std::vector<cv::Vec3f> lights;
+    struct ParsedLight {
+        cv::Vec3f direction;
+        std::string imagePath;
+    };
+    std::vector<ParsedLight> parsedLights;
     std::string line;
     int lineNumber = 0;
     while (std::getline(in, line)) {
@@ -674,19 +729,118 @@ std::vector<cv::Vec3f> loadLightsFile(const std::string& path, size_t expectedCo
 
         const std::vector<std::string> fields = splitLightLine(line);
         cv::Vec3f v(0.0f, 0.0f, 0.0f);
-        if (!parseVec3Fields(fields, 0, v) && !parseVec3Fields(fields, 3, v)) {
+        std::string imagePath;
+        if (fields.size() >= 6 && parseVec3Fields(fields, 3, v)) {
+            imagePath = fields[0];
+        } else if (!parseVec3Fields(fields, 0, v)) {
             continue;
         }
         const float norm = std::sqrt(v.dot(v));
-        if (norm <= 0.0f) {
-            die("Zero light vector in lights file at line " + std::to_string(lineNumber));
+        if (!std::isfinite(norm) || norm <= 0.0f) {
+            die("Non-finite or zero light vector in lights file at line " + std::to_string(lineNumber));
         }
-        lights.push_back(v / norm);
+        parsedLights.push_back({v / norm, imagePath});
     }
-    if (lights.size() != expectedCount) {
+    if (parsedLights.size() != imagePaths.size()) {
         die("Lights file must contain one x,y,z vector per image.");
     }
+
+    const size_t namedCount = static_cast<size_t>(std::count_if(
+        parsedLights.begin(), parsedLights.end(), [](const ParsedLight& light) {
+            return !light.imagePath.empty();
+        }));
+    if (namedCount != 0 && namedCount != parsedLights.size()) {
+        die("Lights file mixes named calibration rows with unnamed vectors.");
+    }
+
+    std::vector<cv::Vec3f> lights;
+    lights.reserve(parsedLights.size());
+    if (namedCount == 0) {
+        for (const ParsedLight& light : parsedLights) {
+            lights.push_back(light.direction);
+        }
+        return lights;
+    }
+
+    std::vector<bool> used(parsedLights.size(), false);
+    for (const std::string& selectedPath : imagePaths) {
+        std::vector<size_t> candidates;
+        const std::string selectedFull = normalizedPathKey(selectedPath);
+        for (size_t i = 0; i < parsedLights.size(); ++i) {
+            if (!used[i] && normalizedPathKey(parsedLights[i].imagePath) == selectedFull) {
+                candidates.push_back(i);
+            }
+        }
+        if (candidates.empty()) {
+            const std::string selectedName = filenameKey(selectedPath);
+            for (size_t i = 0; i < parsedLights.size(); ++i) {
+                if (!used[i] && filenameKey(parsedLights[i].imagePath) == selectedName) {
+                    candidates.push_back(i);
+                }
+            }
+        }
+        if (candidates.empty()) {
+            die("Loaded calibration has no row for selected image: " + selectedPath);
+        }
+        if (candidates.size() != 1) {
+            die("Loaded calibration has an ambiguous filename match for: " + selectedPath);
+        }
+        used[candidates.front()] = true;
+        lights.push_back(parsedLights[candidates.front()].direction);
+    }
     return lights;
+}
+
+cv::Mat buildObservationValidityMask(
+    const std::vector<cv::Mat>& images,
+    const cv::Mat& inputMask,
+    float minimumIntensity,
+    int minimumObservations) {
+    if (images.empty()) {
+        die("Observation validity requires at least one image.");
+    }
+    if (minimumObservations < 1 || minimumObservations > static_cast<int>(images.size())) {
+        die("Observation validity count must be between 1 and the image count.");
+    }
+    if (!std::isfinite(minimumIntensity)) {
+        die("Observation validity intensity threshold must be finite.");
+    }
+    const cv::Size size = images.front().size();
+    if (size.empty() || inputMask.size() != size || inputMask.type() != CV_8U) {
+        die("Observation validity mask must match the images and use 8-bit values.");
+    }
+    for (const cv::Mat& image : images) {
+        if (image.size() != size || image.type() != CV_32F) {
+            die("Observation validity images must be same-size, single-channel 32-bit float images.");
+        }
+    }
+
+    cv::Mat validity(size, CV_8U, cv::Scalar(0));
+    std::vector<const float*> imageRows(images.size(), nullptr);
+    for (int y = 0; y < size.height; ++y) {
+        for (size_t i = 0; i < images.size(); ++i) {
+            imageRows[i] = images[i].ptr<float>(y);
+        }
+        const uchar* inputRow = inputMask.ptr<uchar>(y);
+        uchar* validityRow = validity.ptr<uchar>(y);
+        for (int x = 0; x < size.width; ++x) {
+            if (inputRow[x] == 0) {
+                continue;
+            }
+            int usable = 0;
+            for (const float* imageRow : imageRows) {
+                const float intensity = imageRow[x];
+                if (std::isfinite(intensity) && intensity > minimumIntensity) {
+                    ++usable;
+                    if (usable >= minimumObservations) {
+                        validityRow[x] = 255;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return validity;
 }
 
 void solvePhotometricStereo(
@@ -701,13 +855,12 @@ void solvePhotometricStereo(
     double ringLightHeightMm,
     double pixelScaleMm,
     cv::Point2d lightingCenter,
+    cv::Vec3f viewDirection,
     cv::Mat& normalMap,
     cv::Mat& albedo,
     cv::Mat& residual,
     cv::Mat& validMask,
     PhotometricDiagnostics& diagnostics) {
-    const int rows = images[0].rows;
-    const int cols = images[0].cols;
     const int n = static_cast<int>(images.size());
     if (n < 3) {
         die("Photometric stereo requires at least 3 images.");
@@ -718,23 +871,72 @@ void solvePhotometricStereo(
     if (lights.size() != images.size()) {
         die("Light vector count must match image count.");
     }
+    const int rows = images.front().rows;
+    const int cols = images.front().cols;
+    if (rows <= 0 || cols <= 0) {
+        die("Photometric stereo images must not be empty.");
+    }
+    for (const cv::Mat& image : images) {
+        if (image.size() != images.front().size() || image.type() != CV_32F) {
+            die("Photometric stereo images must be same-size, single-channel 32-bit float images.");
+        }
+    }
+    if (inputMask.size() != images.front().size() || inputMask.type() != CV_8U) {
+        die("Photometric stereo mask must match the images and use 8-bit values.");
+    }
+    const int maskPixels = cv::countNonZero(inputMask);
+    if (maskPixels == 0) {
+        die("Photometric stereo mask contains no pixels.");
+    }
+    if (lightingModel == LightingModel::NearFieldRing &&
+        (!std::isfinite(ringLightRadiusMm) || ringLightRadiusMm <= 0.0 ||
+         !std::isfinite(ringLightHeightMm) || ringLightHeightMm <= 0.0 ||
+         !std::isfinite(pixelScaleMm) || pixelScaleMm <= 0.0 ||
+         !std::isfinite(lightingCenter.x) || !std::isfinite(lightingCenter.y))) {
+        die("Near-field ring lighting requires finite positive radius, height, and pixel scale values.");
+    }
+    const float viewLength = std::sqrt(viewDirection.dot(viewDirection));
+    if (!std::isfinite(viewLength) || viewLength <= 1.0e-6f) {
+        die("View direction must be a finite non-zero vector.");
+    }
+    viewDirection /= viewLength;
+
+    std::vector<cv::Vec3f> conditionLights;
+    conditionLights.reserve(lights.size());
+    if (lightingModel == LightingModel::NearFieldRing) {
+        const int centerX = static_cast<int>(std::lround(lightingCenter.x));
+        const int centerY = static_cast<int>(std::lround(lightingCenter.y));
+        for (int i = 0; i < n; ++i) {
+            conditionLights.push_back(nearFieldRingLightVector(
+                lights[i], i, n, centerX, centerY, ringLightRadiusMm, ringLightHeightMm, pixelScaleMm, lightingCenter));
+        }
+    } else {
+        conditionLights = lights;
+    }
+    diagnostics.lightingConditionNumber = lightConditionNumber(conditionLights);
+    if (!std::isfinite(diagnostics.lightingConditionNumber) || diagnostics.lightingConditionNumber > 100.0) {
+        die("Light directions are rank-deficient or too ill-conditioned for a reliable normal solve.");
+    }
 
     normalMap = cv::Mat(rows, cols, CV_32FC3, cv::Scalar(0, 0, 0));
     albedo = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     residual = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     validMask = cv::Mat(rows, cols, CV_8U, cv::Scalar(0));
     diagnostics.robustWeight = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
+    diagnostics.robustFallbackMask = cv::Mat(rows, cols, CV_8U, cv::Scalar(0));
     diagnostics.shadowCount = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     diagnostics.highlightOutlierCount = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
     diagnostics.specularCueMask = cv::Mat(rows, cols, CV_8U, cv::Scalar(0));
 
-    for (int y = 0; y < rows; ++y) {
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& rowRange) {
+    for (int y = rowRange.start; y < rowRange.end; ++y) {
         const uchar* maskRow = inputMask.ptr<uchar>(y);
         cv::Vec3f* normalRow = normalMap.ptr<cv::Vec3f>(y);
         float* albedoRow = albedo.ptr<float>(y);
         float* residualRow = residual.ptr<float>(y);
         uchar* validRow = validMask.ptr<uchar>(y);
         float* weightRow = diagnostics.robustWeight.ptr<float>(y);
+        uchar* fallbackRow = diagnostics.robustFallbackMask.ptr<uchar>(y);
         float* shadowRow = diagnostics.shadowCount.ptr<float>(y);
         float* highRow = diagnostics.highlightOutlierCount.ptr<float>(y);
         uchar* specularRow = diagnostics.specularCueMask.ptr<uchar>(y);
@@ -769,7 +971,10 @@ void solvePhotometricStereo(
                 continue;
             }
 
-            const bool robust = solverMode == NormalSolverMode::Robust && observations.size() >= 5;
+            const bool robust = solverMode == NormalSolverMode::Robust && observations.size() >= 4;
+            if (solverMode == NormalSolverMode::Robust && !robust) {
+                fallbackRow[x] = 255;
+            }
             double adaptiveHighThreshold = highOutlierThreshold;
             if (robust) {
                 std::vector<double> values;
@@ -812,9 +1017,11 @@ void solvePhotometricStereo(
                 continue;
             }
 
-            auto lightAt = [&](int i) {
-                if (lightingModel == LightingModel::NearFieldRing) {
-                    return nearFieldRingLightDirection(
+            std::vector<cv::Vec3f> nearFieldLights;
+            if (lightingModel == LightingModel::NearFieldRing) {
+                nearFieldLights.reserve(static_cast<size_t>(n));
+                for (int i = 0; i < n; ++i) {
+                    nearFieldLights.push_back(nearFieldRingLightVector(
                         lights[i],
                         i,
                         n,
@@ -823,9 +1030,11 @@ void solvePhotometricStereo(
                         ringLightRadiusMm,
                         ringLightHeightMm,
                         pixelScaleMm,
-                        lightingCenter);
+                        lightingCenter));
                 }
-                return lights[i];
+            }
+            auto lightAt = [&](int i) -> const cv::Vec3f& {
+                return lightingModel == LightingModel::NearFieldRing ? nearFieldLights[i] : lights[i];
             };
 
             auto weightedSolve = [&](const std::vector<double>& weights, cv::Vec3d& solution) {
@@ -913,7 +1122,6 @@ void solvePhotometricStereo(
 
             double err = 0.0;
             double weightSum = 0.0;
-            int downweighted = 0;
             for (const int i : fitIndices) {
                 const float intensity = imageRows[i][x];
                 const double d = static_cast<double>(lightAt(i).dot(g) - intensity);
@@ -921,25 +1129,81 @@ void solvePhotometricStereo(
             }
             err = std::sqrt(err / static_cast<double>(fitIndices.size()));
             if (robust) {
+                std::vector<double> signedResiduals;
                 std::vector<double> absResiduals;
+                signedResiduals.reserve(fitIndices.size());
                 absResiduals.reserve(fitIndices.size());
                 for (const int i : fitIndices) {
-                    absResiduals.push_back(std::abs(static_cast<double>(lightAt(i).dot(g) - imageRows[i][x])));
+                    const double signedResidual = static_cast<double>(lightAt(i).dot(g) - imageRows[i][x]);
+                    signedResiduals.push_back(signedResidual);
+                    absResiduals.push_back(std::abs(signedResidual));
                 }
                 const double medianAbs = medianValue(absResiduals);
                 const double sigma = std::max(0.01, medianAbs / 0.6745);
                 const double delta = 1.345 * sigma;
-                for (const double r : absResiduals) {
+                for (size_t k = 0; k < absResiduals.size(); ++k) {
+                    const double r = absResiduals[k];
                     const double w = r <= delta ? 1.0 : delta / std::max(r, 1.0e-8);
                     weightSum += w;
                     if (w < 0.75) {
-                        ++downweighted;
+                        if (signedResiduals[k] > 0.0) {
+                            shadowRow[x] += 1.0f;
+                        } else {
+                            highRow[x] += 1.0f;
+                            specularRow[x] = 255;
+                        }
                     }
                 }
-                if (downweighted > 0) {
-                    specularRow[x] = 255;
-                }
                 weightRow[x] = static_cast<float>(weightSum / static_cast<double>(fitIndices.size()));
+
+                std::vector<double> sortedIntensities;
+                sortedIntensities.reserve(observations.size());
+                cv::Vec3d halfVectorSum(0.0, 0.0, 0.0);
+                double halfVectorWeight = 0.0;
+                for (const int i : observations) {
+                    const double intensity = static_cast<double>(imageRows[i][x]);
+                    sortedIntensities.push_back(intensity);
+                    cv::Vec3f incidentDirection = lightAt(i);
+                    const float incidentLength = std::sqrt(incidentDirection.dot(incidentDirection));
+                    if (incidentLength <= 1.0e-6f || !std::isfinite(incidentLength)) {
+                        continue;
+                    }
+                    incidentDirection /= incidentLength;
+                    cv::Vec3f halfVector = incidentDirection + viewDirection;
+                    const float halfLength = std::sqrt(halfVector.dot(halfVector));
+                    if (halfLength <= 1.0e-6f || !std::isfinite(halfLength)) {
+                        continue;
+                    }
+                    halfVector /= halfLength;
+                    const double halfWeight = intensity * intensity;
+                    halfVectorSum += halfWeight * cv::Vec3d(halfVector[0], halfVector[1], halfVector[2]);
+                    halfVectorWeight += halfWeight;
+                }
+                if (observations.size() >= 5 && halfVectorWeight > 1.0e-8) {
+                    const double halfLength = std::sqrt(halfVectorSum.dot(halfVectorSum));
+                    if (halfLength > 1.0e-8 && std::isfinite(halfLength)) {
+                        const cv::Vec3d specularNormal = halfVectorSum / halfLength;
+                        const double disagreement = std::acos(std::clamp(
+                            specularNormal.dot(cv::Vec3d(normal[0], normal[1], normal[2])),
+                            -1.0,
+                            1.0));
+                        const size_t intensityMid = sortedIntensities.size() / 2;
+                        std::nth_element(
+                            sortedIntensities.begin(),
+                            sortedIntensities.begin() + static_cast<std::ptrdiff_t>(intensityMid),
+                            sortedIntensities.end());
+                        const double medianIntensity = sortedIntensities[intensityMid];
+                        const double peakIntensity = *std::max_element(
+                            sortedIntensities.begin(), sortedIntensities.end());
+                        const double intensityReference = std::max(0.02, medianIntensity);
+                        const double relativeResidual = err / intensityReference;
+                        const double peakRatio = peakIntensity / intensityReference;
+                        constexpr double kEightDegrees = 8.0 * 3.14159265358979323846 / 180.0;
+                        if (relativeResidual > 0.02 && disagreement > kEightDegrees && peakRatio > 1.2) {
+                            specularRow[x] = 255;
+                        }
+                    }
+                }
             } else {
                 weightRow[x] = 1.0f;
             }
@@ -949,6 +1213,14 @@ void solvePhotometricStereo(
             residualRow[x] = static_cast<float>(err);
             validRow[x] = 255;
         }
+    }
+    });
+
+    const int solvedPixels = cv::countNonZero(validMask);
+    diagnostics.solvedFraction = static_cast<double>(solvedPixels) / static_cast<double>(maskPixels);
+    const int minimumSolvedPixels = std::min(maskPixels, 16);
+    if (solvedPixels < minimumSolvedPixels || diagnostics.solvedFraction < 0.001) {
+        die("Too few masked pixels had at least three usable observations for a reliable normal field.");
     }
 }
 
@@ -1782,7 +2054,8 @@ void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask) {
 }
 
 void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode) {
-    if (mode == HeightFlattenMode::None || height.empty() || validMask.empty()) {
+    if ((mode != HeightFlattenMode::Radial && mode != HeightFlattenMode::Quadratic) ||
+        height.empty() || validMask.empty()) {
         return;
     }
 
@@ -1861,5 +2134,20 @@ void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMo
             }
             hrow[x] = static_cast<float>(static_cast<double>(hrow[x]) - trend);
         }
+    }
+}
+
+void applyHeightFlattening(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode) {
+    switch (mode) {
+    case HeightFlattenMode::Plane:
+        removeBestFitPlane(height, validMask);
+        break;
+    case HeightFlattenMode::Radial:
+    case HeightFlattenMode::Quadratic:
+        removeHeightCurl(height, validMask, mode);
+        break;
+    case HeightFlattenMode::None:
+    default:
+        break;
     }
 }

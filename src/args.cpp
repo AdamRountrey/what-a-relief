@@ -82,13 +82,16 @@ HeightFlattenMode parseHeightFlattenMode(const std::string& s) {
     if (s == "none" || s == "off") {
         return HeightFlattenMode::None;
     }
+    if (s == "plane" || s == "level" || s == "linear") {
+        return HeightFlattenMode::Plane;
+    }
     if (s == "radial" || s == "dome") {
         return HeightFlattenMode::Radial;
     }
     if (s == "quadratic" || s == "quad" || s == "curl") {
         return HeightFlattenMode::Quadratic;
     }
-    die("Invalid height flatten mode: " + s + " (use none, radial, or quadratic)");
+    die("Invalid height flatten mode: " + s + " (use none, plane, radial, or quadratic)");
 }
 
 RtiLayoutMode parseRtiLayoutMode(const std::string& s) {
@@ -155,7 +158,7 @@ void printUsage() {
         << "  --shadow-threshold v         Per-observation shadow cutoff. Default: 0.02\n"
         << "  --integration-iterations n   Work budget for robust height; fast DCT/Poisson ignores it.\n"
         << "  --height-solver robust|fast  Height integration. Default: robust\n"
-        << "  --height-flatten none|radial|quadratic\n"
+        << "  --height-flatten none|plane|radial|quadratic\n"
         << "                               Height/PLY-only curl correction after integration. Default: none\n"
         << "  --height-slope-cap s         Clamp extreme normal-derived height slopes; 0 disables. Default: 3.0\n"
         << "  --no-height                  Skip height.png and height.pfm.\n"

@@ -4,6 +4,7 @@
 #include "neural_fusion.hpp"
 #include "photometric.hpp"
 #include "relight_ui.hpp"
+#include "run_manifest.hpp"
 #include "rti_export.hpp"
 #include "sphere_ui.hpp"
 
@@ -84,6 +85,8 @@ const char* heightSolverName(HeightSolverMode mode) {
 
 const char* heightFlattenName(HeightFlattenMode mode) {
     switch (mode) {
+    case HeightFlattenMode::Plane:
+        return "least-squares plane height leveling";
     case HeightFlattenMode::Radial:
         return "radial/dome height curl correction";
     case HeightFlattenMode::Quadratic:
@@ -104,6 +107,8 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
                   << " radius=" << opt.sphere.radius << '\n';
     }
 
+    const RunManifestContext runManifest = beginRunManifest(opt);
+
     reportStage(progress, "[1/6] Loading images...", 5);
     const std::vector<cv::Mat> images = loadLuminanceImages(opt.imagePaths, opt.srgb);
     reportStage(progress, "[2/6] Loading mask...", 15);
@@ -122,7 +127,7 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     if (opt.uncalibratedLighting) {
         // No calibrated light vectors are available in this mode.
     } else if (!opt.lightsFile.empty()) {
-        lights = loadLightsFile(opt.lightsFile, opt.imagePaths.size(), &opt);
+        lights = loadLightsFile(opt.lightsFile, opt.imagePaths, &opt);
         if (opt.lightingModel == LightingModel::NearFieldRing) {
             std::cout << "      loaded near-field ring calibration metadata from: " << opt.lightsFile << std::endl;
         }
@@ -183,6 +188,12 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
             [&](const std::string& message) {
                 reportDetail(progress, message, 52);
             });
+        const int maskPixels = cv::countNonZero(mask);
+        diagnostics.solvedFraction = maskPixels > 0
+            ? static_cast<double>(cv::countNonZero(validMask)) / static_cast<double>(maskPixels)
+            : 0.0;
+        std::cout << "      solved mask coverage: "
+                  << (100.0 * diagnostics.solvedFraction) << "%" << std::endl;
     } else {
         cv::Point2d lightingCenter(
             static_cast<double>(images[0].cols - 1) * 0.5,
@@ -209,33 +220,45 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
             opt.ringLightHeightMm,
             opt.pixelScaleMm,
             lightingCenter,
+            opt.viewDir,
             normalMap,
             albedo,
             residual,
             validMask,
             diagnostics);
+        std::cout << "      light geometry condition number: "
+                  << diagnostics.lightingConditionNumber << std::endl;
+        std::cout << "      solved mask coverage: "
+                  << (100.0 * diagnostics.solvedFraction) << "%" << std::endl;
+        if (diagnostics.solvedFraction < 0.10) {
+            std::cout << "      warning: fewer than 10% of masked pixels produced valid normals; "
+                         "inspect the input mask, shadows, exposure, and light calibration"
+                      << std::endl;
+        }
+        if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustFallbackMask.empty()) {
+            const int fallbackPixels = cv::countNonZero(diagnostics.robustFallbackMask);
+            if (fallbackPixels > 0) {
+                std::cout << "      robust fallback: " << fallbackPixels
+                          << " pixels had only three usable observations and used least squares" << std::endl;
+            }
+        }
         geometryNormalMap = normalMap.clone();
         geometryValidMask = validMask.clone();
 
         if (opt.neuralFusion) {
             reportStage(progress, "[5.5/6] Running experimental PS-FCN neural fusion...", 62);
             std::cout << "      note: neural fusion changes the normal-map outputs only; height preview and PLY stay classical to avoid exaggerated geometry." << std::endl;
-            try {
-                applyNeuralFusion(
-                    opt,
-                    images,
-                    lights,
-                    mask,
-                    lightingCenter,
-                    normalMap,
-                    albedo,
-                    residual,
-                    validMask,
-                    diagnostics);
-            } catch (const std::exception& e) {
-                std::cerr << "warning: experimental neural fusion was skipped: " << e.what() << std::endl;
-                opt.neuralFusion = false;
-            }
+            applyNeuralFusion(
+                opt,
+                images,
+                lights,
+                mask,
+                lightingCenter,
+                normalMap,
+                albedo,
+                residual,
+                validMask,
+                diagnostics);
         }
     }
 
@@ -266,12 +289,9 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
                         progress("height solve " + std::to_string(done) + "/" + std::to_string(total), 72 + (12 * done) / total);
                     }
                 });
-            std::cout << "      removing best-fit plane from height preview" << std::endl;
-            removeBestFitPlane(height, heightMask);
             if (opt.heightFlattenMode != HeightFlattenMode::None) {
                 std::cout << "      applying " << heightFlattenName(opt.heightFlattenMode) << std::endl;
-                removeHeightCurl(height, heightMask, opt.heightFlattenMode);
-                removeBestFitPlane(height, heightMask);
+                applyHeightFlattening(height, heightMask, opt.heightFlattenMode);
             }
             if (!opt.meshPath.empty()) {
                 std::cout << "      PLY mesh will be written to: " << opt.meshPath << std::endl;
@@ -282,10 +302,7 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
         } catch (const std::exception& e) {
             height.release();
             heightMask.release();
-            if (opt.guiMode || !opt.meshPath.empty() || !opt.printableMeshPath.empty()) {
-                throw std::runtime_error(std::string("Height/mesh export failed: ") + e.what());
-            }
-            std::cerr << "warning: height preview and PLY export were skipped: " << e.what() << std::endl;
+            throw std::runtime_error(std::string("Height/mesh export failed: ") + e.what());
         }
     } else {
         reportStage(progress, "[6/6] Skipping height preview.", 78);
@@ -307,19 +324,17 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
         });
 
     if (opt.exportRti) {
-        try {
-            reportStage(progress, "Writing RTI package...", 92);
-            exportRtiPackage(
-                opt,
-                lights,
-                images[0].size(),
-                [&](const std::string& message) {
-                    reportDetail(progress, message, 95);
-                });
-        } catch (const std::exception& e) {
-            std::cerr << "warning: RTI export was skipped: " << e.what() << std::endl;
-        }
+        reportStage(progress, "Writing RTI package...", 92);
+        exportRtiPackage(
+            opt,
+            lights,
+            images[0].size(),
+            [&](const std::string& message) {
+                reportDetail(progress, message, 95);
+            });
     }
+
+    completeRunManifest(opt, runManifest, lights, diagnostics);
 
     if (progress) {
         progress("Complete.", 100);

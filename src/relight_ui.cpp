@@ -1,4 +1,5 @@
 #include "relight_ui.hpp"
+#include "checked_io.hpp"
 
 #ifdef PS_NO_GUI
 
@@ -154,7 +155,7 @@ void mouseCallback(int event, int x, int y, int, void* userdata) {
 void saveFullResolution(const RelightState& state) {
     fs::create_directories(state.outputDir);
     const fs::path outPath = fs::path(state.outputDir) / "liquid_metal_custom.png";
-    cv::imwrite(outPath.string(), renderRelitMetal(state.fullNormals, state.fullMask, state.light));
+    writeImageChecked(outPath, renderRelitMetal(state.fullNormals, state.fullMask, state.light));
 }
 
 } // namespace

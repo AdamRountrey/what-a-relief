@@ -34,6 +34,7 @@ enum class HeightSolverMode {
 
 enum class HeightFlattenMode {
     None,
+    Plane,
     Radial,
     Quadratic
 };
@@ -99,12 +100,17 @@ struct Options {
 };
 
 struct PhotometricDiagnostics {
+    double lightingConditionNumber = 0.0;
+    double solvedFraction = 0.0;
     cv::Mat robustWeight;
+    cv::Mat robustFallbackMask;
     cv::Mat shadowCount;
     cv::Mat highlightOutlierCount;
     cv::Mat specularCueMask;
     cv::Mat classicalConfidence;
+    cv::Mat classicalValidMask;
     cv::Mat classicalNormal;
+    cv::Mat neuralValidMask;
     cv::Mat neuralNormal;
 };
 

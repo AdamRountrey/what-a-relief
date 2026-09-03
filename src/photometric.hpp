@@ -10,7 +10,15 @@
 
 HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, const Options& opt);
 bool loadLightsFileMetadata(const std::string& path, Options& opt);
-std::vector<cv::Vec3f> loadLightsFile(const std::string& path, size_t expectedCount, Options* opt = nullptr);
+std::vector<cv::Vec3f> loadLightsFile(
+    const std::string& path,
+    const std::vector<std::string>& imagePaths,
+    Options* opt = nullptr);
+cv::Mat buildObservationValidityMask(
+    const std::vector<cv::Mat>& images,
+    const cv::Mat& inputMask,
+    float minimumIntensity,
+    int minimumObservations = 3);
 void solvePhotometricStereo(
     const std::vector<cv::Mat>& images,
     const std::vector<cv::Vec3f>& lights,
@@ -23,6 +31,7 @@ void solvePhotometricStereo(
     double ringLightHeightMm,
     double pixelScaleMm,
     cv::Point2d lightingCenter,
+    cv::Vec3f viewDirection,
     cv::Mat& normalMap,
     cv::Mat& albedo,
     cv::Mat& residual,
@@ -47,3 +56,4 @@ cv::Mat integrateHeight(
 void flattenNormalField(cv::Mat& normalMap, const cv::Mat& validMask, FlattenMode mode);
 void removeBestFitPlane(cv::Mat& height, const cv::Mat& validMask);
 void removeHeightCurl(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode);
+void applyHeightFlattening(cv::Mat& height, const cv::Mat& validMask, HeightFlattenMode mode);

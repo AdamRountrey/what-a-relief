@@ -1,4 +1,6 @@
 #include "rti_export.hpp"
+#include "checked_io.hpp"
+#include "radiometry.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -33,10 +35,65 @@ void reportProgress(
     }
 }
 
-double srgbToLinear(double value) {
-    value = std::clamp(value, 0.0, 1.0);
-    return std::pow(value, 2.2);
+void validateRtiDestination(const fs::path& destination, const Options& opt) {
+    if (!fs::exists(destination)) {
+        return;
+    }
+    if (!fs::is_directory(destination) || fs::is_symlink(destination) ||
+        fs::exists(destination / "run_manifest.json") ||
+        (!fs::is_empty(destination) && !fs::is_regular_file(destination / "rti_manifest.json"))) {
+        die("RTI output must be an empty folder or an existing What A Relief RTI package: " + destination.string());
+    }
+    std::vector<std::string> inputs = opt.imagePaths;
+    inputs.insert(inputs.end(), {opt.lightsFile, opt.maskPath, opt.heightMaskPath, opt.neuralModelPath});
+    for (const std::string& input : inputs) {
+        if (input.empty()) {
+            continue;
+        }
+        fs::path current = fs::absolute(input).lexically_normal();
+        while (!current.empty()) {
+            std::error_code error;
+            if (fs::equivalent(current, destination, error) && !error) {
+                die("RTI output folder contains a selected input; choose a separate folder: " + destination.string());
+            }
+            const fs::path parent = current.parent_path();
+            if (parent == current) {
+                break;
+            }
+            current = parent;
+        }
+    }
 }
+
+class RtiDirectoryTransaction {
+public:
+    explicit RtiDirectoryTransaction(const fs::path& finalPath)
+        : finalPath_(finalPath),
+          stagingPath_(makeUniqueSiblingPath(finalPath, "staging")) {
+        fs::create_directories(stagingPath_);
+    }
+
+    ~RtiDirectoryTransaction() {
+        if (!committed_) {
+            std::error_code ignored;
+            fs::remove_all(stagingPath_, ignored);
+        }
+    }
+
+    const fs::path& stagingPath() const {
+        return stagingPath_;
+    }
+
+    void commit() {
+        replaceDirectoryTransactionally(stagingPath_, finalPath_);
+        committed_ = true;
+    }
+
+private:
+    fs::path finalPath_;
+    fs::path stagingPath_;
+    bool committed_ = false;
+};
 
 cv::Mat loadRtiColorImage(const std::string& path, const cv::Size& expectedSize, bool srgb) {
     cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
@@ -58,32 +115,7 @@ cv::Mat loadRtiColorImage(const std::string& path, const cv::Size& expectedSize,
         die("Unsupported channel count for RTI image: " + path);
     }
 
-    cv::Mat f32;
-    if (bgr.depth() == CV_8U) {
-        bgr.convertTo(f32, CV_32FC3, 1.0 / 255.0);
-    } else if (bgr.depth() == CV_16U) {
-        bgr.convertTo(f32, CV_32FC3, 1.0 / 65535.0);
-    } else {
-        bgr.convertTo(f32, CV_32FC3);
-        double minValue = 0.0;
-        double maxValue = 0.0;
-        cv::minMaxLoc(f32.reshape(1), &minValue, &maxValue);
-        if (maxValue > 1.0) {
-            f32 *= static_cast<float>(1.0 / maxValue);
-        }
-    }
-
-    if (srgb) {
-        for (int y = 0; y < f32.rows; ++y) {
-            cv::Vec3f* row = f32.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < f32.cols; ++x) {
-                row[x][0] = static_cast<float>(srgbToLinear(row[x][0]));
-                row[x][1] = static_cast<float>(srgbToLinear(row[x][1]));
-                row[x][2] = static_cast<float>(srgbToLinear(row[x][2]));
-            }
-        }
-    }
-    return f32;
+    return convertToLinearColor(bgr, srgb);
 }
 
 bool solveSymmetric6x6(
@@ -397,9 +429,9 @@ cv::Mat encodeLrgbCoefficientJpeg(
     return encoded;
 }
 
-int deepZoomLevelCount(const cv::Size& size, int tileSize) {
-    const double maxTiles = static_cast<double>(std::max(size.width, size.height)) / static_cast<double>(tileSize);
-    return std::max(1, static_cast<int>(std::ceil(std::log2(std::max(1.0, maxTiles)))) + 1);
+int deepZoomLevelCount(const cv::Size& size) {
+    const int maximumDimension = std::max(size.width, size.height);
+    return std::max(1, static_cast<int>(std::ceil(std::log2(std::max(1, maximumDimension)))) + 1);
 }
 
 cv::Size deepZoomLevelSize(const cv::Size& original, int level, int levelCount) {
@@ -412,21 +444,20 @@ cv::Size deepZoomLevelSize(const cv::Size& original, int level, int levelCount) 
 void writeDeepZoomPyramid(const cv::Mat& image, const fs::path& basePath, int quality) {
     const int tileSize = 256;
     const int overlap = 0;
-    const int levelCount = deepZoomLevelCount(image.size(), tileSize);
+    const int levelCount = deepZoomLevelCount(image.size());
     const fs::path filesDir = basePath.string() + "_files";
     fs::remove_all(filesDir);
     fs::create_directories(filesDir);
 
     {
-        std::ofstream dzi(basePath.string() + ".dzi", std::ios::binary);
-        if (!dzi) {
-            die("Failed to write DeepZoom index: " + basePath.string() + ".dzi");
-        }
+        CheckedOutputFile checked(basePath.string() + ".dzi");
+        std::ostream& dzi = checked.stream();
         dzi << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
         dzi << "<Image TileSize=\"" << tileSize << "\" Overlap=\"" << overlap
             << "\" Format=\"jpg\" xmlns=\"http://schemas.microsoft.com/deepzoom/2008\">\n";
         dzi << "  <Size Width=\"" << image.cols << "\" Height=\"" << image.rows << "\"/>\n";
         dzi << "</Image>\n";
+        checked.commit();
     }
 
     const std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, quality};
@@ -449,7 +480,10 @@ void writeDeepZoomPyramid(const cv::Mat& image, const fs::path& basePath, int qu
                     ty * tileSize,
                     std::min(tileSize, levelImage.cols - tx * tileSize),
                     std::min(tileSize, levelImage.rows - ty * tileSize));
-                cv::imwrite((levelDir / (std::to_string(tx) + "_" + std::to_string(ty) + ".jpg")).string(), levelImage(roi), params);
+                writeImageChecked(
+                    levelDir / (std::to_string(tx) + "_" + std::to_string(ty) + ".jpg"),
+                    levelImage(roi),
+                    params);
             }
         }
     }
@@ -463,10 +497,8 @@ void writeInfoJson(
     const std::vector<double>& biases,
     RtiColorMode colorMode,
     int quality) {
-    std::ofstream out(outputDir / "info.json", std::ios::binary);
-    if (!out) {
-        die("Failed to write RTI info.json");
-    }
+    CheckedOutputFile checked(outputDir / "info.json");
+    std::ostream& out = checked.stream();
     out << std::setprecision(8);
     out << "{\n";
     out << "\"width\": " << size.width << ", \"height\": " << size.height << ",\n";
@@ -501,6 +533,7 @@ void writeInfoJson(
     out << "] }\n";
     out << "]\n";
     out << "}\n";
+    checked.commit();
 }
 
 void removePlaneFiles(const fs::path& outputDir, int planeIndex) {
@@ -789,7 +822,7 @@ void writeWebRtiLayerTiles(
         cv::Mat tile;
         cv::resize(cropped, tile, cv::Size(tileSize + 2, tileSize + 2), 0.0, 0.0, cv::INTER_AREA);
         const std::string name = std::to_string(node.index + 1) + "_" + std::to_string(layerIndex) + ".jpg";
-        cv::imwrite((outputDir / name).string(), tile, params);
+        writeImageChecked(outputDir / name, tile, params);
     }
 }
 
@@ -802,10 +835,8 @@ void writeWebRtiInfoXml(
     RtiColorMode colorMode,
     const std::vector<double>& scales,
     const std::vector<double>& biases) {
-    std::ofstream out(outputDir / "info.xml", std::ios::binary);
-    if (!out) {
-        die("Failed to write webRTIViewer info.xml");
-    }
+    CheckedOutputFile checked(outputDir / "info.xml");
+    std::ostream& out = checked.stream();
     out << std::setprecision(8);
     out << "<!DOCTYPE Doc>\n";
     out << "<MultiRes format=\"0\">\n";
@@ -838,6 +869,7 @@ void writeWebRtiInfoXml(
     }
     out << "</Tree>\n";
     out << "</MultiRes>\n";
+    checked.commit();
 }
 
 void writeWebRtiViewerPackage(
@@ -861,6 +893,49 @@ void writeWebRtiViewerPackage(
     }
 }
 
+const char* rtiLayoutName(RtiLayoutMode mode) {
+    switch (mode) {
+    case RtiLayoutMode::DeepZoom:
+        return "deepzoom";
+    case RtiLayoutMode::WebRtiViewer:
+        return "webrti";
+    case RtiLayoutMode::Image:
+    default:
+        return "image";
+    }
+}
+
+void writeRtiPackageManifest(
+    const fs::path& outputDir,
+    const Options& opt,
+    const cv::Size& size,
+    int basisCount) {
+    std::uintmax_t fileCount = 0;
+    std::uintmax_t byteCount = 0;
+    for (const fs::directory_entry& entry : fs::recursive_directory_iterator(outputDir)) {
+        if (entry.is_regular_file()) {
+            ++fileCount;
+            byteCount += entry.file_size();
+        }
+    }
+
+    CheckedOutputFile checked(outputDir / "rti_manifest.json");
+    std::ostream& out = checked.stream();
+    out << "{\n";
+    out << "  \"schema_version\": 1,\n";
+    out << "  \"status\": \"complete\",\n";
+    out << "  \"layout\": \"" << rtiLayoutName(opt.rtiLayoutMode) << "\",\n";
+    out << "  \"color_mode\": \"" << (opt.rtiColorMode == RtiColorMode::Lrgb ? "lrgb" : "rgb") << "\",\n";
+    out << "  \"width\": " << size.width << ",\n";
+    out << "  \"height\": " << size.height << ",\n";
+    out << "  \"source_images\": " << opt.imagePaths.size() << ",\n";
+    out << "  \"ptm_basis_terms\": " << basisCount << ",\n";
+    out << "  \"payload_files\": " << fileCount << ",\n";
+    out << "  \"payload_bytes\": " << byteCount << "\n";
+    out << "}\n";
+    checked.commit();
+}
+
 } // namespace
 
 void exportRtiPackage(
@@ -878,8 +953,12 @@ void exportRtiPackage(
         die("RTI export requires at least 3 calibrated or loaded light directions.");
     }
 
-    fs::path outputDir = opt.rtiPath.empty() ? (fs::path(opt.outputDir) / "rti") : fs::path(opt.rtiPath);
-    fs::create_directories(outputDir);
+    const fs::path finalOutputDir = opt.rtiPath.empty()
+        ? (fs::path(opt.outputDir) / "rti")
+        : fs::path(opt.rtiPath);
+    validateRtiDestination(finalOutputDir, opt);
+    RtiDirectoryTransaction transaction(finalOutputDir);
+    const fs::path& outputDir = transaction.stagingPath();
     reportProgress(progress, "RTI: loading color images...");
 
     std::vector<cv::Mat> images;
@@ -887,6 +966,7 @@ void exportRtiPackage(
     for (const std::string& path : opt.imagePaths) {
         images.push_back(loadRtiColorImage(path, expectedSize, opt.srgb));
     }
+    normalizeRelativeIntensityStack(images, false);
 
     std::vector<std::array<double, 6>> bases;
     bases.reserve(lights.size());
@@ -906,6 +986,12 @@ void exportRtiPackage(
             progress,
             "RTI: light geometry is ill-conditioned for quadratic PTM; using stable 3-term PTM.");
     }
+
+    const auto finishPackage = [&]() {
+        writeRtiPackageManifest(outputDir, opt, expectedSize, basisCount);
+        transaction.commit();
+        reportProgress(progress, "RTI: wrote " + finalOutputDir.string());
+    };
 
     const int quality = 95;
     const std::vector<int> jpegParams = {cv::IMWRITE_JPEG_QUALITY, quality};
@@ -943,7 +1029,7 @@ void exportRtiPackage(
                 webScales,
                 webBiases,
                 progress);
-            reportProgress(progress, "RTI: wrote " + outputDir.string());
+            finishPackage();
             return;
         }
 
@@ -964,12 +1050,12 @@ void exportRtiPackage(
             } else {
                 fs::remove(outputDir / ("plane_" + std::to_string(p) + ".dzi"));
                 fs::remove_all(outputDir / ("plane_" + std::to_string(p) + "_files"));
-                cv::imwrite(planePath.string(), encoded, jpegParams);
+                writeImageChecked(planePath, encoded, jpegParams);
             }
         }
         cleanupStalePlaneFiles(outputDir, 1 + coefficientJpegs);
         writeInfoJson(outputDir, expectedSize, lights, scales, biases, opt.rtiColorMode, quality);
-        reportProgress(progress, "RTI: wrote " + outputDir.string());
+        finishPackage();
         return;
     }
 
@@ -1020,7 +1106,7 @@ void exportRtiPackage(
             webScales,
             webBiases,
             progress);
-        reportProgress(progress, "RTI: wrote " + outputDir.string());
+        finishPackage();
         return;
     }
 
@@ -1038,11 +1124,11 @@ void exportRtiPackage(
         } else {
             fs::remove(outputDir / ("plane_" + std::to_string(p) + ".dzi"));
             fs::remove_all(outputDir / ("plane_" + std::to_string(p) + "_files"));
-            cv::imwrite(planePath.string(), encoded, jpegParams);
+            writeImageChecked(planePath, encoded, jpegParams);
         }
     }
     cleanupStalePlaneFiles(outputDir, basisCount);
 
     writeInfoJson(outputDir, expectedSize, lights, scales, biases, opt.rtiColorMode, quality);
-    reportProgress(progress, "RTI: wrote " + outputDir.string());
+    finishPackage();
 }
