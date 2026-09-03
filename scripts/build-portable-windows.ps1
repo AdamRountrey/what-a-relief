@@ -8,7 +8,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $repo $BuildDir
 $dist = Join-Path $repo "dist"
 $stage = Join-Path $dist "portable-work"
-$archive = Join-Path $dist "What-A-Relief-$Version-portable-windows.zip"
+$archive = Join-Path $dist "what-a-relief-$Version-portable-windows.zip"
 
 $resolvedDist = [IO.Path]::GetFullPath($dist).TrimEnd([IO.Path]::DirectorySeparatorChar)
 $resolvedStage = [IO.Path]::GetFullPath($stage)

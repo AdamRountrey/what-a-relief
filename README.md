@@ -86,7 +86,7 @@ To rebuild the app, package the OpenCV DLLs, and create the installer in one ste
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
 ```
 
-The installer is written to `dist\What-A-Relief-0.2.1-Setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\What A Relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
+The installer is written to `dist\what-a-relief-0.2.1-setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\What A Relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 

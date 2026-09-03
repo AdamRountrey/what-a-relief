@@ -19,7 +19,7 @@ $ddfPath = Join-Path $work "payload.ddf"
 $makecabLog = Join-Path $work "makecab.log"
 $stubSource = Join-Path $work "InstallerStub.cs"
 $stubExe = Join-Path $work "InstallerStub.exe"
-$installerOut = Join-Path $dist "What-A-Relief-$Version-Setup.exe"
+$installerOut = Join-Path $dist "what-a-relief-$Version-setup.exe"
 $marker = [Text.Encoding]::ASCII.GetBytes("WHAT_A_RELIEF_PAYLOAD_V1")
 
 function Add-LicenseSection {

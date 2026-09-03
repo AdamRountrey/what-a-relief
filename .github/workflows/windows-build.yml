@@ -65,10 +65,10 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: What-A-Relief-Windows-${{ env.RELEASE_VERSION }}
+          name: what-a-relief-windows-${{ env.RELEASE_VERSION }}
           path: |
-            dist/What-A-Relief-${{ env.RELEASE_VERSION }}-Setup.exe
-            dist/What-A-Relief-${{ env.RELEASE_VERSION }}-portable-windows.zip
+            dist/what-a-relief-${{ env.RELEASE_VERSION }}-setup.exe
+            dist/what-a-relief-${{ env.RELEASE_VERSION }}-portable-windows.zip
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -78,8 +78,8 @@ jobs:
         run: |
           $args = @(
             'release', 'create', $env:GITHUB_REF_NAME,
-            "dist\What-A-Relief-$env:RELEASE_VERSION-Setup.exe",
-            "dist\What-A-Relief-$env:RELEASE_VERSION-portable-windows.zip",
+            "dist\what-a-relief-$env:RELEASE_VERSION-setup.exe",
+            "dist\what-a-relief-$env:RELEASE_VERSION-portable-windows.zip",
             '--title', "What A Relief $env:GITHUB_REF_NAME"
           )
           if ($env:RELEASE_PRERELEASE -eq 'True') {
