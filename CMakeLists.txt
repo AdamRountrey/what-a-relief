@@ -23,10 +23,12 @@ endif()
 add_library(what-a-relief-core STATIC
     src/checked_io.cpp
     src/image_io.cpp
+    src/mitsuba_backend.cpp
     src/photometric.cpp
     src/radiometry.cpp
     src/run_manifest.cpp
-    src/rti_export.cpp)
+    src/rti_export.cpp
+    src/shadow_refinement.cpp)
 target_include_directories(what-a-relief-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(what-a-relief-core PUBLIC ${OpenCV_LIBS})
@@ -57,6 +59,8 @@ if(BUILD_TESTING)
         tests/test_photometric.cpp)
     target_link_libraries(what-a-relief-tests PRIVATE what-a-relief-core)
     target_compile_features(what-a-relief-tests PRIVATE cxx_std_17)
+    target_compile_definitions(what-a-relief-tests PRIVATE
+        WHAT_A_RELIEF_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_executable(what-a-relief-io-tests
         tests/test_io_exports.cpp)
     target_link_libraries(what-a-relief-io-tests PRIVATE what-a-relief-core)
@@ -65,6 +69,13 @@ if(BUILD_TESTING)
         tests/generate_workflow_fixture.cpp)
     target_link_libraries(what-a-relief-fixture-generator PRIVATE what-a-relief-core)
     target_compile_features(what-a-relief-fixture-generator PRIVATE cxx_std_17)
+    add_executable(what-a-relief-fake-mitsuba
+        tests/fake_mitsuba_backend.cpp)
+    target_compile_features(what-a-relief-fake-mitsuba PRIVATE cxx_std_17)
+    add_executable(what-a-relief-mitsuba-contract-tests
+        tests/test_mitsuba_backend.cpp)
+    target_link_libraries(what-a-relief-mitsuba-contract-tests PRIVATE what-a-relief-core)
+    target_compile_features(what-a-relief-mitsuba-contract-tests PRIVATE cxx_std_17)
     add_executable(what-a-relief-benchmark EXCLUDE_FROM_ALL
         tests/benchmark_photometric.cpp)
     target_link_libraries(what-a-relief-benchmark PRIVATE what-a-relief-core)
@@ -84,6 +95,14 @@ if(BUILD_TESTING)
             NAME io-exports
             COMMAND ${CMAKE_COMMAND}
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:what-a-relief-io-tests>"
+                "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_with_runtime.cmake")
+        add_test(
+            NAME mitsuba-backend-contract
+            COMMAND ${CMAKE_COMMAND}
+                "-DTEST_EXECUTABLE=$<TARGET_FILE:what-a-relief-mitsuba-contract-tests>"
+                "-DTEST_ARGUMENT_1=$<TARGET_FILE:what-a-relief-fake-mitsuba>"
+                "-DTEST_ARGUMENT_2=${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py"
                 "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_with_runtime.cmake")
         add_test(
@@ -119,6 +138,11 @@ if(BUILD_TESTING)
         add_test(NAME photometric-core COMMAND what-a-relief-tests)
         add_test(NAME io-exports COMMAND what-a-relief-io-tests)
         add_test(
+            NAME mitsuba-backend-contract
+            COMMAND what-a-relief-mitsuba-contract-tests
+                $<TARGET_FILE:what-a-relief-fake-mitsuba>
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py")
+        add_test(
             NAME end-to-end-workflow
             COMMAND ${CMAKE_COMMAND}
                 "-DAPP_EXECUTABLE=$<TARGET_FILE:what-a-relief>"
@@ -151,7 +175,16 @@ add_custom_command(TARGET what-a-relief POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:what-a-relief>/models"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/models"
-        "$<TARGET_FILE_DIR:what-a-relief>/models")
+        "$<TARGET_FILE_DIR:what-a-relief>/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py"
+        "$<TARGET_FILE_DIR:what-a-relief>/mitsuba_worker.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/requirements.lock.txt"
+        "$<TARGET_FILE_DIR:what-a-relief>/mitsuba_requirements.lock.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/README.md"
+        "$<TARGET_FILE_DIR:what-a-relief>/MITSUBA_BACKEND.md")
 
 if(MSVC)
     target_compile_options(what-a-relief-core PRIVATE /W4 /permissive-)
@@ -161,6 +194,8 @@ if(MSVC)
         target_compile_options(what-a-relief-tests PRIVATE /W4 /permissive-)
         target_compile_options(what-a-relief-io-tests PRIVATE /W4 /permissive-)
         target_compile_options(what-a-relief-fixture-generator PRIVATE /W4 /permissive-)
+        target_compile_options(what-a-relief-fake-mitsuba PRIVATE /W4 /permissive-)
+        target_compile_options(what-a-relief-mitsuba-contract-tests PRIVATE /W4 /permissive-)
         target_compile_options(what-a-relief-benchmark PRIVATE /W4 /permissive-)
         target_compile_options(what-a-relief-output-benchmark PRIVATE /W4 /permissive-)
     endif()
@@ -171,6 +206,8 @@ else()
         target_compile_options(what-a-relief-tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(what-a-relief-io-tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(what-a-relief-fixture-generator PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(what-a-relief-fake-mitsuba PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(what-a-relief-mitsuba-contract-tests PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(what-a-relief-benchmark PRIVATE -Wall -Wextra -Wpedantic)
         target_compile_options(what-a-relief-output-benchmark PRIVATE -Wall -Wextra -Wpedantic)
     endif()

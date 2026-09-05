@@ -3,6 +3,7 @@
 #include "crop_ui.hpp"
 #include "image_io.hpp"
 #include "mask_ui.hpp"
+#include "mitsuba_backend.hpp"
 #include "photometric.hpp"
 #include "scale_ui.hpp"
 #include "sphere_ui.hpp"
@@ -33,7 +34,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr size_t kMinImages = 3;
-constexpr size_t kMaxImages = 25;
+constexpr size_t kMaxNeuralImages = 25;
 
 #ifdef _WIN32
 
@@ -93,6 +94,16 @@ constexpr int kIdProgressBar = 1038;
 constexpr int kIdPrintableMesh = 1039;
 constexpr int kIdMeshStep = 1040;
 constexpr int kIdPrintableThickness = 1041;
+constexpr int kIdPrintableFillHoles = 1042;
+constexpr int kIdShadowHeightRefinement = 1043;
+constexpr int kIdMitsubaInverse = 1044;
+constexpr int kIdMitsubaBackend = 1045;
+constexpr int kIdMitsubaQuality = 1046;
+constexpr int kIdSelectMitsubaPython = 1047;
+constexpr int kIdMitsubaStatus = 1048;
+constexpr int kIdProgressCancel = 1049;
+constexpr int kIdShadowReferenceZ = 1050;
+constexpr int kIdShadowLedDiameter = 1051;
 constexpr int kIdPromptEdit = 2001;
 constexpr int kIdPromptOk = 2002;
 constexpr int kIdPromptCancel = 2003;
@@ -129,6 +140,7 @@ struct SetupDialogState {
     HWND heightCheck = nullptr;
     HWND meshCheck = nullptr;
     HWND printableMeshCheck = nullptr;
+    HWND printableFillHolesCheck = nullptr;
     HWND meshStepEdit = nullptr;
     HWND printableThicknessEdit = nullptr;
     HWND rtiCheck = nullptr;
@@ -136,7 +148,15 @@ struct SetupDialogState {
     HWND rtiColorCombo = nullptr;
     HWND relightCheck = nullptr;
     HWND specularDiagnosticsCheck = nullptr;
+    HWND shadowHeightRefinementCheck = nullptr;
+    HWND shadowReferenceZEdit = nullptr;
+    HWND shadowLedDiameterEdit = nullptr;
     HWND neuralFusionCheck = nullptr;
+    HWND mitsubaInverseCheck = nullptr;
+    HWND mitsubaBackendCombo = nullptr;
+    HWND mitsubaQualityCombo = nullptr;
+    HWND mitsubaPythonButton = nullptr;
+    HWND mitsubaStatus = nullptr;
     std::vector<HWND> sectionHeaders;
     bool nextStepRequired = true;
     HBRUSH requiredBrush = nullptr;
@@ -158,6 +178,8 @@ struct NumberPromptState {
 HWND gProgressWindow = nullptr;
 HWND gProgressLabel = nullptr;
 HWND gProgressBar = nullptr;
+HWND gProgressCancelButton = nullptr;
+bool gProgressCancelRequested = false;
 
 std::vector<std::string> parseMultiSelectBuffer(const char* buffer) {
     std::vector<std::string> parts;
@@ -184,7 +206,7 @@ std::vector<std::string> parseMultiSelectBuffer(const char* buffer) {
 }
 
 std::vector<std::string> chooseImageFiles(HWND owner) {
-    std::vector<char> buffer(65536, '\0');
+    std::vector<char> buffer(1024 * 1024, '\0');
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner;
@@ -193,7 +215,7 @@ std::vector<std::string> chooseImageFiles(HWND owner) {
         "All files\0*.*\0";
     ofn.lpstrFile = buffer.data();
     ofn.nMaxFile = static_cast<DWORD>(buffer.size());
-    ofn.lpstrTitle = "Select 3 to 25 photometric stereo images";
+    ofn.lpstrTitle = "Select at least 3 photometric stereo images";
     ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
     if (!GetOpenFileNameA(&ofn)) {
@@ -207,7 +229,7 @@ std::string chooseOutputFolder(HWND owner) {
     BROWSEINFOA info = {};
     info.hwndOwner = owner;
     info.pszDisplayName = displayName;
-    info.lpszTitle = "Choose output folder for What A Relief results";
+    info.lpszTitle = "Choose output folder for what-a-relief results";
     info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
 
     PIDLIST_ABSOLUTE pidl = SHBrowseForFolderA(&info);
@@ -239,6 +261,26 @@ std::string chooseLightsFile(HWND owner) {
 
     if (!GetOpenFileNameA(&ofn)) {
         throw std::runtime_error("Light-vector file selection was canceled.");
+    }
+    return std::string(buffer);
+}
+
+std::string chooseMitsubaPython(HWND owner) {
+    char buffer[MAX_PATH] = {};
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter =
+        "Python executable\0python.exe\0"
+        "Executable files\0*.exe\0"
+        "All files\0*.*\0";
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = static_cast<DWORD>(sizeof(buffer));
+    ofn.lpstrTitle = "Select the isolated what-a-relief Mitsuba python.exe";
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (!GetOpenFileNameA(&ofn)) {
+        throw std::runtime_error("Mitsuba backend selection was canceled.");
     }
     return std::string(buffer);
 }
@@ -507,9 +549,25 @@ LRESULT CALLBACK numberPromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 }
 
 LRESULT CALLBACK progressWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    (void)wParam;
     (void)lParam;
+    if (msg == WM_COMMAND && LOWORD(wParam) == kIdProgressCancel) {
+        gProgressCancelRequested = true;
+        if (gProgressLabel != nullptr) {
+            SetWindowTextA(gProgressLabel, "Canceling after the current processing step...");
+        }
+        if (gProgressCancelButton != nullptr) {
+            EnableWindow(gProgressCancelButton, FALSE);
+        }
+        return 0;
+    }
     if (msg == WM_CLOSE) {
+        gProgressCancelRequested = true;
+        if (gProgressLabel != nullptr) {
+            SetWindowTextA(gProgressLabel, "Canceling after the current processing step...");
+        }
+        if (gProgressCancelButton != nullptr) {
+            EnableWindow(gProgressCancelButton, FALSE);
+        }
         return 0;
     }
     if (msg == WM_DESTROY) {
@@ -517,6 +575,7 @@ LRESULT CALLBACK progressWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             gProgressWindow = nullptr;
             gProgressLabel = nullptr;
             gProgressBar = nullptr;
+            gProgressCancelButton = nullptr;
         }
         return 0;
     }
@@ -659,7 +718,7 @@ std::string nextStepText(const SetupDialogState& state, bool& required) {
     const Options& opt = *state.opt;
     required = true;
     if (opt.imagePaths.empty()) {
-        return "Next required (Project tab): select 3 to 25 images.";
+        return "Next required (Project tab): select at least 3 images.";
     }
     if (opt.outputDir.empty()) {
         return "Next required (Project tab): choose an output folder.";
@@ -678,6 +737,9 @@ std::string nextStepText(const SetupDialogState& state, bool& required) {
     }
     if (buttonChecked(state.printableMeshCheck) && opt.pixelScaleMm <= 0.0) {
         return "Next required (Project tab): set XY scale for printable mesh export.";
+    }
+    if (buttonChecked(state.mitsubaInverseCheck) && !resolveMitsubaBackend(opt).available()) {
+        return "Next required (Advanced tab): locate or install the optional Mitsuba backend.";
     }
 
     required = false;
@@ -714,17 +776,57 @@ void updateSetupControls(SetupDialogState& state) {
     EnableWindow(state.heightMaskButton, !opt.imagePaths.empty() && buttonChecked(state.heightCheck));
     EnableWindow(state.clearHeightMaskButton, opt.hasHeightMask || !opt.heightMaskPath.empty());
     EnableWindow(state.solverCombo, calibrated);
+    const bool supportsSpecularDiagnostics = calibrated && comboSelection(state.solverCombo) == 0;
+    if (!supportsSpecularDiagnostics && buttonChecked(state.specularDiagnosticsCheck)) {
+        setButtonChecked(state.specularDiagnosticsCheck, false);
+        state.opt->specularDiagnostics = false;
+    }
+    EnableWindow(state.specularDiagnosticsCheck, supportsSpecularDiagnostics);
     const bool heightEnabled = buttonChecked(state.heightCheck);
+    const bool supportsShadowHeightRefinement = supportsSpecularDiagnostics &&
+        heightEnabled && state.opt->imagePaths.size() >= 6;
+    if (!supportsShadowHeightRefinement && buttonChecked(state.shadowHeightRefinementCheck)) {
+        setButtonChecked(state.shadowHeightRefinementCheck, false);
+        state.opt->shadowHeightRefinement = false;
+    }
+    EnableWindow(state.shadowHeightRefinementCheck, supportsShadowHeightRefinement);
+    const bool shadowGeometryEnabled = supportsShadowHeightRefinement &&
+        buttonChecked(state.shadowHeightRefinementCheck) &&
+        buttonChecked(state.nearFieldCheck);
+    EnableWindow(state.shadowReferenceZEdit, shadowGeometryEnabled);
+    EnableWindow(state.shadowLedDiameterEdit, shadowGeometryEnabled);
+    const bool supportsMitsuba = supportsSpecularDiagnostics && heightEnabled &&
+        state.opt->imagePaths.size() >= 6;
+    if (!supportsMitsuba && buttonChecked(state.mitsubaInverseCheck)) {
+        setButtonChecked(state.mitsubaInverseCheck, false);
+        state.opt->mitsubaInverseRefinement = false;
+    }
+    EnableWindow(state.mitsubaInverseCheck, supportsMitsuba);
+    const bool mitsubaEnabled = supportsMitsuba && buttonChecked(state.mitsubaInverseCheck);
+    EnableWindow(state.mitsubaBackendCombo, mitsubaEnabled);
+    EnableWindow(state.mitsubaQualityCombo, mitsubaEnabled);
+    EnableWindow(state.mitsubaPythonButton, mitsubaEnabled);
+    if (state.mitsubaStatus != nullptr) {
+        const std::string status = mitsubaEnabled
+            ? describeMitsubaBackend(opt)
+            : "Optional backend is inactive; standard processing is self-contained.";
+        SetWindowTextA(state.mitsubaStatus, status.c_str());
+    }
     EnableWindow(state.heightSolverCombo, heightEnabled);
     EnableWindow(state.heightFlattenCombo, heightEnabled);
     EnableWindow(state.meshCheck, heightEnabled || buttonChecked(state.meshCheck));
     EnableWindow(state.printableMeshCheck, heightEnabled || buttonChecked(state.printableMeshCheck));
+    EnableWindow(state.printableFillHolesCheck, buttonChecked(state.printableMeshCheck));
     EnableWindow(state.meshStepEdit, buttonChecked(state.meshCheck) || buttonChecked(state.printableMeshCheck));
     EnableWindow(state.printableThicknessEdit, buttonChecked(state.printableMeshCheck));
     EnableWindow(state.nearFieldCheck, calibrated && !usingLightsFile);
     const bool supportsNeuralFusion = calibrated &&
         state.opt->imagePaths.size() >= kMinImages &&
-        state.opt->imagePaths.size() <= kMaxImages;
+        state.opt->imagePaths.size() <= kMaxNeuralImages;
+    if (!supportsNeuralFusion && buttonChecked(state.neuralFusionCheck)) {
+        setButtonChecked(state.neuralFusionCheck, false);
+        state.opt->neuralFusion = false;
+    }
     const bool supportsRti = calibrated && state.opt->imagePaths.size() >= kMinImages;
     EnableWindow(state.rtiCheck, supportsRti);
     EnableWindow(state.rtiLayoutCombo, supportsRti && buttonChecked(state.rtiCheck));
@@ -836,6 +938,9 @@ void selectLightsFile(SetupDialogState& state) {
         if (state.pixelScaleEdit != nullptr) {
             setEditDouble(state.pixelScaleEdit, state.opt->pixelScaleMm);
         }
+        if (state.shadowLedDiameterEdit != nullptr) {
+            setEditDouble(state.shadowLedDiameterEdit, state.opt->shadowLedDiameterMm);
+        }
         if (state.lightingCombo != nullptr) {
             SendMessageA(state.lightingCombo, CB_SETCURSEL, 0, 0);
         }
@@ -928,13 +1033,22 @@ void clearHeightMask(SetupDialogState& state) {
     updateSetupControls(state);
 }
 
+void selectMitsubaPython(SetupDialogState& state) {
+    try {
+        state.opt->mitsubaPythonPath = chooseMitsubaPython(state.hwnd);
+        updateSetupControls(state);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Mitsuba Backend", e.what(), MB_ICONINFORMATION);
+    }
+}
+
 bool validateAndAccept(SetupDialogState& state) {
     Options& opt = *state.opt;
-    if (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxImages) {
+    if (opt.imagePaths.size() < kMinImages) {
         showOwnerMessage(
             state.hwnd,
             "Setup",
-            "Select 3 to 25 images. You selected " + std::to_string(opt.imagePaths.size()) + ".",
+            "Select at least 3 images. You selected " + std::to_string(opt.imagePaths.size()) + ".",
             MB_ICONWARNING);
         return false;
     }
@@ -975,7 +1089,7 @@ bool validateAndAccept(SetupDialogState& state) {
         }
     }
     if (!opt.uncalibratedLighting && buttonChecked(state.neuralFusionCheck) &&
-        (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxImages)) {
+        (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxNeuralImages)) {
         showOwnerMessage(
             state.hwnd,
             "Setup",
@@ -1001,6 +1115,10 @@ bool validateAndAccept(SetupDialogState& state) {
     opt.solverMode = comboSelection(state.solverCombo) == 0 ? NormalSolverMode::Robust : NormalSolverMode::Standard;
     try {
         opt.pixelScaleMm = editDouble(state.pixelScaleEdit, "pixel scale");
+        opt.shadowReferenceZMm = editDouble(
+            state.shadowReferenceZEdit, "shadow reference surface Z");
+        opt.shadowLedDiameterMm = editDouble(
+            state.shadowLedDiameterEdit, "shadow LED diameter");
     } catch (const std::exception& e) {
         showOwnerMessage(state.hwnd, "Setup", e.what(), MB_ICONWARNING);
         return false;
@@ -1088,6 +1206,7 @@ bool validateAndAccept(SetupDialogState& state) {
     if (buttonChecked(state.printableMeshCheck)) {
         opt.calculateHeight = true;
         opt.printableMeshPath = (fs::path(opt.outputDir) / "printable_surface.ply").string();
+        opt.printableFillHoles = buttonChecked(state.printableFillHolesCheck);
         if (opt.pixelScaleMm <= 0.0 && !opt.imagePaths.empty()) {
             opt.pixelScaleMm = readPixelScaleMmFromImage(opt.imagePaths.front());
             if (opt.pixelScaleMm > 0.0) {
@@ -1104,6 +1223,16 @@ bool validateAndAccept(SetupDialogState& state) {
         }
     } else {
         opt.printableMeshPath.clear();
+        opt.printableFillHoles = false;
+    }
+    if (!std::isfinite(opt.shadowReferenceZMm) ||
+        !std::isfinite(opt.shadowLedDiameterMm) || opt.shadowLedDiameterMm < 0.0) {
+        showOwnerMessage(
+            state.hwnd,
+            "Setup",
+            "Shadow reference Z must be finite and LED diameter must be non-negative.",
+            MB_ICONWARNING);
+        return false;
     }
     opt.exportRti = !opt.uncalibratedLighting && opt.imagePaths.size() >= kMinImages && buttonChecked(state.rtiCheck);
     const int rtiLayoutIndex = comboSelection(state.rtiLayoutCombo);
@@ -1118,9 +1247,52 @@ bool validateAndAccept(SetupDialogState& state) {
     opt.rtiPath = opt.exportRti ? (fs::path(opt.outputDir) / "rti").string() : std::string();
     opt.openRelightViewer = buttonChecked(state.relightCheck);
     opt.specularDiagnostics = buttonChecked(state.specularDiagnosticsCheck);
+    opt.shadowHeightRefinement = !opt.uncalibratedLighting &&
+        opt.solverMode == NormalSolverMode::Robust &&
+        opt.calculateHeight &&
+        opt.imagePaths.size() >= 6 &&
+        buttonChecked(state.shadowHeightRefinementCheck);
+    if (opt.shadowHeightRefinement &&
+        opt.lightingModel == LightingModel::NearFieldRing &&
+        opt.shadowReferenceZMm >= opt.ringLightHeightMm) {
+        showOwnerMessage(
+            state.hwnd,
+            "Setup",
+            "The shadow reference surface Z must be below the ring-light height.",
+            MB_ICONWARNING);
+        return false;
+    }
+    opt.mitsubaInverseRefinement = !opt.uncalibratedLighting &&
+        opt.solverMode == NormalSolverMode::Robust &&
+        opt.calculateHeight &&
+        opt.imagePaths.size() >= 6 &&
+        buttonChecked(state.mitsubaInverseCheck);
+    const int mitsubaBackendIndex = comboSelection(state.mitsubaBackendCombo);
+    opt.mitsubaBackendMode = mitsubaBackendIndex == 1
+        ? MitsubaBackendMode::Cuda
+        : (mitsubaBackendIndex == 2 ? MitsubaBackendMode::Cpu : MitsubaBackendMode::Auto);
+    const int mitsubaQualityIndex = comboSelection(state.mitsubaQualityCombo);
+    opt.mitsubaQualityMode = mitsubaQualityIndex == 0
+        ? MitsubaQualityMode::Preview
+        : (mitsubaQualityIndex == 2 ? MitsubaQualityMode::Research : MitsubaQualityMode::Standard);
+    if (opt.mitsubaInverseRefinement && opt.shadowHeightRefinement) {
+        showOwnerMessage(
+            state.hwnd,
+            "Setup",
+            "Choose either Mitsuba inverse refinement or cast-shadow height refinement, not both.",
+            MB_ICONWARNING);
+        return false;
+    }
+    if (opt.mitsubaInverseRefinement) {
+        const MitsubaBackendPaths backend = resolveMitsubaBackend(opt);
+        if (!backend.available()) {
+            showOwnerMessage(state.hwnd, "Mitsuba Backend", backend.problem, MB_ICONWARNING);
+            return false;
+        }
+    }
     opt.neuralFusion = !opt.uncalibratedLighting &&
         opt.imagePaths.size() >= kMinImages &&
-        opt.imagePaths.size() <= kMaxImages &&
+        opt.imagePaths.size() <= kMaxNeuralImages &&
         buttonChecked(state.neuralFusionCheck);
     if (opt.neuralFusion) {
         showOwnerMessage(
@@ -1247,7 +1419,11 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     state.printableMeshCheck = makeControl(geometryPage, "BUTTON", "Export watertight printable PLY solid", BS_AUTOCHECKBOX, kIdPrintableMesh, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.printableMeshCheck, !state.opt->printableMeshPath.empty());
 
-    y += 40;
+    y += 32;
+    state.printableFillHolesCheck = makeControl(geometryPage, "BUTTON", "Smart-fill enclosed surface holes (printable PLY only)", BS_AUTOCHECKBOX, kIdPrintableFillHoles, kControlX, y, kControlWidth, 24);
+    setButtonChecked(state.printableFillHolesCheck, state.opt->printableFillHoles);
+
+    y += 36;
     makeLabel(geometryPage, "Mesh Step", kMargin, y, kLabelWidth, kRowHeight);
     state.meshStepEdit = makeControl(geometryPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdMeshStep, kControlX, y, 120, kRowHeight);
     setEditInt(state.meshStepEdit, state.opt->meshStep);
@@ -1320,12 +1496,73 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
 
     HWND advancedPage = makeTabPage(hwnd, state, "Advanced");
     y = 16;
-    state.specularDiagnosticsCheck = makeControl(advancedPage, "BUTTON", "Write experimental specular-cue diagnostics", BS_AUTOCHECKBOX, kIdSpecularDiagnostics, kControlX, y, kControlWidth, 24);
+    state.specularDiagnosticsCheck = makeControl(advancedPage, "BUTTON", "Write experimental robust observation diagnostics", BS_AUTOCHECKBOX, kIdSpecularDiagnostics, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.specularDiagnosticsCheck, state.opt->specularDiagnostics);
+
+    y += 36;
+    state.shadowHeightRefinementCheck = makeControl(advancedPage, "BUTTON", "Experimental: refine broad height/mesh shape from global cast shadows", BS_AUTOCHECKBOX, kIdShadowHeightRefinement, kControlX, y, kControlWidth, 24);
+    setButtonChecked(state.shadowHeightRefinementCheck, state.opt->shadowHeightRefinement);
+
+    y += 26;
+    makeLabel(advancedPage, "Requires 6+ calibrated robust images and height; sphere directions are supported.", kControlX + 20, y, kControlWidth - 20, kRowHeight);
+
+    y += 20;
+    makeLabel(advancedPage, "Z and LED size are near-field only; weak evidence is rejected unchanged.", kControlX + 20, y, kControlWidth - 20, kRowHeight);
+
+    y += 34;
+    makeLabel(advancedPage, "Reference Surface Z", kMargin, y, kLabelWidth, kRowHeight);
+    state.shadowReferenceZEdit = makeControl(advancedPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdShadowReferenceZ, kControlX, y, 120, kRowHeight);
+    setEditDouble(state.shadowReferenceZEdit, state.opt->shadowReferenceZMm);
+    makeLabel(advancedPage, "near-field mm above calibration datum", kControlX + 135, y, 290, kRowHeight);
+
+    y += 34;
+    makeLabel(advancedPage, "LED Diameter", kMargin, y, kLabelWidth, kRowHeight);
+    state.shadowLedDiameterEdit = makeControl(advancedPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdShadowLedDiameter, kControlX, y, 120, kRowHeight);
+    setEditDouble(state.shadowLedDiameterEdit, state.opt->shadowLedDiameterMm);
+    makeLabel(advancedPage, "near-field effective mm; 0 = point", kControlX + 135, y, 290, kRowHeight);
 
     y += 36;
     state.neuralFusionCheck = makeControl(advancedPage, "BUTTON", "Experimental: PS-FCN neural prior + fusion (3 to 25 calibrated images)", BS_AUTOCHECKBOX, kIdNeuralFusion, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.neuralFusionCheck, state.opt->neuralFusion);
+
+    y += 38;
+    state.mitsubaInverseCheck = makeControl(advancedPage, "BUTTON", "Experimental: Mitsuba inverse geometry refinement", BS_AUTOCHECKBOX, kIdMitsubaInverse, kControlX, y, kControlWidth, 24);
+    setButtonChecked(state.mitsubaInverseCheck, state.opt->mitsubaInverseRefinement);
+
+    y += 25;
+    makeLabel(advancedPage, "Requires 6+ calibrated robust images and height; writes separate inverse outputs.", kControlX + 20, y, kControlWidth - 20, kRowHeight);
+
+    y += 30;
+    makeLabel(advancedPage, "Compute", kMargin, y, kLabelWidth, kRowHeight);
+    state.mitsubaBackendCombo = makeCombo(advancedPage, kIdMitsubaBackend, kControlX, y, kControlWidth);
+    addComboItem(state.mitsubaBackendCombo, "Auto (NVIDIA CUDA, then LLVM CPU)");
+    addComboItem(state.mitsubaBackendCombo, "NVIDIA GPU (CUDA)");
+    addComboItem(state.mitsubaBackendCombo, "CPU (LLVM)");
+    int mitsubaBackendIndex = 0;
+    if (state.opt->mitsubaBackendMode == MitsubaBackendMode::Cuda) {
+        mitsubaBackendIndex = 1;
+    } else if (state.opt->mitsubaBackendMode == MitsubaBackendMode::Cpu) {
+        mitsubaBackendIndex = 2;
+    }
+    SendMessageA(state.mitsubaBackendCombo, CB_SETCURSEL, mitsubaBackendIndex, 0);
+
+    y += 38;
+    makeLabel(advancedPage, "Quality", kMargin, y, kLabelWidth, kRowHeight);
+    state.mitsubaQualityCombo = makeCombo(advancedPage, kIdMitsubaQuality, kControlX, y, kControlWidth);
+    addComboItem(state.mitsubaQualityCombo, "Preview (fast setup check)");
+    addComboItem(state.mitsubaQualityCombo, "Standard");
+    addComboItem(state.mitsubaQualityCombo, "Research (slowest)");
+    int mitsubaQualityIndex = 1;
+    if (state.opt->mitsubaQualityMode == MitsubaQualityMode::Preview) {
+        mitsubaQualityIndex = 0;
+    } else if (state.opt->mitsubaQualityMode == MitsubaQualityMode::Research) {
+        mitsubaQualityIndex = 2;
+    }
+    SendMessageA(state.mitsubaQualityCombo, CB_SETCURSEL, mitsubaQualityIndex, 0);
+
+    y += 40;
+    state.mitsubaPythonButton = makeControl(advancedPage, "BUTTON", "Locate Backend...", BS_PUSHBUTTON, kIdSelectMitsubaPython, kControlX, y, kButtonWidth, kRowHeight);
+    state.mitsubaStatus = makeControl(advancedPage, "STATIC", "", SS_LEFT, kIdMitsubaStatus, kControlX + kButtonWidth + 12, y, 298, 42);
 
     makeControl(hwnd, "BUTTON", "Start", BS_DEFPUSHBUTTON, kIdStart, kWindowWidth - 290, kTabTop + kTabHeight + 22, 110, 34);
     makeControl(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON, kIdCancel, kWindowWidth - 165, kTabTop + kTabHeight + 22, 110, 34);
@@ -1365,6 +1602,11 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 updateSetupControls(*state);
             }
             return 0;
+        case kIdSolver:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                updateSetupControls(*state);
+            }
+            return 0;
         case kIdNearField:
             updateSetupControls(*state);
             return 0;
@@ -1384,6 +1626,7 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!buttonChecked(state->heightCheck)) {
                 setButtonChecked(state->meshCheck, false);
                 setButtonChecked(state->printableMeshCheck, false);
+                setButtonChecked(state->printableFillHolesCheck, false);
             }
             updateSetupControls(*state);
             return 0;
@@ -1396,8 +1639,34 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case kIdPrintableMesh:
             if (buttonChecked(state->printableMeshCheck)) {
                 setButtonChecked(state->heightCheck, true);
+            } else {
+                setButtonChecked(state->printableFillHolesCheck, false);
             }
             updateSetupControls(*state);
+            return 0;
+        case kIdPrintableFillHoles:
+            updateSetupControls(*state);
+            return 0;
+        case kIdShadowHeightRefinement:
+            if (buttonChecked(state->shadowHeightRefinementCheck)) {
+                setButtonChecked(state->mitsubaInverseCheck, false);
+            }
+            updateSetupControls(*state);
+            return 0;
+        case kIdMitsubaInverse:
+            if (buttonChecked(state->mitsubaInverseCheck)) {
+                setButtonChecked(state->shadowHeightRefinementCheck, false);
+            }
+            updateSetupControls(*state);
+            return 0;
+        case kIdMitsubaBackend:
+        case kIdMitsubaQuality:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                updateSetupControls(*state);
+            }
+            return 0;
+        case kIdSelectMitsubaPython:
+            selectMitsubaPython(*state);
             return 0;
         case kIdRtiExport:
             updateSetupControls(*state);
@@ -1585,6 +1854,7 @@ void showGuiProgress(const std::string& title, const std::string& text) {
     RegisterClassA(&wc);
 
     if (gProgressWindow != nullptr) {
+        gProgressCancelRequested = false;
         if (gProgressLabel != nullptr) {
             SetWindowTextA(gProgressLabel, text.c_str());
         }
@@ -1595,15 +1865,16 @@ void showGuiProgress(const std::string& title, const std::string& text) {
         return;
     }
 
+    gProgressCancelRequested = false;
     gProgressWindow = CreateWindowExA(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         className,
         title.c_str(),
-        WS_OVERLAPPED | WS_CAPTION,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         520,
-        150,
+        190,
         nullptr,
         nullptr,
         instance,
@@ -1614,6 +1885,7 @@ void showGuiProgress(const std::string& title, const std::string& text) {
 
     gProgressLabel = makeControl(gProgressWindow, "STATIC", text.c_str(), SS_LEFT, 0, 20, 20, 460, 28);
     gProgressBar = makeControl(gProgressWindow, PROGRESS_CLASSA, "", 0, kIdProgressBar, 20, 60, 460, 24);
+    gProgressCancelButton = makeControl(gProgressWindow, "BUTTON", "Cancel", BS_PUSHBUTTON, kIdProgressCancel, 390, 100, 90, 30);
     SendMessageA(gProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
     SendMessageA(gProgressBar, PBM_SETPOS, 0, 0);
     ShowWindow(gProgressWindow, SW_SHOW);
@@ -1644,12 +1916,22 @@ void updateGuiProgress(const std::string& text, int percent) {
 #endif
 }
 
+bool guiProgressCancellationRequested() {
+#ifdef _WIN32
+    pumpGuiMessages();
+    return gProgressCancelRequested;
+#else
+    return false;
+#endif
+}
+
 void closeGuiProgress() {
 #ifdef _WIN32
     if (gProgressWindow != nullptr) {
         DestroyWindow(gProgressWindow);
         pumpGuiMessages();
     }
+    gProgressCancelRequested = false;
 #endif
 }
 

@@ -42,7 +42,7 @@ void validateRtiDestination(const fs::path& destination, const Options& opt) {
     if (!fs::is_directory(destination) || fs::is_symlink(destination) ||
         fs::exists(destination / "run_manifest.json") ||
         (!fs::is_empty(destination) && !fs::is_regular_file(destination / "rti_manifest.json"))) {
-        die("RTI output must be an empty folder or an existing What A Relief RTI package: " + destination.string());
+        die("RTI output must be an empty folder or an existing what-a-relief RTI package: " + destination.string());
     }
     std::vector<std::string> inputs = opt.imagePaths;
     inputs.insert(inputs.end(), {opt.lightsFile, opt.maskPath, opt.heightMaskPath, opt.neuralModelPath});

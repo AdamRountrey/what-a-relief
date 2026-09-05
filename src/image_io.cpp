@@ -80,6 +80,27 @@ double imageDescriptionUnitMm(const std::string& description) {
     return 0.0;
 }
 
+cv::Mat definiteSaturationMask(const cv::Mat& raw) {
+    double whiteLevel = 0.0;
+    if (raw.depth() == CV_8U) {
+        whiteLevel = 255.0;
+    } else if (raw.depth() == CV_16U) {
+        whiteLevel = 65535.0;
+    } else {
+        return cv::Mat(raw.size(), CV_8U, cv::Scalar(0));
+    }
+
+    std::vector<cv::Mat> channels;
+    cv::split(raw, channels);
+    cv::Mat saturated(raw.size(), CV_8U, cv::Scalar(0));
+    for (const cv::Mat& channel : channels) {
+        cv::Mat channelSaturated;
+        cv::compare(channel, whiteLevel, channelSaturated, cv::CMP_GE);
+        cv::bitwise_or(saturated, channelSaturated, saturated);
+    }
+    return saturated;
+}
+
 double averagePositive(double a, double b) {
     if (a > 0.0 && b > 0.0) {
         return 0.5 * (a + b);
@@ -557,6 +578,26 @@ float maskedAbsPercentile(const cv::Mat& src, const cv::Mat& mask, float percent
     return std::max(values[index], 1.0e-6f);
 }
 
+cv::Mat signedFloatTo8U(const cv::Mat& src, const cv::Mat& mask) {
+    const float extent = maskedAbsPercentile(src, mask, 0.995f);
+    cv::Mat out(src.size(), CV_8U, cv::Scalar(0));
+    cv::parallel_for_(cv::Range(0, src.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* srcRow = src.ptr<float>(y);
+            const uchar* maskRow = mask.ptr<uchar>(y);
+            uchar* outputRow = out.ptr<uchar>(y);
+            for (int x = 0; x < src.cols; ++x) {
+                if (maskRow[x] == 0 || !std::isfinite(srcRow[x])) {
+                    continue;
+                }
+                const float normalized = std::clamp(srcRow[x] / extent, -1.0f, 1.0f);
+                outputRow[x] = static_cast<uchar>(std::lround(127.5f * (normalized + 1.0f)));
+            }
+        }
+    });
+    return out;
+}
+
 cv::Mat maskedGaussianBlur(const cv::Mat& src, const cv::Mat& mask, double sigma) {
     cv::Mat maskFloat;
     mask.convertTo(maskFloat, CV_32F, 1.0 / 255.0);
@@ -761,6 +802,7 @@ void writeLightsCsv(
     if (opt.lightingModel == LightingModel::NearFieldRing) {
         out << "ring_light_radius_mm," << opt.ringLightRadiusMm << "\n";
         out << "ring_light_height_mm," << opt.ringLightHeightMm << "\n";
+        out << "ring_light_led_diameter_mm," << opt.shadowLedDiameterMm << "\n";
     }
     if (opt.pixelScaleMm > 0.0) {
         out << "pixel_scale_mm_per_pixel," << opt.pixelScaleMm << "\n";
@@ -988,6 +1030,414 @@ PlyGridTopology buildPlyGridTopology(
     return topology;
 }
 
+struct PrintableSurfaceFill {
+    cv::Mat height;
+    cv::Mat mask;
+    cv::Mat vertexColor;
+    cv::Mat fillMask;
+    size_t filledPixelCount = 0;
+};
+
+cv::Mat finiteGeometryMask(const cv::Mat& height, const cv::Mat& mask) {
+    cv::Mat finiteMask(mask.size(), CV_8U, cv::Scalar(0));
+    cv::parallel_for_(cv::Range(0, mask.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* hrow = height.ptr<float>(y);
+            const uchar* mrow = mask.ptr<uchar>(y);
+            uchar* out = finiteMask.ptr<uchar>(y);
+            for (int x = 0; x < mask.cols; ++x) {
+                out[x] = mrow[x] != 0 && std::isfinite(hrow[x]) ? 255 : 0;
+            }
+        }
+    });
+    return finiteMask;
+}
+
+cv::Mat enclosedMaskHoles(const cv::Mat& validMask) {
+    cv::Mat exterior;
+    cv::compare(validMask, 0, exterior, cv::CMP_EQ);
+    if (exterior.empty()) {
+        return exterior;
+    }
+
+    const auto floodExterior = [&](int x, int y) {
+        if (exterior.at<uchar>(y, x) == 255) {
+            cv::floodFill(
+                exterior,
+                cv::Point(x, y),
+                cv::Scalar(128),
+                nullptr,
+                cv::Scalar(),
+                cv::Scalar(),
+                8);
+        }
+    };
+    for (int x = 0; x < exterior.cols; ++x) {
+        floodExterior(x, 0);
+        if (exterior.rows > 1) {
+            floodExterior(x, exterior.rows - 1);
+        }
+    }
+    for (int y = 1; y + 1 < exterior.rows; ++y) {
+        floodExterior(0, y);
+        if (exterior.cols > 1) {
+            floodExterior(exterior.cols - 1, y);
+        }
+    }
+
+    cv::Mat holes;
+    cv::compare(exterior, 255, holes, cv::CMP_EQ);
+    return holes;
+}
+
+std::vector<cv::Point> maskPoints(const cv::Mat& mask) {
+    std::vector<cv::Point> points;
+    points.reserve(static_cast<size_t>(cv::countNonZero(mask)));
+    for (int y = 0; y < mask.rows; ++y) {
+        const uchar* row = mask.ptr<uchar>(y);
+        for (int x = 0; x < mask.cols; ++x) {
+            if (row[x] != 0) {
+                points.emplace_back(x, y);
+            }
+        }
+    }
+    return points;
+}
+
+bool maskContains(const cv::Mat& mask, int x, int y) {
+    return x >= 0 && y >= 0 && x < mask.cols && y < mask.rows && mask.at<uchar>(y, x) != 0;
+}
+
+void initializeHarmonicField(
+    cv::Mat& field,
+    const cv::Mat& sourceMask,
+    const cv::Mat& domainMask,
+    const std::vector<cv::Point>& holes) {
+    cv::Mat known = sourceMask.clone();
+    cv::Mat queued(sourceMask.size(), CV_8U, cv::Scalar(0));
+    std::vector<cv::Point> queue;
+    queue.reserve(holes.size());
+
+    const auto hasKnownNeighbor = [&](const cv::Point& point) {
+        return maskContains(known, point.x - 1, point.y) ||
+            maskContains(known, point.x + 1, point.y) ||
+            maskContains(known, point.x, point.y - 1) ||
+            maskContains(known, point.x, point.y + 1);
+    };
+    for (const cv::Point& point : holes) {
+        if (hasKnownNeighbor(point)) {
+            queue.push_back(point);
+            queued.at<uchar>(point) = 255;
+        }
+    }
+
+    const int dx[4] = {-1, 1, 0, 0};
+    const int dy[4] = {0, 0, -1, 1};
+    size_t head = 0;
+    while (head < queue.size()) {
+        const cv::Point point = queue[head++];
+        float sum = 0.0f;
+        int count = 0;
+        for (int direction = 0; direction < 4; ++direction) {
+            const int nx = point.x + dx[direction];
+            const int ny = point.y + dy[direction];
+            if (maskContains(known, nx, ny)) {
+                sum += field.at<float>(ny, nx);
+                ++count;
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        field.at<float>(point) = sum / static_cast<float>(count);
+        known.at<uchar>(point) = 255;
+
+        for (int direction = 0; direction < 4; ++direction) {
+            const int nx = point.x + dx[direction];
+            const int ny = point.y + dy[direction];
+            if (maskContains(domainMask, nx, ny) && !maskContains(known, nx, ny) &&
+                queued.at<uchar>(ny, nx) == 0) {
+                queue.emplace_back(nx, ny);
+                queued.at<uchar>(ny, nx) = 255;
+            }
+        }
+    }
+}
+
+void relaxHarmonicField(
+    cv::Mat& field,
+    const cv::Mat& domainMask,
+    const std::vector<cv::Point>& holes,
+    int iterations) {
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        float maximumChange = 0.0f;
+        for (int parity = 0; parity < 2; ++parity) {
+            for (const cv::Point& point : holes) {
+                if (((point.x + point.y) & 1) != parity) {
+                    continue;
+                }
+                float sum = 0.0f;
+                int count = 0;
+                const int dx[4] = {-1, 1, 0, 0};
+                const int dy[4] = {0, 0, -1, 1};
+                for (int direction = 0; direction < 4; ++direction) {
+                    const int nx = point.x + dx[direction];
+                    const int ny = point.y + dy[direction];
+                    if (maskContains(domainMask, nx, ny)) {
+                        sum += field.at<float>(ny, nx);
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    const float candidate = sum / static_cast<float>(count);
+                    float& value = field.at<float>(point);
+                    maximumChange = std::max(maximumChange, std::abs(candidate - value));
+                    value = candidate;
+                }
+            }
+        }
+        if (maximumChange < 1.0e-5f) {
+            break;
+        }
+    }
+}
+
+void estimateSurfaceSlopes(
+    const cv::Mat& height,
+    const cv::Mat& sourceMask,
+    const cv::Mat& normalMap,
+    double slopeCap,
+    cv::Mat& p,
+    cv::Mat& q) {
+    p = cv::Mat(height.size(), CV_32F, cv::Scalar(0));
+    q = cv::Mat(height.size(), CV_32F, cv::Scalar(0));
+    const bool normalsAvailable = normalMap.type() == CV_32FC3 && normalMap.size() == height.size();
+
+    cv::parallel_for_(cv::Range(0, height.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* hrow = height.ptr<float>(y);
+            float* prow = p.ptr<float>(y);
+            float* qrow = q.ptr<float>(y);
+            for (int x = 0; x < height.cols; ++x) {
+                if (!maskContains(sourceMask, x, y)) {
+                    continue;
+                }
+
+                bool haveP = false;
+                bool haveQ = false;
+                if (maskContains(sourceMask, x - 1, y) && maskContains(sourceMask, x + 1, y)) {
+                    prow[x] = 0.5f * (hrow[x + 1] - hrow[x - 1]);
+                    haveP = true;
+                } else if (maskContains(sourceMask, x + 1, y)) {
+                    prow[x] = hrow[x + 1] - hrow[x];
+                    haveP = true;
+                } else if (maskContains(sourceMask, x - 1, y)) {
+                    prow[x] = hrow[x] - hrow[x - 1];
+                    haveP = true;
+                }
+
+                if (maskContains(sourceMask, x, y - 1) && maskContains(sourceMask, x, y + 1)) {
+                    qrow[x] = 0.5f * (height.at<float>(y + 1, x) - height.at<float>(y - 1, x));
+                    haveQ = true;
+                } else if (maskContains(sourceMask, x, y + 1)) {
+                    qrow[x] = height.at<float>(y + 1, x) - hrow[x];
+                    haveQ = true;
+                } else if (maskContains(sourceMask, x, y - 1)) {
+                    qrow[x] = hrow[x] - height.at<float>(y - 1, x);
+                    haveQ = true;
+                }
+
+                if ((!haveP || !haveQ) && normalsAvailable) {
+                    const cv::Vec3f normal = normalMap.at<cv::Vec3f>(y, x);
+                    if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
+                        std::isfinite(normal[2]) && normal[2] > 1.0e-4f) {
+                        if (!haveP) {
+                            prow[x] = -normal[0] / normal[2];
+                        }
+                        if (!haveQ) {
+                            qrow[x] = normal[1] / normal[2];
+                        }
+                    }
+                }
+
+                if (slopeCap > 0.0) {
+                    const float magnitude = std::sqrt(prow[x] * prow[x] + qrow[x] * qrow[x]);
+                    if (magnitude > static_cast<float>(slopeCap)) {
+                        const float scale = static_cast<float>(slopeCap) / magnitude;
+                        prow[x] *= scale;
+                        qrow[x] *= scale;
+                    }
+                }
+            }
+        }
+    });
+}
+
+float slopeAdjustedNeighborHeight(
+    const cv::Mat& height,
+    const cv::Mat& p,
+    const cv::Mat& q,
+    const cv::Point& point,
+    int nx,
+    int ny) {
+    const float neighborHeight = height.at<float>(ny, nx);
+    if (nx < point.x) {
+        return neighborHeight + 0.5f * (p.at<float>(ny, nx) + p.at<float>(point));
+    }
+    if (nx > point.x) {
+        return neighborHeight - 0.5f * (p.at<float>(ny, nx) + p.at<float>(point));
+    }
+    if (ny < point.y) {
+        return neighborHeight + 0.5f * (q.at<float>(ny, nx) + q.at<float>(point));
+    }
+    return neighborHeight - 0.5f * (q.at<float>(ny, nx) + q.at<float>(point));
+}
+
+void fillHeightFromSlopes(
+    cv::Mat& height,
+    const cv::Mat& sourceMask,
+    const cv::Mat& domainMask,
+    const cv::Mat& p,
+    const cv::Mat& q,
+    const std::vector<cv::Point>& holes) {
+    cv::Mat known = sourceMask.clone();
+    cv::Mat queued(sourceMask.size(), CV_8U, cv::Scalar(0));
+    std::vector<cv::Point> queue;
+    queue.reserve(holes.size());
+    const int dx[4] = {-1, 1, 0, 0};
+    const int dy[4] = {0, 0, -1, 1};
+
+    for (const cv::Point& point : holes) {
+        for (int direction = 0; direction < 4; ++direction) {
+            if (maskContains(known, point.x + dx[direction], point.y + dy[direction])) {
+                queue.push_back(point);
+                queued.at<uchar>(point) = 255;
+                break;
+            }
+        }
+    }
+
+    size_t head = 0;
+    while (head < queue.size()) {
+        const cv::Point point = queue[head++];
+        float sum = 0.0f;
+        int count = 0;
+        for (int direction = 0; direction < 4; ++direction) {
+            const int nx = point.x + dx[direction];
+            const int ny = point.y + dy[direction];
+            if (maskContains(known, nx, ny)) {
+                sum += slopeAdjustedNeighborHeight(height, p, q, point, nx, ny);
+                ++count;
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        height.at<float>(point) = sum / static_cast<float>(count);
+        known.at<uchar>(point) = 255;
+        for (int direction = 0; direction < 4; ++direction) {
+            const int nx = point.x + dx[direction];
+            const int ny = point.y + dy[direction];
+            if (maskContains(domainMask, nx, ny) && !maskContains(known, nx, ny) &&
+                queued.at<uchar>(ny, nx) == 0) {
+                queue.emplace_back(nx, ny);
+                queued.at<uchar>(ny, nx) = 255;
+            }
+        }
+    }
+
+    double minimumHeight = 0.0;
+    double maximumHeight = 0.0;
+    cv::minMaxLoc(height, &minimumHeight, &maximumHeight, nullptr, nullptr, sourceMask);
+    const float tolerance = static_cast<float>(
+        std::max(1.0e-5, (maximumHeight - minimumHeight) * 1.0e-6));
+    int iterations = 180;
+    if (holes.size() > 2000000) {
+        iterations = 60;
+    } else if (holes.size() > 500000) {
+        iterations = 100;
+    }
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        float maximumChange = 0.0f;
+        for (int parity = 0; parity < 2; ++parity) {
+            for (const cv::Point& point : holes) {
+                if (((point.x + point.y) & 1) != parity) {
+                    continue;
+                }
+                float sum = 0.0f;
+                int count = 0;
+                for (int direction = 0; direction < 4; ++direction) {
+                    const int nx = point.x + dx[direction];
+                    const int ny = point.y + dy[direction];
+                    if (maskContains(domainMask, nx, ny)) {
+                        sum += slopeAdjustedNeighborHeight(height, p, q, point, nx, ny);
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    const float candidate = sum / static_cast<float>(count);
+                    float& value = height.at<float>(point);
+                    const float updated = value + 1.25f * (candidate - value);
+                    maximumChange = std::max(maximumChange, std::abs(updated - value));
+                    value = updated;
+                }
+            }
+        }
+        if (maximumChange < tolerance) {
+            break;
+        }
+    }
+}
+
+PrintableSurfaceFill fillPrintableSurfaceHoles(
+    const cv::Mat& height,
+    const cv::Mat& geometryMask,
+    const cv::Mat& normalMap,
+    const cv::Mat& vertexColor,
+    double slopeCap,
+    const std::function<void(const std::string&)>& progress) {
+    PrintableSurfaceFill result;
+    const cv::Mat sourceMask = finiteGeometryMask(height, geometryMask);
+    result.fillMask = enclosedMaskHoles(sourceMask);
+    result.filledPixelCount = static_cast<size_t>(cv::countNonZero(result.fillMask));
+    result.height = height.clone();
+    result.mask = sourceMask.clone();
+    result.vertexColor = vertexColor.clone();
+    if (result.filledPixelCount == 0) {
+        reportProgress(progress, "Printable PLY: no enclosed surface holes found.");
+        return result;
+    }
+
+    reportProgress(
+        progress,
+        "Printable PLY: reconstructing " + std::to_string(result.filledPixelCount) +
+            " enclosed surface pixels...");
+    result.mask.setTo(cv::Scalar(255), result.fillMask);
+    const std::vector<cv::Point> holes = maskPoints(result.fillMask);
+
+    cv::Mat p;
+    cv::Mat q;
+    estimateSurfaceSlopes(height, sourceMask, normalMap, slopeCap, p, q);
+    initializeHarmonicField(p, sourceMask, result.mask, holes);
+    initializeHarmonicField(q, sourceMask, result.mask, holes);
+    relaxHarmonicField(p, result.mask, holes, 60);
+    relaxHarmonicField(q, result.mask, holes, 60);
+    fillHeightFromSlopes(result.height, sourceMask, result.mask, p, q, holes);
+
+    if (!result.vertexColor.empty() && result.vertexColor.type() == CV_8U &&
+        result.vertexColor.size() == height.size()) {
+        cv::Mat colorFloat;
+        result.vertexColor.convertTo(colorFloat, CV_32F);
+        initializeHarmonicField(colorFloat, sourceMask, result.mask, holes);
+        relaxHarmonicField(colorFloat, result.mask, holes, 60);
+        for (const cv::Point& point : holes) {
+            result.vertexColor.at<uchar>(point) =
+                cv::saturate_cast<uchar>(colorFloat.at<float>(point));
+        }
+    }
+    return result;
+}
+
 void writePlyMesh(
     const fs::path& path,
     const cv::Mat& height,
@@ -1000,7 +1450,7 @@ void writePlyMesh(
 
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
-    out << "comment generated by What A Relief\n";
+    out << "comment generated by what-a-relief\n";
     out << "element vertex " << topology.vertexCount << "\n";
     out << "property float x\n";
     out << "property float y\n";
@@ -1113,7 +1563,7 @@ void writePrintablePlyMesh(
 
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
-    out << "comment generated by What A Relief printable solid export\n";
+    out << "comment generated by what-a-relief printable solid export\n";
     out << "comment units " << (pixelScaleMm > 0.0 ? "millimeters" : "input_pixels") << "\n";
     out << "element vertex " << vertexCount << "\n";
     out << "property float x\n";
@@ -1225,9 +1675,16 @@ double readPixelScaleMmFromImage(const std::string& path) {
     return 0.0;
 }
 
-std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, bool srgb) {
+std::vector<cv::Mat> loadLuminanceImages(
+    const std::vector<std::string>& paths,
+    bool srgb,
+    std::vector<cv::Mat>* saturationMasks) {
     std::vector<cv::Mat> images;
     images.reserve(paths.size());
+    if (saturationMasks != nullptr) {
+        saturationMasks->clear();
+        saturationMasks->reserve(paths.size());
+    }
     cv::Size expected;
     for (const std::string& path : paths) {
         cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
@@ -1239,6 +1696,9 @@ std::vector<cv::Mat> loadLuminanceImages(const std::vector<std::string>& paths, 
             expected = gray.size();
         } else if (gray.size() != expected) {
             die("All input images must have identical dimensions. Mismatch at: " + path);
+        }
+        if (saturationMasks != nullptr) {
+            saturationMasks->push_back(definiteSaturationMask(raw));
         }
         images.push_back(gray);
     }
@@ -1361,11 +1821,140 @@ void saveOutputs(
         if (!diagnostics.robustFallbackMask.empty()) {
             writeImageChecked(outDir / "robust_fallback_mask.png", diagnostics.robustFallbackMask);
         }
+        if (!diagnostics.unsupportedMask.empty()) {
+            writeImageChecked(outDir / "robust_unsupported_mask.png", diagnostics.unsupportedMask);
+        }
+        if (!diagnostics.effectiveInlierCount.empty()) {
+            cv::Mat inlierCount8;
+            diagnostics.effectiveInlierCount.convertTo(
+                inlierCount8,
+                CV_8U,
+                255.0 / static_cast<double>(std::max<size_t>(1, lights.size())));
+            writeImageChecked(outDir / "robust_inlier_count.png", inlierCount8);
+        }
+        if (!diagnostics.localConditionNumber.empty()) {
+            cv::Mat condition8;
+            cv::min(diagnostics.localConditionNumber, 100.0f, condition8);
+            condition8.convertTo(condition8, CV_8U, 2.55);
+            writeImageChecked(outDir / "robust_local_condition.png", condition8);
+        }
         writeImageChecked(outDir / "shadow_count.png", normalizeFloatTo8U(diagnostics.shadowCount, validMask, true));
         writeImageChecked(outDir / "highlight_outlier_count.png", normalizeFloatTo8U(diagnostics.highlightOutlierCount, validMask, true));
+        writeImageChecked(outDir / "saturation_count.png", normalizeFloatTo8U(diagnostics.saturationCount, validMask, true));
+        writeImageChecked(outDir / "model_mismatch_count.png", normalizeFloatTo8U(diagnostics.modelMismatchCount, validMask, true));
     }
     if (opt.specularDiagnostics && !diagnostics.specularCueMask.empty()) {
         writeImageChecked(outDir / "specular_cue_mask.png", diagnostics.specularCueMask);
+        if (diagnostics.shadowObservationMasks.size() == lights.size() &&
+            diagnostics.highlightObservationMasks.size() == lights.size() &&
+            diagnostics.saturationObservationMasks.size() == lights.size()) {
+            const fs::path observationDir = outDir / "robust_observations";
+            fs::create_directories(observationDir);
+            for (size_t i = 0; i < lights.size(); ++i) {
+                std::ostringstream number;
+                number << std::setw(3) << std::setfill('0') << (i + 1);
+                writeImageChecked(
+                    observationDir / ("light_" + number.str() + "_shadow.png"),
+                    diagnostics.shadowObservationMasks[i]);
+                writeImageChecked(
+                    observationDir / ("light_" + number.str() + "_highlight.png"),
+                    diagnostics.highlightObservationMasks[i]);
+                writeImageChecked(
+                    observationDir / ("light_" + number.str() + "_saturation.png"),
+                    diagnostics.saturationObservationMasks[i]);
+            }
+        }
+    }
+    if (opt.shadowHeightRefinement && !diagnostics.shadowHeightCorrection.empty()) {
+        reportProgress(progress, "Writing shadow-constrained height audit...");
+        const cv::Mat& geometryMask = heightMask.empty() ? validMask : heightMask;
+        writeImageChecked(
+            outDir / "shadow_height_correction.png",
+            signedFloatTo8U(diagnostics.shadowHeightCorrection, geometryMask));
+        writePfm(
+            outDir / "shadow_height_correction.pfm",
+            diagnostics.shadowHeightCorrection,
+            geometryMask);
+        writeImageChecked(
+            outDir / "shadow_constraint_count.png",
+            normalizeFloatTo8U(diagnostics.shadowConstraintCount, geometryMask, true));
+        writeImageChecked(
+            outDir / "shadow_mismatch_before.png",
+            normalizeFloatTo8U(diagnostics.shadowMismatchBefore, geometryMask, true));
+        writeImageChecked(
+            outDir / "shadow_mismatch_after.png",
+            normalizeFloatTo8U(diagnostics.shadowMismatchAfter, geometryMask, true));
+        if (!diagnostics.shadowObservability.empty()) {
+            cv::Mat observability8;
+            diagnostics.shadowObservability.convertTo(observability8, CV_8U, 255.0);
+            writeImageChecked(outDir / "shadow_observability.png", observability8);
+        }
+        if (!diagnostics.shadowEdgeSupport.empty()) {
+            writeImageChecked(
+                outDir / "shadow_edge_support.png",
+                normalizeFloatTo8U(diagnostics.shadowEdgeSupport, geometryMask, true));
+        }
+        if (!diagnostics.shadowOccluderSupport.empty()) {
+            writeImageChecked(
+                outDir / "shadow_occluder_support.png",
+                diagnostics.shadowOccluderSupport);
+        }
+
+        const fs::path shadowDirectory = outDir / "shadow_refinement";
+        fs::create_directories(shadowDirectory);
+        for (const int index : diagnostics.shadowRefinementLightIndices) {
+            if (index < 0 || static_cast<size_t>(index) >= lights.size()) {
+                continue;
+            }
+            std::ostringstream number;
+            number << std::setw(3) << std::setfill('0') << (index + 1);
+            const size_t lightIndex = static_cast<size_t>(index);
+            if (lightIndex < diagnostics.shadowObservedCastMasks.size() &&
+                !diagnostics.shadowObservedCastMasks[lightIndex].empty()) {
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_observed_cast.png"),
+                    diagnostics.shadowObservedCastMasks[lightIndex]);
+            }
+            if (lightIndex < diagnostics.shadowObservationConfidence.size() &&
+                !diagnostics.shadowObservationConfidence[lightIndex].empty()) {
+                cv::Mat confidence8;
+                diagnostics.shadowObservationConfidence[lightIndex].convertTo(
+                    confidence8, CV_8U, 255.0);
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_evidence_confidence.png"),
+                    confidence8);
+            }
+            if (lightIndex < diagnostics.shadowPredictedBeforeMasks.size() &&
+                !diagnostics.shadowPredictedBeforeMasks[lightIndex].empty()) {
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_predicted_before.png"),
+                    diagnostics.shadowPredictedBeforeMasks[lightIndex]);
+            }
+            if (lightIndex < diagnostics.shadowPredictedAfterMasks.size() &&
+                !diagnostics.shadowPredictedAfterMasks[lightIndex].empty()) {
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_predicted_after.png"),
+                    diagnostics.shadowPredictedAfterMasks[lightIndex]);
+            }
+            if (lightIndex < diagnostics.shadowPredictedBeforeProbability.size() &&
+                !diagnostics.shadowPredictedBeforeProbability[lightIndex].empty()) {
+                cv::Mat probability8;
+                diagnostics.shadowPredictedBeforeProbability[lightIndex].convertTo(
+                    probability8, CV_8U, 255.0);
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_probability_before.png"),
+                    probability8);
+            }
+            if (lightIndex < diagnostics.shadowPredictedAfterProbability.size() &&
+                !diagnostics.shadowPredictedAfterProbability[lightIndex].empty()) {
+                cv::Mat probability8;
+                diagnostics.shadowPredictedAfterProbability[lightIndex].convertTo(
+                    probability8, CV_8U, 255.0);
+                writeImageChecked(
+                    shadowDirectory / ("light_" + number.str() + "_probability_after.png"),
+                    probability8);
+            }
+        }
     }
     if (!height.empty()) {
         reportProgress(progress, "Writing height outputs...");
@@ -1374,31 +1963,73 @@ void saveOutputs(
         writeImageChecked(outDir / "height.png", normalizeFloatTo8U(height, geometryMask, false));
         writePfm(outDir / "height.pfm", height, geometryMask);
         if (!opt.meshPath.empty() || !opt.printableMeshPath.empty()) {
-            const PlyGridTopology topology = buildPlyGridTopology(
-                height,
-                geometryMask,
-                opt.meshStep,
-                !opt.printableMeshPath.empty(),
-                progress);
-            if (!opt.meshPath.empty()) {
-                writePlyMesh(
-                    opt.meshPath,
+            if (opt.printableFillHoles && !opt.printableMeshPath.empty()) {
+                if (!opt.meshPath.empty()) {
+                    const PlyGridTopology openTopology = buildPlyGridTopology(
+                        height,
+                        geometryMask,
+                        opt.meshStep,
+                        false,
+                        progress);
+                    writePlyMesh(
+                        opt.meshPath,
+                        height,
+                        albedo8,
+                        opt.heightScale,
+                        openTopology,
+                        progress);
+                }
+
+                const PrintableSurfaceFill printable = fillPrintableSurfaceHoles(
                     height,
+                    geometryMask,
+                    normalMap,
                     albedo8,
-                    opt.heightScale,
-                    topology,
+                    opt.heightSlopeCap,
                     progress);
-            }
-            if (!opt.printableMeshPath.empty()) {
+                writeImageChecked(outDir / "printable_fill_mask.png", printable.fillMask);
+                const PlyGridTopology printableTopology = buildPlyGridTopology(
+                    printable.height,
+                    printable.mask,
+                    opt.meshStep,
+                    true,
+                    progress);
                 writePrintablePlyMesh(
                     opt.printableMeshPath,
-                    height,
-                    albedo8,
+                    printable.height,
+                    printable.vertexColor,
                     opt.heightScale,
                     opt.pixelScaleMm,
                     opt.printableThicknessMm,
-                    topology,
+                    printableTopology,
                     progress);
+            } else {
+                const PlyGridTopology topology = buildPlyGridTopology(
+                    height,
+                    geometryMask,
+                    opt.meshStep,
+                    !opt.printableMeshPath.empty(),
+                    progress);
+                if (!opt.meshPath.empty()) {
+                    writePlyMesh(
+                        opt.meshPath,
+                        height,
+                        albedo8,
+                        opt.heightScale,
+                        topology,
+                        progress);
+                }
+                if (!opt.printableMeshPath.empty()) {
+                    writePrintablePlyMesh(
+                        opt.printableMeshPath,
+                        height,
+                        albedo8,
+                        opt.heightScale,
+                        opt.pixelScaleMm,
+                        opt.printableThicknessMm,
+                        topology,
+                        progress);
+                }
             }
         }
     }

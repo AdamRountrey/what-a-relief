@@ -37,7 +37,8 @@ void solvePhotometricStereo(
     cv::Mat& albedo,
     cv::Mat& residual,
     cv::Mat& validMask,
-    PhotometricDiagnostics& diagnostics);
+    PhotometricDiagnostics& diagnostics,
+    const std::vector<cv::Mat>& saturationMasks = {});
 void solveUncalibratedPhotometricStereo(
     const std::vector<cv::Mat>& images,
     const cv::Mat& inputMask,

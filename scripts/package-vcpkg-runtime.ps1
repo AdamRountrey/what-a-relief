@@ -54,7 +54,7 @@ function Write-ThirdPartyLicenseBundle {
         @{ Package = "zlib"; Display = "zlib" }
     )
 
-    Set-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Third-party license notices for the What A Relief Windows runtime package."
+    Set-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Third-party license notices for the what-a-relief Windows runtime package."
     Add-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Generated from vcpkg package copyright files."
     foreach ($package in $packages) {
         Add-LicenseSection -OutputPath $OutputPath -ShareDir $ShareDir -PackageName $package.Package -DisplayName $package.Display
@@ -75,5 +75,8 @@ foreach ($doc in @("README.md", "LICENSE", "SECURITY.md", "AI_ATTRIBUTION.md", "
         Copy-Item -LiteralPath $source -Destination $out -Force
     }
 }
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\worker.py") -Destination (Join-Path $out "mitsuba_worker.py") -Force
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\requirements.lock.txt") -Destination (Join-Path $out "mitsuba_requirements.lock.txt") -Force
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\README.md") -Destination (Join-Path $out "MITSUBA_BACKEND.md") -Force
 Write-ThirdPartyLicenseBundle -OutputPath (Join-Path $out "THIRD_PARTY_LICENSES.txt") -ShareDir $share
 Write-Host "Copied vcpkg runtime DLLs to $out"

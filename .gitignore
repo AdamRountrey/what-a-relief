@@ -12,6 +12,7 @@ out_*/
 dist/
 *.pfm
 *.ply
+!tests/fixtures/mitsuba/*/relief_mesh.ply
 *.user
 *.suo
 .vs/
@@ -20,3 +21,5 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
+__pycache__/
+*.py[cod]

@@ -1,0 +1,325 @@
+{
+  "fixture": "mitsuba-holdout-relief-v1",
+  "split": "validation",
+  "mitsuba_version": "3.8.0",
+  "mitsuba_variant": "cuda_ad_rgb",
+  "reference_normal_effective_bits": 12,
+  "resolution": [
+    96,
+    72
+  ],
+  "requested_samples_per_pixel": 128,
+  "radiance_samples_per_pixel": 144,
+  "aov_samples_per_pixel": 128,
+  "radiance_sampling": {
+    "method": "single-sample spatial supersampling with deterministic downsampling",
+    "horizontal_samples": 12,
+    "vertical_samples": 12
+  },
+  "lighting_model": "near_field_ring",
+  "light_directions": [
+    [
+      0.9204617394213542,
+      0.2125053367804975,
+      0.3280116889704119
+    ],
+    [
+      0.6442658898023556,
+      0.6908905811602563,
+      0.3280116889704119
+    ],
+    [
+      0.1314731632468629,
+      0.9354801650728045,
+      0.3280116889704119
+    ],
+    [
+      -0.4865429054457113,
+      0.8097433748165054,
+      0.3280116889704119
+    ],
+    [
+      -0.9166128191324988,
+      0.22853724357476354,
+      0.3280116889704119
+    ],
+    [
+      -0.8417103980621262,
+      -0.4288728689167393,
+      0.3280116889704119
+    ],
+    [
+      -0.30755566142919905,
+      -0.8932064974134625,
+      0.3280116889704119
+    ],
+    [
+      0.38423339499297215,
+      -0.8630023349162808,
+      0.3280116889704119
+    ],
+    [
+      0.8097433748165052,
+      -0.4865429054457115,
+      0.3280116889704119
+    ],
+    [
+      0.9376322099931436,
+      -0.11512675919242792,
+      0.3280116889704119
+    ]
+  ],
+  "light_positions": [
+    [
+      3.5077322332268466,
+      0.8098237956379141,
+      1.25
+    ],
+    [
+      2.4551940962249947,
+      2.632873325829014,
+      1.25
+    ],
+    [
+      0.5010231634562357,
+      3.564965047469653,
+      1.25
+    ],
+    [
+      -1.8541370696761954,
+      3.085802282527604,
+      1.25
+    ],
+    [
+      -3.4930646145935875,
+      0.870918824158804,
+      1.25
+    ],
+    [
+      -3.2076234870781244,
+      -1.634365799062368,
+      1.25
+    ],
+    [
+      -1.1720453560457638,
+      -3.4038668721575407,
+      1.25
+    ],
+    [
+      1.464251915072879,
+      -3.288763647513364,
+      1.25
+    ],
+    [
+      3.0858022825276037,
+      -1.854137069676196,
+      1.25
+    ],
+    [
+      3.57316614590876,
+      -0.43872963625853,
+      1.25
+    ]
+  ],
+  "light_irradiance": null,
+  "ring_radius_mm": 3.6,
+  "ring_height_mm": 1.25,
+  "pixel_scale_mm": 0.027777777777777776,
+  "sensor_model": {
+    "linear": true,
+    "exposure": 2.2,
+    "full_well_electrons": 18000.0,
+    "read_noise_electrons": 3.0,
+    "dark_signal_fraction": 0.003,
+    "adc_bits": 12,
+    "random_seed": 1592598566
+  },
+  "truth_definition": {
+    "shadow": "attached shadow or at least 45% visibility loss in a matched Lambertian render",
+    "attached_shadow": "valid surface sample with local n dot l no greater than 0.015",
+    "cast_shadow": "front-facing valid sample with at least 45% visibility loss and an absolute diffuse deficit above 0.018",
+    "highlight": "rough-plastic specular excess above absolute and diffuse-relative thresholds",
+    "saturation": "measured 12-bit ADC code equals 4095"
+  },
+  "position_z_encoding": {
+    "units": "scene millimeters",
+    "minimum": -0.25,
+    "maximum": 1.0,
+    "container_bits": 16,
+    "effective_bits": 12,
+    "invalid_pixels": "encoded minimum"
+  },
+  "files": {
+    "images": [
+      "images/light_00.png",
+      "images/light_01.png",
+      "images/light_02.png",
+      "images/light_03.png",
+      "images/light_04.png",
+      "images/light_05.png",
+      "images/light_06.png",
+      "images/light_07.png",
+      "images/light_08.png",
+      "images/light_09.png"
+    ],
+    "shadow_truth": [
+      "shadow_truth/light_00.png",
+      "shadow_truth/light_01.png",
+      "shadow_truth/light_02.png",
+      "shadow_truth/light_03.png",
+      "shadow_truth/light_04.png",
+      "shadow_truth/light_05.png",
+      "shadow_truth/light_06.png",
+      "shadow_truth/light_07.png",
+      "shadow_truth/light_08.png",
+      "shadow_truth/light_09.png"
+    ],
+    "attached_shadow_truth": [
+      "attached_shadow_truth/light_00.png",
+      "attached_shadow_truth/light_01.png",
+      "attached_shadow_truth/light_02.png",
+      "attached_shadow_truth/light_03.png",
+      "attached_shadow_truth/light_04.png",
+      "attached_shadow_truth/light_05.png",
+      "attached_shadow_truth/light_06.png",
+      "attached_shadow_truth/light_07.png",
+      "attached_shadow_truth/light_08.png",
+      "attached_shadow_truth/light_09.png"
+    ],
+    "cast_shadow_truth": [
+      "cast_shadow_truth/light_00.png",
+      "cast_shadow_truth/light_01.png",
+      "cast_shadow_truth/light_02.png",
+      "cast_shadow_truth/light_03.png",
+      "cast_shadow_truth/light_04.png",
+      "cast_shadow_truth/light_05.png",
+      "cast_shadow_truth/light_06.png",
+      "cast_shadow_truth/light_07.png",
+      "cast_shadow_truth/light_08.png",
+      "cast_shadow_truth/light_09.png"
+    ],
+    "highlight_truth": [
+      "highlight_truth/light_00.png",
+      "highlight_truth/light_01.png",
+      "highlight_truth/light_02.png",
+      "highlight_truth/light_03.png",
+      "highlight_truth/light_04.png",
+      "highlight_truth/light_05.png",
+      "highlight_truth/light_06.png",
+      "highlight_truth/light_07.png",
+      "highlight_truth/light_08.png",
+      "highlight_truth/light_09.png"
+    ],
+    "saturation_truth": [
+      "saturation_truth/light_00.png",
+      "saturation_truth/light_01.png",
+      "saturation_truth/light_02.png",
+      "saturation_truth/light_03.png",
+      "saturation_truth/light_04.png",
+      "saturation_truth/light_05.png",
+      "saturation_truth/light_06.png",
+      "saturation_truth/light_07.png",
+      "saturation_truth/light_08.png",
+      "saturation_truth/light_09.png"
+    ],
+    "solve_mask": "solve_mask.png",
+    "shape_index": "shape_index.png",
+    "shape_indices": {
+      "floor": 1,
+      "corrugated_relief": 2,
+      "dark_rod": 3,
+      "rough_block": 4,
+      "textured_medallion": 5
+    },
+    "normal_components": [
+      "normal_x.png",
+      "normal_y.png",
+      "normal_z.png"
+    ],
+    "position_z": "position_z.png",
+    "lights": "lights.csv",
+    "scene_assets": [
+      "relief_mesh.ply",
+      "albedo_texture.png"
+    ]
+  },
+  "counts": {
+    "valid_pixels": 4195,
+    "shadow_observations": 6707,
+    "attached_shadow_observations": 520,
+    "cast_shadow_observations": 6187,
+    "highlight_observations": 168,
+    "saturated_observations": 290
+  },
+  "sha256": {
+    "albedo_texture.png": "53590fead6114ac5e1d138a340ce892d99243f9efd9b0c2734731ee88c96021c",
+    "attached_shadow_truth/light_00.png": "4840bca0d695721cec089a84ad928040d7cc4e4fef7c396e613e44c9c83aa234",
+    "attached_shadow_truth/light_01.png": "9d7c7870a13eeb6dc4a150a1376c6c4a82ecaa20baf9eb339b04568239498753",
+    "attached_shadow_truth/light_02.png": "fac56d2905a5d1ddcf9708a694607d105037fc3807a6d3223cc0d6bc48bd7e67",
+    "attached_shadow_truth/light_03.png": "fac56d2905a5d1ddcf9708a694607d105037fc3807a6d3223cc0d6bc48bd7e67",
+    "attached_shadow_truth/light_04.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "attached_shadow_truth/light_05.png": "1333df721b21bdb4f877d840811d27df96aed0d27203e09590024dd5c07dfdb1",
+    "attached_shadow_truth/light_06.png": "f7a6bd12ff65f285f0fb7b84f381514001210f39da9bfa597da6d02ce68495dc",
+    "attached_shadow_truth/light_07.png": "75989d8e93f341df71301b2584da57b876e5a3ed81840ac26c9c029e904ae691",
+    "attached_shadow_truth/light_08.png": "ff8137d1b74879007210ea13565a7c6fe0366578fe3c39d07d4d733ac316ccfb",
+    "attached_shadow_truth/light_09.png": "8f9f0654b06f89c4d87a41a03ea089ba0e9f039bc55f59ee1142fc56b8971a7f",
+    "cast_shadow_truth/light_00.png": "e88336c9d0e709d8b554a415fc81ed3c467a59e9c1d6e58475019ea80ac158e8",
+    "cast_shadow_truth/light_01.png": "467e68984ceb936ef682bdfced7c3465797208c85cc89fa972577ea5c90729f5",
+    "cast_shadow_truth/light_02.png": "cc1fb181f20b48843a3a97bed6eeded4a02f3bbe23f4bd1d39f37106dbbef6df",
+    "cast_shadow_truth/light_03.png": "e1458a53e78ac5d7707529c18d89efe785cacdfa2353c6053b359da11c057f43",
+    "cast_shadow_truth/light_04.png": "297976e7fbe62a99ded4798e4e54f9cfaef88f44c96d3e0d4c2408debd65c49a",
+    "cast_shadow_truth/light_05.png": "4fb38f10045c19f0539c3aea3b58edb6c8a426a9bad51187da5b29e04e6dfa84",
+    "cast_shadow_truth/light_06.png": "d2a4d8b87f6a090656cf91088b166c9ef3bc116f95bad9f2904739b55118cbba",
+    "cast_shadow_truth/light_07.png": "56a1e63616330f962be482e6906ef99c11cca9c658c601fcf01d03aea005fe2e",
+    "cast_shadow_truth/light_08.png": "24676f69fe07103e4b7bae7463ab64347804f434534829cc5926680156b3cff7",
+    "cast_shadow_truth/light_09.png": "ad764f03d41264b956550f1eae4d67b93848ac8198f1cb0a8ba401f1ccf1ecb9",
+    "highlight_truth/light_00.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "highlight_truth/light_01.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "highlight_truth/light_02.png": "3c1c650cb035c0c080cbc0d5371421445d4e64da4c8ef062609f4fb1fc04c4aa",
+    "highlight_truth/light_03.png": "ce51fe4a9ac2b29f66bb519ed1de1a899ae8ee2bdeeddcd65f0749433d35806c",
+    "highlight_truth/light_04.png": "a0465f498e6a1b13d2d6e137b0706df94f1f97b8c572d143cb5ed7b913136221",
+    "highlight_truth/light_05.png": "faaf7b89320d059a1abebfc4052d5a5e69cf568bcde70d9dae6c28059ec8bd31",
+    "highlight_truth/light_06.png": "9f0311c5c22ea8c45ac86376aff68608019f01d03420e6da4a80e6246a937337",
+    "highlight_truth/light_07.png": "55c661eaf082908568b18fb1d24457eceaae3dd83239c9e11a444aa83f7fc94c",
+    "highlight_truth/light_08.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "highlight_truth/light_09.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "images/light_00.png": "3067ecb24247a80194a41ff4391622a511601528f4ae5e2a0232e60c53b420ad",
+    "images/light_01.png": "a1324c509536cb7e9194834da1dbe5bc7209d34d88095e05ba188713e01b8eba",
+    "images/light_02.png": "30d24fb6347b501ef47a2f5440f4cd9c14e746606de6bde57eda1c32aaeb05c2",
+    "images/light_03.png": "e00c8de75ffc002dd1e964760a87088bd73bf3cf745f0f668eae86dc10ce0215",
+    "images/light_04.png": "039fb348cd7e144a0f500d1ee662efb7f7bb024abbca7a591a277577d46c06c1",
+    "images/light_05.png": "aaffedc0661d0a577ac74a1bebe2c687c5253e0913ef7ad542d9f63a2cd5ac5b",
+    "images/light_06.png": "640059db2fd83a2ae2a3eb3f903781d3eee8fc9dd3b53ccbb1acc7f1cedf38c4",
+    "images/light_07.png": "0f0757ca25020983ad584b7f3b030ce9a2cec00da4c5eaedf75c6de77003ec39",
+    "images/light_08.png": "ba330bde3ba40194f24a8e9db1deabf115743040fb341d7eef7d7226e6e6fb64",
+    "images/light_09.png": "c810e4b948c6fa1318f312100696a668a86283d0d5ad92535aa01df59cedc861",
+    "lights.csv": "0c09e65ecbb755aa9d97c34dafd82a0f5bb621ddceca377b916c342e7143fa2d",
+    "normal_x.png": "31813f1c6e67151daead5a52979e3c9c5967093cb37022c06d8430f0ee904987",
+    "normal_y.png": "852564288e372ad1d8898c49bd375ea0b927a5c6b2ed656b6e7b79e9ff21d85c",
+    "normal_z.png": "bf87957830575592dd120dd4a87c71055c723de47e8c56912c6a7f7827040212",
+    "position_z.png": "1ff6fdc4f204a01ac7e90a3622c70c528c72a325234794312c663769c95becad",
+    "relief_mesh.ply": "d545ae611290e21e1dad43277b9fdeeffae1179f75657df23ab631ccb715a8ab",
+    "saturation_truth/light_00.png": "8c5e9f291492c4d2fca712e3629ef1fd23b67b1bf135180e9aa27594db309c4b",
+    "saturation_truth/light_01.png": "21f5c9acadfa454ff5c285c5acf4f4277829cf33f225bfd14bd0bbc3420a3f8f",
+    "saturation_truth/light_02.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "saturation_truth/light_03.png": "ff4520a2e64907db3d4aa19802192440bfa4fb30c7f4b4f0075e0e056c22fa87",
+    "saturation_truth/light_04.png": "f51b81fffebd7a5fd48266b8c118c1ec987cf5c85c3c01997b4f5b5e3e730a0c",
+    "saturation_truth/light_05.png": "52d69397ae3cf8b3454b390e5a84b3ec3b2e14518b621ee9d36913c52e417cd6",
+    "saturation_truth/light_06.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "saturation_truth/light_07.png": "717f089bf4790870e1e10d5a8e89dc058083bcf9e9bb618a6e4d2216711d3dd3",
+    "saturation_truth/light_08.png": "d84bc192a9fc68bd821ca4b2faacf8ddaf2b79bbd7686e5cca34d98179c309bf",
+    "saturation_truth/light_09.png": "52582ee3ffd41fd14369017dbe504c0302b9e8b4362455e47f0963a92276705d",
+    "shadow_truth/light_00.png": "eaf3e4489f112a8e5d96a685e1b292e514ae5f6deaa4b47b3faa19ea602b176d",
+    "shadow_truth/light_01.png": "97bb2fc4cb0ce4017072fbea355bcf9ece73ac1ac2d0595a3973d15904ab0642",
+    "shadow_truth/light_02.png": "888e44540a8afc9ba14fcb71d3c7c043a46f168802ad7a2c2fa6c4b4fae0cd3f",
+    "shadow_truth/light_03.png": "a4626c80fb6bc414c58c9041ca2f63eef37c6b929ee7a6538d2142580dca09bd",
+    "shadow_truth/light_04.png": "297976e7fbe62a99ded4798e4e54f9cfaef88f44c96d3e0d4c2408debd65c49a",
+    "shadow_truth/light_05.png": "b38e00a12882aa4ab2c6f13b9b4d359c0da2b56d0e8fafe133ed3a74098c7ca5",
+    "shadow_truth/light_06.png": "2b9857e0ffd935f80ebadd7871f680763df398d08017f849ec5e310f5847537c",
+    "shadow_truth/light_07.png": "619625ec21ca4228ac917784920518208e58a27f5c29c9c29d3b3c7b1023e47a",
+    "shadow_truth/light_08.png": "a3129bb47454ff88da1ac8508a67c7549d797556cfff7f4bf1e27dfa121a02f2",
+    "shadow_truth/light_09.png": "5744a2af123efc7d990426c8671e748737f6a0879364c007b53e0ed158359ba6",
+    "shape_index.png": "29adb1a2820092cd1dab053669917915f7ef406977ff22de9406fd173f873a13",
+    "solve_mask.png": "b5419d348583cf88e52020b6b96002057b41e941476ac6469631c14ca94093e4"
+  }
+}

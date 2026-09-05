@@ -1,6 +1,6 @@
 # AI Attribution
 
-What A Relief was created by Adam Rountrey with the use of AI coding tools.
+what-a-relief was created by Adam Rountrey with the use of AI coding tools.
 
 AI attribution statement:
 

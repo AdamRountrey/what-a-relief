@@ -9,14 +9,16 @@
 namespace {
 
 constexpr size_t kMinImages = 3;
-constexpr size_t kMaxImages = 25;
+constexpr size_t kMaxNeuralImages = 25;
+constexpr size_t kMinShadowRefinementImages = 6;
+constexpr size_t kMinMitsubaRefinementImages = 6;
 
 [[noreturn]] void die(const std::string& message) {
     throw std::runtime_error(message);
 }
 
 bool validImageCount(size_t count) {
-    return count >= kMinImages && count <= kMaxImages;
+    return count >= kMinImages;
 }
 
 double parseDouble(const std::string& s, const std::string& label) {
@@ -117,16 +119,42 @@ RtiColorMode parseRtiColorMode(const std::string& s) {
     die("Invalid RTI color mode: " + s + " (use rgb or lrgb)");
 }
 
+MitsubaBackendMode parseMitsubaBackendMode(const std::string& s) {
+    if (s == "auto") {
+        return MitsubaBackendMode::Auto;
+    }
+    if (s == "cuda" || s == "gpu" || s == "nvidia") {
+        return MitsubaBackendMode::Cuda;
+    }
+    if (s == "cpu" || s == "llvm") {
+        return MitsubaBackendMode::Cpu;
+    }
+    die("Invalid Mitsuba backend: " + s + " (use auto, cuda, or cpu)");
+}
+
+MitsubaQualityMode parseMitsubaQualityMode(const std::string& s) {
+    if (s == "preview" || s == "fast") {
+        return MitsubaQualityMode::Preview;
+    }
+    if (s == "standard" || s == "normal") {
+        return MitsubaQualityMode::Standard;
+    }
+    if (s == "research" || s == "high") {
+        return MitsubaQualityMode::Research;
+    }
+    die("Invalid Mitsuba quality: " + s + " (use preview, standard, or research)");
+}
+
 } // namespace
 
 void printUsage() {
     std::cout
-        << "What A Relief: relief visualization and photometric stereo from 3 to 25 images.\n\n"
+        << "what-a-relief: relief visualization and photometric stereo from 3 or more images.\n\n"
         << "GUI:\n"
         << "  what-a-relief.exe            Open file picker, output folder picker, and lighting choice.\n"
         << "  --gui                        Same as running with no arguments.\n\n"
         << "Required:\n"
-        << "  --image path                 Add one image. Use 3 to 25 times.\n\n"
+        << "  --image path                 Add one image. Use at least 3 times.\n\n"
         << "Interactive sphere selection:\n"
         << "  If --sphere, --lights-file, and --uncalibrated are omitted, the first image opens in a window.\n"
         << "  Click three points on the sphere edge, then press Enter or Space.\n"
@@ -142,10 +170,20 @@ void printUsage() {
         << "  --no-gui                     Disable interactive selection. Requires --sphere, --lights-file, or --uncalibrated.\n"
         << "  --srgb                       Linearize sRGB image intensities.\n"
         << "  --solver standard|robust     Calibrated normal solve. Default: robust\n"
-        << "  --high-outlier-threshold v   Robust solve highlight/saturation cutoff. Default: 0.98\n"
+        << "  --high-outlier-threshold v   Robust solve probable-clipping/bright-candidate cutoff. Default: 0.98\n"
         << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
         << "  --pixel-scale-mm s           Image pixel size in mm/pixel; 0 auto-reads TIFF tags when needed.\n"
         << "  --specular-diagnostics       Write experimental shiny-cue and robust outlier diagnostic maps.\n"
+        << "  --shadow-height-refinement   Experimentally refine broad height/mesh shape from coherent cast shadows.\n"
+        << "                               Requires 6+ calibrated images, robust solve, and height output.\n"
+        << "  --shadow-reference-z-mm z    Near-field reference-surface Z above the light datum. Default: 0\n"
+        << "  --shadow-led-diameter-mm d   Near-field effective LED diameter for soft shadows; 0 is point source.\n"
+        << "  --mitsuba-inverse            Experimental inverse-rendering geometry refinement.\n"
+        << "                               Requires 6+ calibrated robust images, height, and the optional backend.\n"
+        << "  --mitsuba-python path        Python executable from the isolated what-a-relief Mitsuba backend.\n"
+        << "  --mitsuba-worker path        Override the versioned Mitsuba worker script.\n"
+        << "  --mitsuba-backend mode       auto, cuda, or cpu. Default: auto\n"
+        << "  --mitsuba-quality mode       preview, standard, or research. Default: standard\n"
         << "  --neural-fusion             Run bundled PS-FCN neural normal prior and fuse it with the classical solve.\n"
         << "                               Experimental; calibrated mode only, supports 3 to 25 images.\n"
         << "                               Height/PLY remain classical-only to avoid exaggerated geometry.\n"
@@ -164,6 +202,7 @@ void printUsage() {
         << "  --no-height                  Skip height.png and height.pfm.\n"
         << "  --mesh path.ply              Export a PLY mesh from the height preview.\n"
         << "  --printable-mesh path.ply    Export a watertight solid PLY; requires pixel scale.\n"
+        << "  --printable-fill-holes       Fill enclosed missing surface regions in the printable PLY.\n"
         << "  --mesh-step n                Use every nth pixel for PLY export. Default: 1\n"
         << "  --height-scale s             Scale mesh z coordinates. Default: 1.0\n"
         << "  --printable-thickness-mm s   Solid base thickness for --printable-mesh. Default: 2.0\n"
@@ -246,6 +285,28 @@ Options parseArgs(int argc, char** argv) {
             opt.pixelScaleMm = parseDouble(argv[++i], "pixel scale");
         } else if (arg == "--specular-diagnostics") {
             opt.specularDiagnostics = true;
+        } else if (arg == "--shadow-height-refinement") {
+            opt.shadowHeightRefinement = true;
+        } else if (arg == "--shadow-reference-z-mm") {
+            need(1);
+            opt.shadowReferenceZMm = parseDouble(argv[++i], "shadow reference surface Z");
+        } else if (arg == "--shadow-led-diameter-mm") {
+            need(1);
+            opt.shadowLedDiameterMm = parseDouble(argv[++i], "shadow LED diameter");
+        } else if (arg == "--mitsuba-inverse") {
+            opt.mitsubaInverseRefinement = true;
+        } else if (arg == "--mitsuba-python") {
+            need(1);
+            opt.mitsubaPythonPath = argv[++i];
+        } else if (arg == "--mitsuba-worker") {
+            need(1);
+            opt.mitsubaWorkerPath = argv[++i];
+        } else if (arg == "--mitsuba-backend") {
+            need(1);
+            opt.mitsubaBackendMode = parseMitsubaBackendMode(argv[++i]);
+        } else if (arg == "--mitsuba-quality") {
+            need(1);
+            opt.mitsubaQualityMode = parseMitsubaQualityMode(argv[++i]);
         } else if (arg == "--neural-fusion") {
             opt.neuralFusion = true;
         } else if (arg == "--neural-model") {
@@ -292,6 +353,8 @@ Options parseArgs(int argc, char** argv) {
             need(1);
             opt.printableMeshPath = argv[++i];
             opt.calculateHeight = true;
+        } else if (arg == "--printable-fill-holes") {
+            opt.printableFillHoles = true;
         } else if (arg == "--mesh-step") {
             need(1);
             opt.meshStep = parseInt(argv[++i], "mesh step");
@@ -323,10 +386,10 @@ Options parseArgs(int argc, char** argv) {
     }
 
     if (!opt.guiMode && !validImageCount(opt.imagePaths.size())) {
-        die("Use 3 to 25 --image arguments.");
+        die("Use at least 3 --image arguments.");
     }
     if (opt.guiMode && !opt.imagePaths.empty() && !validImageCount(opt.imagePaths.size())) {
-        die("Use 3 to 25 --image arguments.");
+        die("Use at least 3 --image arguments.");
     }
     if (opt.noGui && opt.lightsFile.empty() && !opt.hasSphere && !opt.uncalibratedLighting) {
         die("--no-gui requires --sphere, --lights-file, or --uncalibrated.");
@@ -342,9 +405,32 @@ Options parseArgs(int argc, char** argv) {
             die("--neural-fusion cannot be combined with --uncalibrated.");
         }
         if ((!opt.guiMode || !opt.imagePaths.empty()) &&
-            (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxImages)) {
+            (opt.imagePaths.size() < kMinImages || opt.imagePaths.size() > kMaxNeuralImages)) {
             die("--neural-fusion supports 3 to 25 images.");
         }
+    }
+    if (opt.specularDiagnostics &&
+        (opt.uncalibratedLighting || opt.solverMode != NormalSolverMode::Robust)) {
+        die("--specular-diagnostics requires calibrated lighting and --solver robust.");
+    }
+    if (opt.shadowHeightRefinement &&
+        (opt.uncalibratedLighting || opt.solverMode != NormalSolverMode::Robust)) {
+        die("--shadow-height-refinement requires calibrated lighting and --solver robust.");
+    }
+    if (opt.shadowHeightRefinement && (!opt.guiMode || !opt.imagePaths.empty()) &&
+        opt.imagePaths.size() < kMinShadowRefinementImages) {
+        die("--shadow-height-refinement requires at least 6 images.");
+    }
+    if (opt.mitsubaInverseRefinement &&
+        (opt.uncalibratedLighting || opt.solverMode != NormalSolverMode::Robust)) {
+        die("--mitsuba-inverse requires calibrated lighting and --solver robust.");
+    }
+    if (opt.mitsubaInverseRefinement && (!opt.guiMode || !opt.imagePaths.empty()) &&
+        opt.imagePaths.size() < kMinMitsubaRefinementImages) {
+        die("--mitsuba-inverse requires at least 6 images.");
+    }
+    if (opt.mitsubaInverseRefinement && opt.shadowHeightRefinement) {
+        die("Choose either --mitsuba-inverse or --shadow-height-refinement, not both.");
     }
     if (opt.hasCrop && (opt.crop.width <= 0 || opt.crop.height <= 0)) {
         die("--crop width and height must be positive.");
@@ -363,6 +449,12 @@ Options parseArgs(int argc, char** argv) {
     if (!std::isfinite(opt.pixelScaleMm) || opt.pixelScaleMm < 0.0) {
         die("--pixel-scale-mm must be non-negative. Use 0 to auto-read TIFF tags when possible.");
     }
+    if (!std::isfinite(opt.shadowReferenceZMm)) {
+        die("--shadow-reference-z-mm must be finite.");
+    }
+    if (!std::isfinite(opt.shadowLedDiameterMm) || opt.shadowLedDiameterMm < 0.0) {
+        die("--shadow-led-diameter-mm must be finite and non-negative.");
+    }
     if (opt.lightingModel == LightingModel::NearFieldRing) {
         if (opt.uncalibratedLighting) {
             die("--near-field-ring cannot be combined with --uncalibrated.");
@@ -370,6 +462,9 @@ Options parseArgs(int argc, char** argv) {
         if (!std::isfinite(opt.ringLightRadiusMm) || opt.ringLightRadiusMm <= 0.0 ||
             !std::isfinite(opt.ringLightHeightMm) || opt.ringLightHeightMm <= 0.0) {
             die("--near-field-ring radius and height must be positive finite values.");
+        }
+        if (opt.shadowHeightRefinement && opt.shadowReferenceZMm >= opt.ringLightHeightMm) {
+            die("--shadow-reference-z-mm must be below the ring-light height.");
         }
     }
     if (opt.integrationIterations < 0) {
@@ -392,6 +487,15 @@ Options parseArgs(int argc, char** argv) {
     }
     if (!opt.meshPath.empty() || !opt.printableMeshPath.empty()) {
         opt.calculateHeight = true;
+    }
+    if (opt.shadowHeightRefinement && !opt.calculateHeight) {
+        die("--shadow-height-refinement cannot be combined with --no-height.");
+    }
+    if (opt.mitsubaInverseRefinement && !opt.calculateHeight) {
+        die("--mitsuba-inverse cannot be combined with --no-height.");
+    }
+    if (opt.printableFillHoles && opt.printableMeshPath.empty()) {
+        die("--printable-fill-holes requires --printable-mesh.");
     }
 
     const float viewNorm = std::sqrt(opt.viewDir.dot(opt.viewDir));

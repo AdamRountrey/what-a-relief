@@ -6,9 +6,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repo = Split-Path -Parent $PSScriptRoot
-$appName = "What A Relief"
+$appName = "what-a-relief"
 $exeName = "what-a-relief.exe"
-$publisher = "What A Relief Contributors"
+$publisher = "what-a-relief Contributors"
 $buildOut = Join-Path $repo "build-vcpkg-direct"
 $share = Join-Path $repo "build\ninja-vcpkg\vcpkg_installed\x64-windows\share"
 $dist = Join-Path $repo "dist"
@@ -66,7 +66,7 @@ function Write-ThirdPartyLicenseBundle {
         @{ Package = "zlib"; Display = "zlib" }
     )
 
-    Set-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Third-party license notices for the What A Relief Windows runtime package."
+    Set-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Third-party license notices for the what-a-relief Windows runtime package."
     Add-Content -LiteralPath $OutputPath -Encoding UTF8 -Value "Generated from vcpkg package copyright files."
     foreach ($package in $packages) {
         Add-LicenseSection -OutputPath $OutputPath -ShareDir $ShareDir -PackageName $package.Package -DisplayName $package.Display
@@ -96,6 +96,13 @@ Copy-Item -LiteralPath (Join-Path $repo "SECURITY.md") -Destination $payload -Fo
 Copy-Item -LiteralPath (Join-Path $repo "AI_ATTRIBUTION.md") -Destination $payload -Force
 Copy-Item -LiteralPath (Join-Path $repo "THIRD_PARTY_NOTICES.md") -Destination $payload -Force
 Copy-Item -LiteralPath (Join-Path $repo "docs\algorithm.md") -Destination (Join-Path $payload "ALGORITHM.md") -Force
+foreach ($backendFile in @("mitsuba_worker.py", "mitsuba_requirements.lock.txt", "MITSUBA_BACKEND.md")) {
+    $path = Join-Path $buildOut $backendFile
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "Required optional-backend interface file not found: $path"
+    }
+    Copy-Item -LiteralPath $path -Destination $payload -Force
+}
 if (Test-Path (Join-Path $buildOut "models")) {
     Copy-Item -Path (Join-Path $buildOut "models\*") -Destination $payload -Force
 }
@@ -138,6 +145,7 @@ using System.Windows.Forms;
 
 internal static class InstallerStub {
     private const string AppName = "$appName";
+    private const string LegacyAppName = "What A Relief";
     private const string ExeName = "$exeName";
     private const string Version = "$Version";
     private const string Publisher = "$publisher";
@@ -215,8 +223,18 @@ internal static class InstallerStub {
     }
 
     private static void InstallPayload(string tempDir) {
-        string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", AppName);
-        string startMenuDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Microsoft", "Windows", "Start Menu", "Programs", AppName);
+        string localProgramsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs");
+        string startMenuProgramsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Microsoft", "Windows", "Start Menu", "Programs");
+        string installDir = Path.Combine(localProgramsDir, AppName);
+        string startMenuDir = Path.Combine(startMenuProgramsDir, AppName);
+        string legacyInstallDir = Path.Combine(localProgramsDir, LegacyAppName);
+        string legacyStartMenuDir = Path.Combine(startMenuProgramsDir, LegacyAppName);
+        bool migrateLegacyInstall = IsRecognizedLegacyInstall(legacyInstallDir);
+        if (migrateLegacyInstall && IsFileLocked(Path.Combine(legacyInstallDir, ExeName))) {
+            throw new InvalidOperationException(
+                "An older " + AppName + " window is still running. Close it, then run this installer again.");
+        }
+
         Directory.CreateDirectory(installDir);
         Directory.CreateDirectory(startMenuDir);
 
@@ -243,19 +261,82 @@ internal static class InstallerStub {
         WriteUninstaller(installDir, startMenuDir);
         CreateShortcut(Path.Combine(startMenuDir, AppName + ".lnk"), Path.Combine(installDir, ExeName), installDir);
         RegisterUninstall(installDir);
+        RemoveLegacyArtifacts(legacyInstallDir, legacyStartMenuDir, migrateLegacyInstall);
+    }
+
+    private static bool IsRecognizedLegacyInstall(string legacyInstallDir) {
+        return !PathsEqual(legacyInstallDir, Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", AppName)) &&
+            File.Exists(Path.Combine(legacyInstallDir, ExeName)) &&
+            File.Exists(Path.Combine(legacyInstallDir, "uninstall.ps1"));
+    }
+
+    private static bool IsFileLocked(string path) {
+        try {
+            using (FileStream stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None)) { }
+            return false;
+        } catch (IOException) {
+            return true;
+        } catch (UnauthorizedAccessException) {
+            return true;
+        }
+    }
+
+    private static bool PathsEqual(string left, string right) {
+        return string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void RemoveLegacyArtifacts(string legacyInstallDir, string legacyStartMenuDir, bool removeInstallDir) {
+        if (removeInstallDir && Directory.Exists(legacyInstallDir)) {
+            try {
+                Directory.Delete(legacyInstallDir, true);
+            } catch (IOException ex) {
+                throw new InvalidOperationException(
+                    "The current version was installed, but the older installation could not be removed. " +
+                    "Close any running " + AppName + " windows and run the installer again.", ex);
+            } catch (UnauthorizedAccessException ex) {
+                throw new InvalidOperationException(
+                    "The current version was installed, but the older installation could not be removed. " +
+                    "Close any running " + AppName + " windows and run the installer again.", ex);
+            }
+        }
+
+        if (Directory.Exists(legacyStartMenuDir)) {
+            foreach (string shortcutName in new[] { LegacyAppName + ".lnk", AppName + ".lnk" }) {
+                string shortcutPath = Path.Combine(legacyStartMenuDir, shortcutName);
+                try { File.Delete(shortcutPath); } catch { }
+            }
+            try {
+                if (Directory.GetFileSystemEntries(legacyStartMenuDir).Length == 0) {
+                    Directory.Delete(legacyStartMenuDir, false);
+                }
+            } catch { }
+        }
+
+        using (RegistryKey legacyKey = Registry.CurrentUser.OpenSubKey(
+                   @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + LegacyAppName)) {
+            string registeredLocation = legacyKey == null ? null : legacyKey.GetValue("InstallLocation") as string;
+            if (!string.IsNullOrWhiteSpace(registeredLocation) && PathsEqual(registeredLocation, legacyInstallDir)) {
+                Registry.CurrentUser.DeleteSubKeyTree(
+                    @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + LegacyAppName, false);
+            }
+        }
     }
 
     private static void WriteUninstaller(string installDir, string startMenuDir) {
         string uninstallScript = @"`$ErrorActionPreference = ""Stop""
 `$installDir = Split-Path -Parent `$MyInvocation.MyCommand.Path
-`$expectedInstallDir = Join-Path `$env:LOCALAPPDATA ""Programs\What A Relief""
+`$expectedInstallDir = Join-Path `$env:LOCALAPPDATA ""Programs\what-a-relief""
 `$actual = [IO.Path]::GetFullPath(`$installDir).TrimEnd('\')
 `$expected = [IO.Path]::GetFullPath(`$expectedInstallDir).TrimEnd('\')
 if (`$actual -ne `$expected) {
     throw ""Refusing to uninstall from unexpected directory: `$installDir""
 }
 `$startMenuDir = """ + startMenuDir.Replace("\"", "\\") + @"""
-`$uninstallKey = ""HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\What A Relief""
+`$uninstallKey = ""HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\what-a-relief""
 Remove-Item -LiteralPath `$startMenuDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath `$uninstallKey -Recurse -Force -ErrorAction SilentlyContinue
 `$cmd = ""/c timeout /t 1 /nobreak > nul & rmdir /s /q """""" + `$installDir + """"""""
@@ -293,7 +374,7 @@ Start-Process -FilePath `$env:ComSpec -ArgumentList `$cmd -WindowStyle Hidden
 
     private static void RegisterUninstall(string installDir) {
         string uninstallScript = Path.Combine(installDir, "uninstall.ps1");
-        using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\What A Relief")) {
+        using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\what-a-relief")) {
             key.SetValue("DisplayName", AppName);
             key.SetValue("DisplayVersion", Version);
             key.SetValue("Publisher", Publisher);

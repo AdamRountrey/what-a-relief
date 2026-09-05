@@ -88,12 +88,12 @@ set PATH=C:\Program Files\Git\cmd;C:\Program Files\Git\bin;%PATH%
 call "$VsDevCmd" -arch=x64
 "$CMake" --preset ninja-vcpkg -DWHAT_A_RELIEF_VERSION_STRING="$Version"
 if errorlevel 1 exit /b %errorlevel%
-"$CMake" --build --preset ninja-vcpkg-release --target what-a-relief what-a-relief-tests what-a-relief-io-tests what-a-relief-fixture-generator what-a-relief-benchmark what-a-relief-output-benchmark
+"$CMake" --build --preset ninja-vcpkg-release --target what-a-relief what-a-relief-tests what-a-relief-io-tests what-a-relief-fixture-generator what-a-relief-fake-mitsuba what-a-relief-mitsuba-contract-tests what-a-relief-benchmark what-a-relief-output-benchmark
 if errorlevel 1 exit /b %errorlevel%
 "$ctest" --test-dir "$build" --output-on-failure
 if errorlevel 1 exit /b %errorlevel%
 cl /nologo /std:c++17 /EHsc /O2 /DNDEBUG /W4 /permissive- /DWHAT_A_RELIEF_VERSION=\"$Version\" /external:W0 /external:I"$build\vcpkg_installed\x64-windows\include\opencv4" ^
-  "$repo\src\args.cpp" "$repo\src\checked_io.cpp" "$repo\src\crop_ui.cpp" "$repo\src\gui_workflow.cpp" "$repo\src\image_io.cpp" "$repo\src\main.cpp" "$repo\src\mask_ui.cpp" "$repo\src\neural_fusion.cpp" "$repo\src\photometric.cpp" "$repo\src\radiometry.cpp" "$repo\src\relight_ui.cpp" "$repo\src\run_manifest.cpp" "$repo\src\rti_export.cpp" "$repo\src\scale_ui.cpp" "$repo\src\sphere_ui.cpp" ^
+  "$repo\src\args.cpp" "$repo\src\checked_io.cpp" "$repo\src\crop_ui.cpp" "$repo\src\gui_workflow.cpp" "$repo\src\image_io.cpp" "$repo\src\main.cpp" "$repo\src\mask_ui.cpp" "$repo\src\mitsuba_backend.cpp" "$repo\src\neural_fusion.cpp" "$repo\src\photometric.cpp" "$repo\src\radiometry.cpp" "$repo\src\relight_ui.cpp" "$repo\src\run_manifest.cpp" "$repo\src\rti_export.cpp" "$repo\src\scale_ui.cpp" "$repo\src\shadow_refinement.cpp" "$repo\src\sphere_ui.cpp" ^
   /Fe:"$out\what-a-relief.exe" /Fo:"$obj\\" ^
   /link /MANIFEST:NO /LIBPATH:"$build\vcpkg_installed\x64-windows\lib" ^
   opencv_highgui4.lib opencv_videoio4.lib opencv_imgcodecs4.lib opencv_imgproc4.lib opencv_dnn4.lib opencv_core4.lib comdlg32.lib shell32.lib ole32.lib user32.lib gdi32.lib comctl32.lib
@@ -112,6 +112,9 @@ New-Item -ItemType Directory -Force $modelOutDir | Out-Null
 Get-ChildItem -Path (Join-Path $repo "assets\models") -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $modelOutDir $_.Name) -Force
 }
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\worker.py") -Destination (Join-Path $out "mitsuba_worker.py") -Force
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\requirements.lock.txt") -Destination (Join-Path $out "mitsuba_requirements.lock.txt") -Force
+Copy-Item -LiteralPath (Join-Path $repo "tools\mitsuba_backend\README.md") -Destination (Join-Path $out "MITSUBA_BACKEND.md") -Force
 
 Write-Host "Built $out\what-a-relief.exe"
 Write-Host "Run with this DLL path first:"

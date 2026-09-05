@@ -34,6 +34,13 @@ foreach ($doc in @("README.md", "LICENSE", "SECURITY.md", "AI_ATTRIBUTION.md", "
     Copy-Item -LiteralPath $path -Destination $stage
 }
 Copy-Item -LiteralPath (Join-Path $repo "docs\algorithm.md") -Destination (Join-Path $stage "ALGORITHM.md")
+foreach ($backendFile in @("mitsuba_worker.py", "mitsuba_requirements.lock.txt", "MITSUBA_BACKEND.md")) {
+    $path = Join-Path $source $backendFile
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "Required optional-backend interface file not found: $path"
+    }
+    Copy-Item -LiteralPath $path -Destination $stage
+}
 $models = Join-Path $source "models"
 if (-not (Test-Path -LiteralPath $models)) {
     throw "Bundled model directory not found: $models"
@@ -45,7 +52,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {
     $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
-    foreach ($required in @("what-a-relief.exe", "README.md", "THIRD_PARTY_LICENSES.txt", "models/psfcn_3_normalize.onnx", "models/psfcn_25_normalize.onnx")) {
+    foreach ($required in @("what-a-relief.exe", "README.md", "THIRD_PARTY_LICENSES.txt", "mitsuba_worker.py", "mitsuba_requirements.lock.txt", "MITSUBA_BACKEND.md", "models/psfcn_3_normalize.onnx", "models/psfcn_25_normalize.onnx")) {
         if ($entries -notcontains $required) {
             throw "Portable archive is missing $required"
         }

@@ -22,10 +22,14 @@ cv::Vec3f normalized(const cv::Vec3f& value) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) {
-            throw std::runtime_error("Usage: fixture-generator output-directory");
+        if (argc != 2 && argc != 3) {
+            throw std::runtime_error("Usage: fixture-generator output-directory [.png|.tif]");
         }
         const fs::path root(argv[1]);
+        const std::string imageExtension = argc == 3 ? argv[2] : ".png";
+        if (imageExtension != ".png" && imageExtension != ".tif") {
+            throw std::runtime_error("Fixture image extension must be .png or .tif");
+        }
         fs::remove_all(root);
         fs::create_directories(root / "inputs");
 
@@ -63,7 +67,7 @@ int main(int argc, char** argv) {
                     row[x] = static_cast<unsigned short>(std::clamp(std::round(intensity * 60000.0), 0.0, 65535.0));
                 }
             }
-            writeImageChecked(root / "inputs" / ("image_" + std::to_string(i) + ".png"), image);
+            writeImageChecked(root / "inputs" / ("image_" + std::to_string(i) + imageExtension), image);
         }
 
         CheckedOutputFile lightsFile(root / "light_vectors.csv");

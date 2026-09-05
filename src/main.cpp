@@ -1,16 +1,19 @@
 #include "args.hpp"
 #include "gui_workflow.hpp"
 #include "image_io.hpp"
+#include "mitsuba_backend.hpp"
 #include "neural_fusion.hpp"
 #include "photometric.hpp"
 #include "relight_ui.hpp"
 #include "run_manifest.hpp"
 #include "rti_export.hpp"
+#include "shadow_refinement.hpp"
 #include "sphere_ui.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -110,7 +113,8 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     const RunManifestContext runManifest = beginRunManifest(opt);
 
     reportStage(progress, "[1/6] Loading images...", 5);
-    const std::vector<cv::Mat> images = loadLuminanceImages(opt.imagePaths, opt.srgb);
+    std::vector<cv::Mat> saturationMasks;
+    const std::vector<cv::Mat> images = loadLuminanceImages(opt.imagePaths, opt.srgb, &saturationMasks);
     reportStage(progress, "[2/6] Loading mask...", 15);
     cv::Mat mask = loadMask(opt.maskPath, images[0].size());
     if (opt.hasCrop) {
@@ -119,6 +123,14 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
                   << " width=" << opt.crop.width
                   << " height=" << opt.crop.height << std::endl;
         applyCropToMask(mask, opt.crop);
+    }
+    cv::Point2d lightingCenter(
+        static_cast<double>(images[0].cols - 1) * 0.5,
+        static_cast<double>(images[0].rows - 1) * 0.5);
+    if (opt.hasCrop) {
+        lightingCenter = cv::Point2d(
+            static_cast<double>(opt.crop.x) + static_cast<double>(opt.crop.width - 1) * 0.5,
+            static_cast<double>(opt.crop.y) + static_cast<double>(opt.crop.height - 1) * 0.5);
     }
 
     reportStage(progress, opt.uncalibratedLighting ? "[3/6] Preparing unknown-lighting solve..." : "[3/6] Estimating light directions...", 25);
@@ -176,6 +188,9 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     cv::Mat geometryNormalMap;
     cv::Mat geometryValidMask;
     PhotometricDiagnostics diagnostics;
+    diagnostics.collectObservationMasks = !opt.uncalibratedLighting &&
+        opt.solverMode == NormalSolverMode::Robust &&
+        (opt.specularDiagnostics || opt.shadowHeightRefinement);
     if (opt.uncalibratedLighting) {
         solveUncalibratedPhotometricStereo(
             images,
@@ -195,14 +210,6 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
         std::cout << "      solved mask coverage: "
                   << (100.0 * diagnostics.solvedFraction) << "%" << std::endl;
     } else {
-        cv::Point2d lightingCenter(
-            static_cast<double>(images[0].cols - 1) * 0.5,
-            static_cast<double>(images[0].rows - 1) * 0.5);
-        if (opt.hasCrop) {
-            lightingCenter = cv::Point2d(
-                static_cast<double>(opt.crop.x) + static_cast<double>(opt.crop.width - 1) * 0.5,
-                static_cast<double>(opt.crop.y) + static_cast<double>(opt.crop.height - 1) * 0.5);
-        }
         if (opt.lightingModel == LightingModel::NearFieldRing) {
             std::cout << "      using near-field ring light model radius=" << opt.ringLightRadiusMm
                       << " mm height=" << opt.ringLightHeightMm
@@ -225,7 +232,8 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
             albedo,
             residual,
             validMask,
-            diagnostics);
+            diagnostics,
+            saturationMasks);
         std::cout << "      light geometry condition number: "
                   << diagnostics.lightingConditionNumber << std::endl;
         std::cout << "      solved mask coverage: "
@@ -293,6 +301,37 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
                 std::cout << "      applying " << heightFlattenName(opt.heightFlattenMode) << std::endl;
                 applyHeightFlattening(height, heightMask, opt.heightFlattenMode);
             }
+            if (opt.shadowHeightRefinement) {
+                reportStage(progress, "Refining broad height from global cast-shadow consistency...", 82);
+                ShadowRefinementSettings settings;
+                settings.lightingModel = opt.lightingModel;
+                settings.ringLightRadiusMm = opt.ringLightRadiusMm;
+                settings.ringLightHeightMm = opt.ringLightHeightMm;
+                settings.pixelScaleMm = opt.pixelScaleMm;
+                settings.referenceSurfaceZMm = opt.shadowReferenceZMm;
+                settings.ledDiameterMm = opt.shadowLedDiameterMm;
+                settings.lightingCenter = lightingCenter;
+                refineHeightFromCastShadows(
+                    height,
+                    heightMask,
+                    heightMask,
+                    geometryNormalMap.empty() ? normalMap : geometryNormalMap,
+                    images,
+                    lights,
+                    settings,
+                    diagnostics,
+                    [&](const std::string& message) {
+                        reportDetail(progress, message, 83);
+                    });
+                std::cout << "      shadow-height decision: "
+                          << diagnostics.shadowHeightRefinementDecision;
+                if (diagnostics.shadowMismatchRateBefore >= 0.0) {
+                    std::cout << ", balanced mismatch "
+                              << diagnostics.shadowMismatchRateBefore << " -> "
+                              << diagnostics.shadowMismatchRateAfter;
+                }
+                std::cout << std::endl;
+            }
             if (!opt.meshPath.empty()) {
                 std::cout << "      PLY mesh will be written to: " << opt.meshPath << std::endl;
             }
@@ -324,14 +363,38 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
         });
 
     if (opt.exportRti) {
-        reportStage(progress, "Writing RTI package...", 92);
+        reportStage(progress, "Writing RTI package...", 89);
         exportRtiPackage(
             opt,
             lights,
             images[0].size(),
             [&](const std::string& message) {
-                reportDetail(progress, message, 95);
+                reportDetail(progress, message, 91);
             });
+    }
+
+    if (opt.mitsubaInverseRefinement) {
+        reportStage(progress, "Running experimental Mitsuba inverse geometry refinement...", 92);
+        runMitsubaInverseRefinement(
+            opt,
+            lights,
+            images,
+            albedo,
+            height,
+            heightMask.empty() ? validMask : heightMask,
+            diagnostics,
+            [&](const std::string& message, int backendPercent) {
+                const int mappedPercent = 92 + (7 * std::clamp(backendPercent, 0, 100)) / 100;
+                std::cout << "      " << message << std::endl;
+                if (opt.guiMode) {
+                    updateGuiProgress(message, mappedPercent);
+                } else if (progress) {
+                    progress(message, mappedPercent);
+                }
+            },
+            opt.guiMode
+                ? std::function<bool()>([]() { return guiProgressCancellationRequested(); })
+                : std::function<bool()>());
     }
 
     completeRunManifest(opt, runManifest, lights, diagnostics);
@@ -365,6 +428,9 @@ int main(int argc, char** argv) {
             opt.guiMode
                 ? ProgressCallback([](const std::string& message, int percent) {
                       updateGuiProgress(message, percent);
+                      if (guiProgressCancellationRequested()) {
+                          throw std::runtime_error("Processing canceled by user.");
+                      }
                   })
                 : ProgressCallback());
         if (progressShown) {
@@ -380,7 +446,7 @@ int main(int argc, char** argv) {
         if (progressShown) {
             closeGuiProgress();
         }
-        if (guiMode) {
+        if (guiMode && std::string(e.what()) != "Processing canceled by user.") {
             showGuiInfo("what-a-relief Error", e.what());
         }
         return 1;

@@ -1,6 +1,6 @@
 # Security
 
-What A Relief is a local desktop and command-line tool. It does not intentionally make network requests at runtime.
+what-a-relief is a local desktop and command-line tool. It does not intentionally make network requests at runtime.
 
 ## Supported Use
 

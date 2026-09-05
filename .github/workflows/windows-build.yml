@@ -39,6 +39,7 @@ jobs:
             .vcpkg-downloads
             .vcpkg-registries
             build/ninja-vcpkg/vcpkg_installed
+            dist/mitsuba-backend-cache
           key: windows-vcpkg-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', 'CMakePresets.json') }}
           restore-keys: |
             windows-vcpkg-
@@ -54,6 +55,7 @@ jobs:
           .\scripts\package-vcpkg-runtime.ps1
           .\scripts\build-windows-installer.ps1 -SkipBuild -Version $version
           .\scripts\build-portable-windows.ps1 -Version $version
+          .\scripts\build-mitsuba-backend-installer.ps1 -Version $version
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
           $notesFile = "docs/release-notes/v$version.md"
           if (Test-Path $notesFile) {
@@ -69,6 +71,7 @@ jobs:
           path: |
             dist/what-a-relief-${{ env.RELEASE_VERSION }}-setup.exe
             dist/what-a-relief-${{ env.RELEASE_VERSION }}-portable-windows.zip
+            dist/what-a-relief-${{ env.RELEASE_VERSION }}-mitsuba-backend-setup.exe
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -80,7 +83,8 @@ jobs:
             'release', 'create', $env:GITHUB_REF_NAME,
             "dist\what-a-relief-$env:RELEASE_VERSION-setup.exe",
             "dist\what-a-relief-$env:RELEASE_VERSION-portable-windows.zip",
-            '--title', "What A Relief $env:GITHUB_REF_NAME"
+            "dist\what-a-relief-$env:RELEASE_VERSION-mitsuba-backend-setup.exe",
+            '--title', "what-a-relief $env:GITHUB_REF_NAME"
           )
           if ($env:RELEASE_PRERELEASE -eq 'True') {
             $args += '--prerelease'
@@ -88,6 +92,6 @@ jobs:
           if ($env:RELEASE_NOTES_FILE) {
             $args += @('--notes-file', $env:RELEASE_NOTES_FILE)
           } else {
-            $args += @('--notes', 'Windows installer and portable build for What A Relief.')
+            $args += @('--notes', 'Windows installer, portable build, and optional self-contained Mitsuba backend for what-a-relief.')
           }
           gh @args

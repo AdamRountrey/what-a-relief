@@ -31,7 +31,8 @@ list(APPEND app_arguments
     --height-flatten none
     --pixel-scale-mm 0.1
     --mesh "${mesh_path}"
-    --printable-mesh "${printable_path}")
+    --printable-mesh "${printable_path}"
+    --printable-fill-holes)
 if(UNCALIBRATED)
     list(APPEND app_arguments --uncalibrated)
 else()
@@ -43,6 +44,9 @@ else()
 endif()
 if(ENABLE_NEURAL)
     list(APPEND app_arguments --neural-fusion --neural-max-side 64)
+endif()
+if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
+    list(APPEND app_arguments --specular-diagnostics --shadow-height-refinement)
 endif()
 
 execute_process(
@@ -81,12 +85,33 @@ set(required_outputs
     "${output_dir}/normal_rgb.png"
     "${output_dir}/albedo.png"
     "${output_dir}/height.pfm"
+    "${output_dir}/printable_fill_mask.png"
     "${mesh_path}"
     "${printable_path}")
 if(NOT UNCALIBRATED)
     list(APPEND required_outputs
+        "${output_dir}/robust_weight.png"
+        "${output_dir}/robust_unsupported_mask.png"
+        "${output_dir}/robust_inlier_count.png"
+        "${output_dir}/robust_local_condition.png"
+        "${output_dir}/shadow_count.png"
+        "${output_dir}/highlight_outlier_count.png"
+        "${output_dir}/saturation_count.png"
+        "${output_dir}/model_mismatch_count.png"
         "${rti_dir}/info.json"
         "${rti_dir}/rti_manifest.json")
+endif()
+if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
+    list(APPEND required_outputs
+        "${output_dir}/specular_cue_mask.png"
+        "${output_dir}/shadow_height_correction.png"
+        "${output_dir}/shadow_height_correction.pfm"
+        "${output_dir}/shadow_constraint_count.png"
+        "${output_dir}/shadow_mismatch_before.png"
+        "${output_dir}/shadow_mismatch_after.png"
+        "${output_dir}/robust_observations/light_001_shadow.png"
+        "${output_dir}/robust_observations/light_001_highlight.png"
+        "${output_dir}/robust_observations/light_001_saturation.png")
 endif()
 if(ENABLE_NEURAL)
     list(APPEND required_outputs
@@ -121,6 +146,18 @@ endif()
 string(JSON manifest_coverage GET "${manifest}" diagnostics solved_fraction)
 if(manifest_coverage LESS 0.98 OR manifest_coverage GREATER 1.0)
     message(FATAL_ERROR "End-to-end workflow solve coverage was ${manifest_coverage}, expected 0.98 to 1.0")
+endif()
+if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
+    string(JSON shadow_refinement_type TYPE
+        "${manifest}" diagnostics shadow_height_refinement)
+    if(NOT shadow_refinement_type STREQUAL "OBJECT")
+        message(FATAL_ERROR "Calibrated workflow manifest omitted shadow-height diagnostics")
+    endif()
+    string(JSON shadow_refinement_parameter GET
+        "${manifest}" parameters shadow_height_refinement)
+    if(NOT shadow_refinement_parameter)
+        message(FATAL_ERROR "Calibrated workflow manifest did not record shadow-height refinement")
+    endif()
 endif()
 if(UNCALIBRATED)
     string(JSON condition_type TYPE "${manifest}" diagnostics lighting_condition_number)

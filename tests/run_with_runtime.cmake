@@ -6,8 +6,16 @@ if(DEFINED RUNTIME_DIRECTORY)
     set(ENV{PATH} "${RUNTIME_DIRECTORY};$ENV{PATH}")
 endif()
 
+set(test_arguments)
+if(DEFINED TEST_ARGUMENT_1)
+    list(APPEND test_arguments "${TEST_ARGUMENT_1}")
+endif()
+if(DEFINED TEST_ARGUMENT_2)
+    list(APPEND test_arguments "${TEST_ARGUMENT_2}")
+endif()
+
 execute_process(
-    COMMAND "${TEST_EXECUTABLE}"
+    COMMAND "${TEST_EXECUTABLE}" ${test_arguments}
     RESULT_VARIABLE test_result)
 
 if(NOT test_result EQUAL 0)

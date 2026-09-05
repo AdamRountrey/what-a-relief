@@ -1,5 +1,6 @@
 #include "checked_io.hpp"
 #include "image_io.hpp"
+#include "photometric.hpp"
 #include "run_manifest.hpp"
 #include "rti_export.hpp"
 
@@ -565,6 +566,14 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
         opt.imagePaths.push_back(path.string());
     }
     writeImageChecked(root / "output" / "height.png", makePattern(3, 3, 0));
+    fs::create_directories(root / "output" / "robust_observations");
+    writeImageChecked(
+        root / "output" / "robust_observations" / "light_001_shadow.png",
+        makePattern(3, 3, 0));
+    {
+        std::ofstream userFile(root / "output" / "robust_observations" / "notes.txt");
+        userFile << "preserve me\n";
+    }
     fs::create_directories(root / "output" / "rti");
     {
         std::ofstream staleRti(root / "output" / "rti" / "rti_manifest.json");
@@ -581,6 +590,10 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
     context.check(
         !fs::exists(root / "output" / "rti"),
         "a run with RTI disabled must remove a stale app-owned default RTI package");
+    context.check(
+        !fs::exists(root / "output" / "robust_observations" / "light_001_shadow.png") &&
+            fs::is_regular_file(root / "output" / "robust_observations" / "notes.txt"),
+        "cleanup must remove generated observation masks without deleting unrelated files");
 
     const cv::Mat normals(12, 14, CV_32FC3, cv::Scalar(0.0f, 0.0f, 1.0f));
     const cv::Mat albedo(12, 14, CV_32F, cv::Scalar(0.6f));
@@ -612,6 +625,7 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
     context.check(
         complete.find("\"integration_iterations\": 800") != std::string::npos &&
             complete.find("\"printable_base_thickness_mm\": 2") != std::string::npos &&
+            complete.find("\"printable_fill_holes\": false") != std::string::npos &&
             complete.find("\"crop\": null") != std::string::npos,
         "run manifest must retain geometry parameters and explicit absent selections");
 
@@ -665,6 +679,74 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
     context.check(
         !fs::exists(root / "output" / "unsupported.no_such_codec"),
         "failed checked image writes must not leave a final artifact");
+    fs::remove_all(root);
+}
+
+void testNearFieldCalibrationMetadataRoundTrip(TestContext& context) {
+    const fs::path root = "io_near_field_metadata_test";
+    fs::remove_all(root);
+
+    Options opt;
+    opt.outputDir = (root / "output").string();
+    opt.calculateHeight = false;
+    opt.solverMode = NormalSolverMode::Standard;
+    opt.lightingModel = LightingModel::NearFieldRing;
+    opt.ringLightRadiusMm = 12.75;
+    opt.ringLightHeightMm = 8.25;
+    opt.pixelScaleMm = 0.0175;
+    opt.shadowLedDiameterMm = 0.65;
+    const std::vector<cv::Vec3f> lights = makeLights();
+    for (size_t i = 0; i < lights.size(); ++i) {
+        opt.imagePaths.push_back("calibration_" + std::to_string(i) + ".tif");
+    }
+
+    const cv::Mat normals(6, 7, CV_32FC3, cv::Scalar(0.0f, 0.0f, 1.0f));
+    const cv::Mat albedo(6, 7, CV_32F, cv::Scalar(0.6f));
+    const cv::Mat residual(6, 7, CV_32F, cv::Scalar(0.0f));
+    const cv::Mat mask(6, 7, CV_8U, cv::Scalar(255));
+    saveOutputs(opt, lights, {}, normals, albedo, residual, mask, {}, {}, {});
+
+    Options restored;
+    const fs::path lightsPath = root / "output" / "lights.csv";
+    const bool found = loadLightsFileMetadata(lightsPath.string(), restored);
+    context.check(found, "full lights.csv must expose reusable near-field metadata");
+    context.check(
+        restored.lightingModel == LightingModel::NearFieldRing &&
+            std::abs(restored.ringLightRadiusMm - opt.ringLightRadiusMm) < 1.0e-9 &&
+            std::abs(restored.ringLightHeightMm - opt.ringLightHeightMm) < 1.0e-9 &&
+            std::abs(restored.pixelScaleMm - opt.pixelScaleMm) < 1.0e-9 &&
+            std::abs(restored.shadowLedDiameterMm - opt.shadowLedDiameterMm) < 1.0e-9,
+        "near-field calibration reuse must restore ring geometry, image scale, and effective LED diameter");
+    fs::remove_all(root);
+}
+
+void testDefiniteSaturationLoading(TestContext& context) {
+    const fs::path root = "io_saturation_test";
+    fs::remove_all(root);
+    fs::create_directories(root);
+
+    cv::Mat image8 = (cv::Mat_<uchar>(2, 3) << 0, 254, 255, 64, 128, 200);
+    cv::Mat image16 = (cv::Mat_<unsigned short>(2, 3) <<
+        0, 4095, 65534, 1024, 32768, 65535);
+    const fs::path path8 = root / "eight_bit.png";
+    const fs::path path16 = root / "sixteen_bit.png";
+    writeImageChecked(path8, image8);
+    writeImageChecked(path16, image16);
+
+    std::vector<cv::Mat> saturationMasks;
+    const std::vector<cv::Mat> loaded = loadLuminanceImages(
+        {path8.string(), path16.string()},
+        false,
+        &saturationMasks);
+    context.check(loaded.size() == 2 && saturationMasks.size() == 2,
+        "luminance loading must return one definite-clipping mask per image");
+    context.check(
+        cv::countNonZero(saturationMasks[0]) == 1 && saturationMasks[0].at<uchar>(0, 2) == 255,
+        "8-bit loading must flag only the exact container maximum");
+    context.check(
+        cv::countNonZero(saturationMasks[1]) == 1 && saturationMasks[1].at<uchar>(1, 2) == 255 &&
+            saturationMasks[1].at<uchar>(0, 1) == 0,
+        "16-bit loading must flag 65535 but not a 12-bit ADC maximum stored in a wider container");
     fs::remove_all(root);
 }
 
@@ -810,6 +892,174 @@ void testPrintableMeshTopology(TestContext& context) {
     context.check(
         irregularEdgesClosed,
         "concave and internal printable PLY boundaries must remain watertight");
+
+    Options filledOpt = irregularOpt;
+    filledOpt.outputDir = (root / "filled").string();
+    filledOpt.meshPath.clear();
+    filledOpt.printableMeshPath = (root / "filled" / "printable_surface.ply").string();
+    filledOpt.printableFillHoles = true;
+    saveOutputs(
+        filledOpt,
+        lights,
+        {},
+        normals,
+        albedo,
+        residual,
+        irregularMask,
+        {},
+        height,
+        irregularMask);
+
+    const cv::Mat fillMask = cv::imread(
+        (root / "filled" / "printable_fill_mask.png").string(),
+        cv::IMREAD_GRAYSCALE);
+    context.check(!fillMask.empty(), "printable hole filling must write an audit mask");
+    context.check(
+        cv::countNonZero(fillMask) == 1 && fillMask.at<uchar>(3, 4) == 255,
+        "printable hole filling must fill the enclosed gap and preserve the boundary-connected notch");
+
+    const PlyData filledSolid = readBinaryPly(filledOpt.printableMeshPath);
+    context.check(
+        filledSolid.vertices.size() == irregularSolid.vertices.size() + 2,
+        "one reconstructed surface pixel must add paired top and bottom printable vertices");
+    const size_t filledTopCount = filledSolid.vertices.size() / 2;
+    bool foundFilledVertex = false;
+    const float expectedFilledZ = height.at<float>(3, 4) * static_cast<float>(filledOpt.pixelScaleMm);
+    for (size_t i = 0; i < filledTopCount; ++i) {
+        const cv::Vec3f& vertex = filledSolid.vertices[i];
+        if (std::abs(vertex[0] - 0.8f) < 1.0e-6f &&
+            std::abs(vertex[1] + 0.6f) < 1.0e-6f) {
+            foundFilledVertex = true;
+            context.check(
+                std::isfinite(vertex[2]) && std::abs(vertex[2] - expectedFilledZ) < 0.02f,
+                "reconstructed printable height must follow the surrounding synthetic surface");
+            break;
+        }
+    }
+    context.check(foundFilledVertex, "printable hole filling must add the enclosed surface vertex");
+
+    std::map<std::pair<std::int32_t, std::int32_t>, int> filledEdges;
+    for (const std::vector<std::int32_t>& face : filledSolid.faces) {
+        for (size_t i = 0; i < face.size(); ++i) {
+            const std::int32_t a = face[i];
+            const std::int32_t b = face[(i + 1) % face.size()];
+            ++filledEdges[{std::min(a, b), std::max(a, b)}];
+        }
+    }
+    const bool filledEdgesClosed = std::all_of(
+        filledEdges.begin(),
+        filledEdges.end(),
+        [](const auto& edge) { return edge.second == 2; });
+    context.check(filledEdgesClosed, "hole-filled printable PLY must remain watertight");
+    const long long filledEulerCharacteristic =
+        static_cast<long long>(filledSolid.vertices.size()) -
+        static_cast<long long>(filledEdges.size()) +
+        static_cast<long long>(filledSolid.faces.size());
+    context.check(
+        filledEulerCharacteristic == 2,
+        "filling the enclosed gap must produce a closed genus-zero printable solid");
+    fs::remove_all(root);
+}
+
+void testPrintableHoleFillSurface(TestContext& context) {
+    const fs::path root = "io_mesh_fill_test";
+    fs::remove_all(root);
+    constexpr int rows = 31;
+    constexpr int cols = 37;
+    constexpr float pixelScale = 0.1f;
+    cv::Mat height(rows, cols, CV_32F);
+    cv::Mat normals(rows, cols, CV_32FC3);
+    for (int y = 0; y < rows; ++y) {
+        float* hrow = height.ptr<float>(y);
+        cv::Vec3f* nrow = normals.ptr<cv::Vec3f>(y);
+        const float fy = 2.0f * static_cast<float>(3.14159265358979323846) * y / (rows - 1);
+        for (int x = 0; x < cols; ++x) {
+            const float fx = 2.0f * static_cast<float>(3.14159265358979323846) * x / (cols - 1);
+            hrow[x] = 0.025f * x + 0.018f * y + 0.22f * std::sin(fx) * std::cos(fy);
+            const float p = 0.025f +
+                0.22f * 2.0f * static_cast<float>(3.14159265358979323846) /
+                    (cols - 1) * std::cos(fx) * std::cos(fy);
+            const float q = 0.018f -
+                0.22f * 2.0f * static_cast<float>(3.14159265358979323846) /
+                    (rows - 1) * std::sin(fx) * std::sin(fy);
+            cv::Vec3f normal(-p, q, 1.0f);
+            nrow[x] = normal / std::sqrt(normal.dot(normal));
+        }
+    }
+
+    cv::Mat mask(rows, cols, CV_8U, cv::Scalar(255));
+    constexpr int holeLeft = 14;
+    constexpr int holeRight = 21;
+    constexpr int holeTop = 11;
+    constexpr int holeBottom = 17;
+    for (int y = holeTop; y <= holeBottom; ++y) {
+        for (int x = holeLeft; x <= holeRight; ++x) {
+            mask.at<uchar>(y, x) = 0;
+        }
+    }
+    for (int x = 0; x < 4; ++x) {
+        mask.at<uchar>(22, x) = 0;
+    }
+
+    Options opt;
+    opt.outputDir = (root / "output").string();
+    opt.calculateHeight = true;
+    opt.solverMode = NormalSolverMode::Standard;
+    opt.printableMeshPath = (root / "output" / "printable_surface.ply").string();
+    opt.printableFillHoles = true;
+    opt.pixelScaleMm = pixelScale;
+    const cv::Mat albedo(rows, cols, CV_32F, cv::Scalar(0.55f));
+    const cv::Mat residual(rows, cols, CV_32F, cv::Scalar(0.0f));
+    const std::vector<cv::Vec3f> lights = makeLights();
+    for (size_t i = 0; i < lights.size(); ++i) {
+        opt.imagePaths.push_back("synthetic_fill_input_" + std::to_string(i) + ".png");
+    }
+    saveOutputs(opt, lights, {}, normals, albedo, residual, mask, {}, height, mask);
+
+    const cv::Mat fillMask = cv::imread(
+        (root / "output" / "printable_fill_mask.png").string(),
+        cv::IMREAD_GRAYSCALE);
+    const int expectedFillPixels =
+        (holeRight - holeLeft + 1) * (holeBottom - holeTop + 1);
+    context.check(
+        !fillMask.empty() && cv::countNonZero(fillMask) == expectedFillPixels,
+        "smart filling must reconstruct every pixel in a wider enclosed gap");
+    context.check(
+        !fillMask.empty() && fillMask.at<uchar>(22, 2) == 0,
+        "smart filling must not reconstruct an exclusion connected to the image boundary");
+
+    const PlyData solid = readBinaryPly(opt.printableMeshPath);
+    const size_t topCount = solid.vertices.size() / 2;
+    std::vector<float> recovered(static_cast<size_t>(rows * cols),
+        std::numeric_limits<float>::quiet_NaN());
+    for (size_t i = 0; i < topCount; ++i) {
+        const int x = static_cast<int>(std::lround(solid.vertices[i][0] / pixelScale));
+        const int y = static_cast<int>(std::lround(-solid.vertices[i][1] / pixelScale));
+        if (x >= 0 && x < cols && y >= 0 && y < rows) {
+            recovered[static_cast<size_t>(y * cols + x)] = solid.vertices[i][2] / pixelScale;
+        }
+    }
+    double squaredError = 0.0;
+    int recoveredHolePixels = 0;
+    for (int y = holeTop; y <= holeBottom; ++y) {
+        for (int x = holeLeft; x <= holeRight; ++x) {
+            const float reconstructed = recovered[static_cast<size_t>(y * cols + x)];
+            if (std::isfinite(reconstructed)) {
+                const double error = reconstructed - height.at<float>(y, x);
+                squaredError += error * error;
+                ++recoveredHolePixels;
+            }
+        }
+    }
+    const double rmse = recoveredHolePixels > 0
+        ? std::sqrt(squaredError / recoveredHolePixels)
+        : std::numeric_limits<double>::infinity();
+    context.check(
+        recoveredHolePixels == expectedFillPixels && rmse < 0.025,
+        "slope-guided printable filling must approximate a smooth curved surface across a wider gap");
+    context.check(
+        !std::isfinite(recovered[static_cast<size_t>(22 * cols + 2)]),
+        "the printable top surface must preserve a boundary-connected notch");
     fs::remove_all(root);
 }
 
@@ -821,7 +1071,10 @@ int main() {
     testPtmReconstruction(context);
     testDeepZoomLayout(context);
     testRunManifestAndCheckedWrites(context);
+    testNearFieldCalibrationMetadataRoundTrip(context);
+    testDefiniteSaturationLoading(context);
     testPrintableMeshTopology(context);
+    testPrintableHoleFillSurface(context);
     if (context.failures != 0) {
         std::cerr << context.failures << " I/O/export regression check(s) failed.\n";
         return 1;

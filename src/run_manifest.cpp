@@ -3,10 +3,12 @@
 #include "checked_io.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -132,6 +134,38 @@ const char* rtiLayoutName(RtiLayoutMode mode) {
     }
 }
 
+const char* mitsubaBackendName(MitsubaBackendMode mode) {
+    switch (mode) {
+    case MitsubaBackendMode::Cuda:
+        return "cuda";
+    case MitsubaBackendMode::Cpu:
+        return "cpu";
+    case MitsubaBackendMode::Auto:
+    default:
+        return "auto";
+    }
+}
+
+const char* mitsubaQualityName(MitsubaQualityMode mode) {
+    switch (mode) {
+    case MitsubaQualityMode::Preview:
+        return "preview";
+    case MitsubaQualityMode::Research:
+        return "research";
+    case MitsubaQualityMode::Standard:
+    default:
+        return "standard";
+    }
+}
+
+void writeNullableNumber(std::ostream& out, double value) {
+    if (std::isfinite(value) && value >= 0.0) {
+        out << value;
+    } else {
+        out << "null";
+    }
+}
+
 void requireNonemptyFile(const fs::path& path, const std::string& description) {
     std::error_code error;
     if (!fs::is_regular_file(path, error) || error || fs::file_size(path, error) == 0 || error) {
@@ -153,6 +187,162 @@ void rejectInputImageCollision(const fs::path& output, const Options& opt) {
             throw std::runtime_error(
                 "Output would overwrite an input image; choose a different output folder: " + output.string());
         }
+    }
+}
+
+std::string observationMaskName(size_t lightIndex, const std::string& classification) {
+    std::ostringstream name;
+    name << "light_" << std::setw(3) << std::setfill('0') << (lightIndex + 1)
+         << '_' << classification << ".png";
+    return name.str();
+}
+
+bool isGeneratedObservationMaskName(const std::string& name) {
+    constexpr const char* prefix = "light_";
+    if (name.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const size_t classification = name.find('_', 6);
+    if (classification == std::string::npos || classification == 6) {
+        return false;
+    }
+    for (size_t i = 6; i < classification; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+            return false;
+        }
+    }
+    const std::string suffix = name.substr(classification);
+    return suffix == "_shadow.png" || suffix == "_highlight.png" ||
+        suffix == "_saturation.png";
+}
+
+void removeKnownObservationMasks(const Options& opt) {
+    const fs::path directory = fs::path(opt.outputDir) / "robust_observations";
+    std::error_code error;
+    if (!fs::exists(directory, error)) {
+        if (error) {
+            throw std::system_error(error, "Could not inspect robust observation output " + directory.string());
+        }
+        return;
+    }
+    if (!fs::is_directory(directory, error) || error) {
+        throw std::runtime_error(
+            "Robust observation output exists but is not a directory: " + directory.string());
+    }
+    for (const fs::directory_entry& entry : fs::directory_iterator(directory)) {
+        const bool regularFile = entry.is_regular_file(error);
+        if (error) {
+            throw std::system_error(error, "Could not inspect stale output " + entry.path().string());
+        }
+        if (!regularFile || !isGeneratedObservationMaskName(entry.path().filename().string())) {
+            continue;
+        }
+        rejectInputImageCollision(entry.path(), opt);
+        fs::remove(entry.path(), error);
+        if (error) {
+            throw std::system_error(error, "Could not remove stale output " + entry.path().string());
+        }
+    }
+    if (fs::is_empty(directory, error) && !error) {
+        fs::remove(directory, error);
+    }
+    if (error) {
+        throw std::system_error(error, "Could not clean robust observation output " + directory.string());
+    }
+}
+
+bool isGeneratedShadowRefinementMaskName(const std::string& name) {
+    if (name.rfind("light_", 0) != 0) {
+        return false;
+    }
+    const size_t suffix = name.find('_', 6);
+    if (suffix == std::string::npos || suffix == 6) {
+        return false;
+    }
+    for (size_t i = 6; i < suffix; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+            return false;
+        }
+    }
+    const std::string ending = name.substr(suffix);
+    return ending == "_observed_cast.png" || ending == "_predicted_before.png" ||
+        ending == "_predicted_after.png" || ending == "_evidence_confidence.png" ||
+        ending == "_probability_before.png" || ending == "_probability_after.png";
+}
+
+void removeKnownShadowRefinementMasks(const Options& opt) {
+    const fs::path directory = fs::path(opt.outputDir) / "shadow_refinement";
+    std::error_code error;
+    if (!fs::exists(directory, error)) {
+        if (error) {
+            throw std::system_error(error, "Could not inspect shadow refinement output " + directory.string());
+        }
+        return;
+    }
+    if (!fs::is_directory(directory, error) || error) {
+        throw std::runtime_error(
+            "Shadow refinement output exists but is not a directory: " + directory.string());
+    }
+    for (const fs::directory_entry& entry : fs::directory_iterator(directory)) {
+        const bool regularFile = entry.is_regular_file(error);
+        if (error) {
+            throw std::system_error(error, "Could not inspect stale output " + entry.path().string());
+        }
+        if (!regularFile || !isGeneratedShadowRefinementMaskName(entry.path().filename().string())) {
+            continue;
+        }
+        rejectInputImageCollision(entry.path(), opt);
+        fs::remove(entry.path(), error);
+        if (error) {
+            throw std::system_error(error, "Could not remove stale output " + entry.path().string());
+        }
+    }
+    if (fs::is_empty(directory, error) && !error) {
+        fs::remove(directory, error);
+    }
+    if (error) {
+        throw std::system_error(error, "Could not clean shadow refinement output " + directory.string());
+    }
+}
+
+bool fileContainsMitsubaMethodMarker(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    constexpr size_t kMaximumMarkerBytes = 1024 * 1024;
+    std::string text;
+    text.resize(kMaximumMarkerBytes);
+    in.read(text.data(), static_cast<std::streamsize>(text.size()));
+    text.resize(static_cast<size_t>(in.gcount()));
+    return text.find("mitsuba_heightfield_inverse_v1") != std::string::npos;
+}
+
+void removeKnownMitsubaDirectory(const Options& opt) {
+    const fs::path directory = fs::path(opt.outputDir) / "inverse";
+    std::error_code error;
+    if (!fs::exists(directory, error)) {
+        if (error) {
+            throw std::system_error(error, "Could not inspect inverse output " + directory.string());
+        }
+        return;
+    }
+    if (!fs::is_directory(directory, error) || error) {
+        throw std::runtime_error("Inverse output exists but is not a directory: " + directory.string());
+    }
+    const bool recognized = fileContainsMitsubaMethodMarker(directory / "result.json") ||
+        fileContainsMitsubaMethodMarker(directory / "job.json");
+    if (!recognized) {
+        if (opt.mitsubaInverseRefinement) {
+            throw std::runtime_error(
+                "The inverse output folder is not recognized as what-a-relief generated data. "
+                "Move it or choose a different output folder: " + directory.string());
+        }
+        return;
+    }
+    fs::remove_all(directory, error);
+    if (error) {
+        throw std::system_error(error, "Could not remove stale inverse output " + directory.string());
     }
 }
 
@@ -189,12 +379,26 @@ void removeKnownRunFiles(const Options& opt) {
         "fused_classical_confidence.png",
         "robust_weight.png",
         "robust_fallback_mask.png",
+        "robust_unsupported_mask.png",
+        "robust_inlier_count.png",
+        "robust_local_condition.png",
         "shadow_count.png",
         "highlight_outlier_count.png",
+        "saturation_count.png",
+        "model_mismatch_count.png",
         "specular_cue_mask.png",
         "height.png",
         "height.pfm",
         "height_mask.png",
+        "shadow_height_correction.png",
+        "shadow_height_correction.pfm",
+        "shadow_constraint_count.png",
+        "shadow_mismatch_before.png",
+        "shadow_mismatch_after.png",
+        "shadow_observability.png",
+        "shadow_edge_support.png",
+        "shadow_occluder_support.png",
+        "printable_fill_mask.png",
         "surface.ply",
         "printable_surface.ply"};
     for (const std::string& name : names) {
@@ -213,6 +417,9 @@ void removeKnownRunFiles(const Options& opt) {
             throw std::system_error(error, "Could not remove stale output " + path.string());
         }
     }
+    removeKnownObservationMasks(opt);
+    removeKnownShadowRefinementMasks(opt);
+    removeKnownMitsubaDirectory(opt);
 }
 
 std::vector<fs::path> expectedOutputFiles(const Options& opt) {
@@ -232,11 +439,23 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
     if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust) {
         paths.push_back(outputDir / "robust_weight.png");
         paths.push_back(outputDir / "robust_fallback_mask.png");
+        paths.push_back(outputDir / "robust_unsupported_mask.png");
+        paths.push_back(outputDir / "robust_inlier_count.png");
+        paths.push_back(outputDir / "robust_local_condition.png");
         paths.push_back(outputDir / "shadow_count.png");
         paths.push_back(outputDir / "highlight_outlier_count.png");
+        paths.push_back(outputDir / "saturation_count.png");
+        paths.push_back(outputDir / "model_mismatch_count.png");
     }
-    if (!opt.uncalibratedLighting && opt.specularDiagnostics) {
+    if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust &&
+        opt.specularDiagnostics) {
         paths.push_back(outputDir / "specular_cue_mask.png");
+        const fs::path observationDirectory = outputDir / "robust_observations";
+        for (size_t i = 0; i < opt.imagePaths.size(); ++i) {
+            paths.push_back(observationDirectory / observationMaskName(i, "shadow"));
+            paths.push_back(observationDirectory / observationMaskName(i, "highlight"));
+            paths.push_back(observationDirectory / observationMaskName(i, "saturation"));
+        }
     }
     if (opt.neuralFusion) {
         for (const std::string& prefix : {"fused", "classical", "neural"}) {
@@ -249,6 +468,28 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
         paths.push_back(outputDir / "neural_valid_mask.png");
         paths.push_back(outputDir / "fused_classical_confidence.png");
     }
+    if (opt.shadowHeightRefinement) {
+        paths.push_back(outputDir / "shadow_height_correction.png");
+        paths.push_back(outputDir / "shadow_height_correction.pfm");
+        paths.push_back(outputDir / "shadow_constraint_count.png");
+        paths.push_back(outputDir / "shadow_mismatch_before.png");
+        paths.push_back(outputDir / "shadow_mismatch_after.png");
+        paths.push_back(outputDir / "shadow_observability.png");
+        paths.push_back(outputDir / "shadow_edge_support.png");
+        paths.push_back(outputDir / "shadow_occluder_support.png");
+    }
+    if (opt.mitsubaInverseRefinement) {
+        const fs::path inverseDirectory = outputDir / "inverse";
+        for (const std::string& name : {
+                 "result.json", "job.json", "inverse_height.pfm", "inverse_height.png",
+                 "inverse_normal_rgb.png", "inverse_normal_x.png", "inverse_normal_y.png",
+                 "inverse_normal_z.png", "inverse_hillshade_ul.png", "inverse_surface.ply",
+                 "height_correction.pfm", "height_correction.png", "render_before.png",
+                 "render_after.png", "material_diffuse.png", "material_specular.png",
+                 "material_roughness.png"}) {
+            paths.push_back(inverseDirectory / name);
+        }
+    }
     if (opt.calculateHeight) {
         paths.push_back(outputDir / "height.png");
         paths.push_back(outputDir / "height.pfm");
@@ -259,6 +500,9 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
     }
     if (!opt.printableMeshPath.empty()) {
         paths.emplace_back(opt.printableMeshPath);
+        if (opt.printableFillHoles) {
+            paths.push_back(outputDir / "printable_fill_mask.png");
+        }
     }
     return paths;
 }
@@ -280,6 +524,31 @@ std::vector<fs::path> collectVerifiedOutputs(const Options& opt) {
         requireNonemptyFile(descriptor, "RTI descriptor");
         requireNonemptyFile(rtiPath / "rti_manifest.json", "RTI package manifest");
         for (const fs::directory_entry& entry : fs::recursive_directory_iterator(rtiPath)) {
+            if (entry.is_regular_file()) {
+                outputs.push_back(entry.path());
+            }
+        }
+    }
+    if (opt.shadowHeightRefinement) {
+        const fs::path shadowDirectory = fs::path(opt.outputDir) / "shadow_refinement";
+        std::error_code error;
+        if (fs::is_directory(shadowDirectory, error) && !error) {
+            for (const fs::directory_entry& entry : fs::directory_iterator(shadowDirectory)) {
+                if (entry.is_regular_file() &&
+                    isGeneratedShadowRefinementMaskName(entry.path().filename().string())) {
+                    requireNonemptyFile(entry.path(), "shadow refinement audit image");
+                    outputs.push_back(entry.path());
+                }
+            }
+        }
+    }
+    if (opt.mitsubaInverseRefinement) {
+        const fs::path inverseDirectory = fs::path(opt.outputDir) / "inverse";
+        std::error_code error;
+        if (!fs::is_directory(inverseDirectory, error) || error) {
+            throw std::runtime_error("Mitsuba inverse output directory was not written: " + inverseDirectory.string());
+        }
+        for (const fs::directory_entry& entry : fs::recursive_directory_iterator(inverseDirectory)) {
             if (entry.is_regular_file()) {
                 outputs.push_back(entry.path());
             }
@@ -380,6 +649,8 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"pixel_scale_mm_per_pixel\": " << opt.pixelScaleMm << ",\n";
     out << "    \"ring_radius_mm\": " << opt.ringLightRadiusMm << ",\n";
     out << "    \"ring_height_mm\": " << opt.ringLightHeightMm << ",\n";
+    out << "    \"shadow_reference_surface_z_mm\": " << opt.shadowReferenceZMm << ",\n";
+    out << "    \"shadow_led_diameter_mm\": " << opt.shadowLedDiameterMm << ",\n";
     out << "    \"mesh_step\": " << opt.meshStep << ",\n";
     out << "    \"height_scale\": " << opt.heightScale << ",\n";
     out << "    \"mesh_path\": ";
@@ -389,12 +660,23 @@ void writeParameters(std::ostream& out, const Options& opt) {
     writePathOrNull(out, opt.printableMeshPath);
     out << ",\n";
     out << "    \"printable_base_thickness_mm\": " << opt.printableThicknessMm << ",\n";
+    out << "    \"printable_fill_holes\": " << (opt.printableFillHoles ? "true" : "false") << ",\n";
     out << "    \"neural_fusion\": " << (opt.neuralFusion ? "true" : "false") << ",\n";
     out << "    \"neural_model_override\": ";
     writePathOrNull(out, opt.neuralModelPath);
     out << ",\n";
     out << "    \"neural_max_side\": " << opt.neuralMaxSide << ",\n";
     out << "    \"specular_diagnostics\": " << (opt.specularDiagnostics ? "true" : "false") << ",\n";
+    out << "    \"shadow_height_refinement\": " << (opt.shadowHeightRefinement ? "true" : "false") << ",\n";
+    out << "    \"mitsuba_inverse_refinement\": " << (opt.mitsubaInverseRefinement ? "true" : "false") << ",\n";
+    out << "    \"mitsuba_backend_requested\": \"" << mitsubaBackendName(opt.mitsubaBackendMode) << "\",\n";
+    out << "    \"mitsuba_quality\": \"" << mitsubaQualityName(opt.mitsubaQualityMode) << "\",\n";
+    out << "    \"mitsuba_python_override\": ";
+    writePathOrNull(out, opt.mitsubaPythonPath);
+    out << ",\n";
+    out << "    \"mitsuba_worker_override\": ";
+    writePathOrNull(out, opt.mitsubaWorkerPath);
+    out << ",\n";
     out << "    \"export_rti\": " << (opt.exportRti ? "true" : "false") << ",\n";
     out << "    \"rti_path\": ";
     writePathOrNull(out, opt.exportRti
@@ -412,7 +694,7 @@ void writeInProgressManifest(const Options& opt, const RunManifestContext& conte
     out << "{\n";
     out << "  \"schema_version\": 1,\n";
     out << "  \"status\": \"in_progress\",\n";
-    out << "  \"application\": {\"name\": \"What A Relief\", \"version\": \""
+    out << "  \"application\": {\"name\": \"what-a-relief\", \"version\": \""
         << WHAT_A_RELIEF_VERSION << "\"},\n";
     out << "  \"started_utc\": \"" << context.startedUtc << "\",\n";
     writeInputs(out, opt);
@@ -454,7 +736,7 @@ void completeRunManifest(
     out << "{\n";
     out << "  \"schema_version\": 1,\n";
     out << "  \"status\": \"complete\",\n";
-    out << "  \"application\": {\"name\": \"What A Relief\", \"version\": \""
+    out << "  \"application\": {\"name\": \"what-a-relief\", \"version\": \""
         << WHAT_A_RELIEF_VERSION << "\"},\n";
     out << "  \"started_utc\": \"" << context.startedUtc << "\",\n";
     out << "  \"completed_utc\": \"" << utcNow() << "\",\n";
@@ -467,7 +749,100 @@ void completeRunManifest(
     } else {
         out << diagnostics.lightingConditionNumber;
     }
-    out << ", \"solved_fraction\": " << diagnostics.solvedFraction << "},\n";
+    out << ", \"solved_fraction\": " << diagnostics.solvedFraction;
+    if (opt.shadowHeightRefinement) {
+        out << ", \"shadow_height_refinement\": {"
+            << "\"applied\": " << (diagnostics.shadowHeightRefinementApplied ? "true" : "false")
+            << ", \"decision\": \""
+            << jsonEscape(diagnostics.shadowHeightRefinementDecision) << "\""
+            << ", \"balanced_mismatch_before\": ";
+        if (diagnostics.shadowMismatchRateBefore < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowMismatchRateBefore;
+        }
+        out << ", \"balanced_mismatch_after\": ";
+        if (diagnostics.shadowMismatchRateAfter < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowMismatchRateAfter;
+        }
+        out << ", \"holdout_mismatch_before\": ";
+        if (diagnostics.shadowHoldoutMismatchRateBefore < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowHoldoutMismatchRateBefore;
+        }
+        out << ", \"holdout_mismatch_after\": ";
+        if (diagnostics.shadowHoldoutMismatchRateAfter < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowHoldoutMismatchRateAfter;
+        }
+        out << ", \"correction_rms_pixels\": " << diagnostics.shadowCorrectionRms
+            << ", \"normal_slope_rms_before\": ";
+        if (diagnostics.shadowNormalSlopeRmsBefore < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowNormalSlopeRmsBefore;
+        }
+        out << ", \"normal_slope_rms_after\": ";
+        if (diagnostics.shadowNormalSlopeRmsAfter < 0.0) {
+            out << "null";
+        } else {
+            out << diagnostics.shadowNormalSlopeRmsAfter;
+        }
+        out << ", \"constraint_count\": " << diagnostics.shadowRefinementConstraintCount
+            << ", \"shadow_samples\": " << diagnostics.shadowRefinementShadowSamples
+            << ", \"lit_samples\": " << diagnostics.shadowRefinementLitSamples
+            << ", \"selected_step_fraction\": " << diagnostics.shadowSelectedStepFraction
+            << ", \"worst_holdout_delta\": " << diagnostics.shadowWorstHoldoutDelta
+            << ", \"used_light_indices_zero_based\": [";
+        for (size_t i = 0; i < diagnostics.shadowRefinementLightIndices.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << diagnostics.shadowRefinementLightIndices[i];
+        }
+        out << "]}";
+    }
+    if (opt.mitsubaInverseRefinement) {
+        const MitsubaRefinementDiagnostics& inverse = diagnostics.mitsuba;
+        out << ", \"mitsuba_inverse_refinement\": {"
+            << "\"method\": \"mitsuba_heightfield_inverse_v1\""
+            << ", \"attempted\": " << (inverse.attempted ? "true" : "false")
+            << ", \"succeeded\": " << (inverse.succeeded ? "true" : "false")
+            << ", \"accepted\": " << (inverse.accepted ? "true" : "false")
+            << ", \"status\": \"" << jsonEscape(inverse.status) << "\""
+            << ", \"decision\": \"" << jsonEscape(inverse.decision) << "\""
+            << ", \"backend_requested\": \"" << jsonEscape(inverse.requestedBackend) << "\""
+            << ", \"backend_selected\": \"" << jsonEscape(inverse.selectedBackend) << "\""
+            << ", \"variant\": \"" << jsonEscape(inverse.variant) << "\""
+            << ", \"optimizer\": \"" << jsonEscape(inverse.optimizer) << "\""
+            << ", \"mitsuba_version\": \"" << jsonEscape(inverse.mitsubaVersion) << "\""
+            << ", \"drjit_version\": \"" << jsonEscape(inverse.drjitVersion) << "\""
+            << ", \"numpy_version\": \"" << jsonEscape(inverse.numpyVersion) << "\""
+            << ", \"python_version\": \"" << jsonEscape(inverse.pythonVersion) << "\""
+            << ", \"iterations_completed\": " << inverse.iterationsCompleted
+            << ", \"render_width\": " << inverse.renderWidth
+            << ", \"render_height\": " << inverse.renderHeight
+            << ", \"train_loss_before\": ";
+        writeNullableNumber(out, inverse.trainLossBefore);
+        out << ", \"train_loss_after\": ";
+        writeNullableNumber(out, inverse.trainLossAfter);
+        out << ", \"holdout_loss_before\": ";
+        writeNullableNumber(out, inverse.holdoutLossBefore);
+        out << ", \"holdout_loss_after\": ";
+        writeNullableNumber(out, inverse.holdoutLossAfter);
+        out << ", \"correction_rms_pixels\": " << inverse.correctionRmsPixels
+            << ", \"correction_maximum_pixels\": " << inverse.correctionMaximumPixels
+            << ", \"result_path\": \"" << jsonEscape(inverse.resultPath) << "\""
+            << ", \"method_references\": ["
+            << "{\"id\": \"zhang2023projective\", \"doi\": \"10.1145/3618385\"}, "
+            << "{\"id\": \"jakob2022drjit\", \"doi\": \"10.1145/3528223.3530099\"}, "
+            << "{\"id\": \"mitsuba3\", \"url\": \"https://mitsuba-renderer.org/\"}]}";
+    }
+    out << "},\n";
     out << "  \"lights\": [";
     for (size_t i = 0; i < lights.size(); ++i) {
         if (i != 0) {
