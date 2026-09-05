@@ -8,6 +8,11 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  # A release tag supersedes an ordinary branch build of the same commit.
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build:
     name: Build Windows Installer

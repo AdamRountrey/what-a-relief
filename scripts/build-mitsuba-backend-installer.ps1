@@ -1,6 +1,8 @@
 param(
     [string]$Version = "0.2.1",
-    [string]$CacheDirectory = ""
+    [string]$CacheDirectory = "",
+    [ValidateRange(1, 5)]
+    [int]$BackendProbeAttempts = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -119,18 +121,50 @@ function Expand-ZipMerged {
 }
 
 function Test-BackendProbe {
-    param([string]$RuntimeDirectory, [string]$Backend)
+    param(
+        [string]$RuntimeDirectory,
+        [string]$Backend,
+        [ValidateRange(1, 5)]
+        [int]$Attempts = 1
+    )
     $python = Join-Path $RuntimeDirectory "python.exe"
     $worker = Join-Path $RuntimeDirectory "worker.py"
     $result = Join-Path $RuntimeDirectory "probe-$Backend.json"
-    Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue
-    & $python $worker --probe --backend $Backend --result $result
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $result)) {
-        return $false
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue
+        & $python $worker --probe --backend $Backend --result $result
+        $exitCode = $LASTEXITCODE
+        $detail = "exit code $exitCode"
+        if (Test-Path -LiteralPath $result) {
+            try {
+                $probe = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+                if ($exitCode -eq 0 -and $probe.status -eq "available") {
+                    if ($attempt -gt 1) {
+                        Write-Host "Mitsuba $Backend probe recovered on attempt $attempt of $Attempts."
+                    }
+                    return $true
+                }
+                if ($probe.error) {
+                    $detail = [string]$probe.error
+                } elseif ($probe.status) {
+                    $detail = "status $($probe.status), exit code $exitCode"
+                }
+            } catch {
+                $detail = "invalid result JSON, exit code $exitCode"
+            }
+        } elseif ($exitCode -eq 0) {
+            $detail = "result file was not written"
+        }
+
+        if ($attempt -lt $Attempts) {
+            $detail = ($detail -replace '\s+', ' ').Trim()
+            Write-Warning "Mitsuba $Backend probe attempt $attempt of $Attempts failed ($detail). Retrying in a fresh process."
+            Start-Sleep -Seconds 2
+        }
     }
-    $probe = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
-    return $probe.status -eq "available"
+
+    return $false
 }
 
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
@@ -238,7 +272,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "The Mitsuba preview PNG-writer regression test failed."
 }
 
-if (-not (Test-BackendProbe -RuntimeDirectory $runtime -Backend "llvm")) {
+if (-not (Test-BackendProbe -RuntimeDirectory $runtime -Backend "llvm" -Attempts $BackendProbeAttempts)) {
     throw "The self-contained LLVM CPU backend failed its live render probe."
 }
 $cudaAvailable = Test-BackendProbe -RuntimeDirectory $runtime -Backend "cuda"
@@ -566,7 +600,7 @@ $verifyProcess = Start-Process -FilePath $installerOut -ArgumentList @("--extrac
 if ($verifyProcess.ExitCode -ne 0) {
     throw "Backend installer self-extraction verification failed with exit code $($verifyProcess.ExitCode)."
 }
-if (-not (Test-BackendProbe -RuntimeDirectory $verify -Backend "llvm")) {
+if (-not (Test-BackendProbe -RuntimeDirectory $verify -Backend "llvm" -Attempts $BackendProbeAttempts)) {
     throw "The extracted backend installer payload failed its LLVM CPU probe."
 }
 Remove-Item -LiteralPath $work -Recurse -Force
