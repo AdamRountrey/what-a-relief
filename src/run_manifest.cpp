@@ -20,7 +20,7 @@
 namespace fs = std::filesystem;
 
 #ifndef WHAT_A_RELIEF_VERSION
-#define WHAT_A_RELIEF_VERSION "0.2.1"
+#define WHAT_A_RELIEF_VERSION "0.2.3"
 #endif
 
 namespace {
@@ -815,6 +815,9 @@ void completeRunManifest(
             << ", \"attempted\": " << (inverse.attempted ? "true" : "false")
             << ", \"succeeded\": " << (inverse.succeeded ? "true" : "false")
             << ", \"accepted\": " << (inverse.accepted ? "true" : "false")
+            << ", \"candidate_saved\": " << (inverse.candidateSaved ? "true" : "false")
+            << ", \"candidate_export_status\": \"" << jsonEscape(inverse.candidateExportStatus) << "\""
+            << ", \"candidate_review_path\": \"" << jsonEscape(inverse.candidateReviewPath) << "\""
             << ", \"status\": \"" << jsonEscape(inverse.status) << "\""
             << ", \"decision\": \"" << jsonEscape(inverse.decision) << "\""
             << ", \"backend_requested\": \"" << jsonEscape(inverse.requestedBackend) << "\""

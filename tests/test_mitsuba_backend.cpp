@@ -66,7 +66,8 @@ int main(int argc, char** argv) {
         PhotometricDiagnostics diagnostics;
         diagnostics.robustWeight = cv::Mat(8, 8, CV_32F, cv::Scalar(1.0f));
         int lastProgress = -1;
-        runMitsubaInverseRefinement(
+        std::string lastMessage;
+        const auto run = [&]() { runMitsubaInverseRefinement(
             options,
             lights,
             images,
@@ -76,20 +77,35 @@ int main(int argc, char** argv) {
             normals,
             std::vector<cv::Mat>(6, cv::Mat(8, 8, CV_8U, cv::Scalar(0))),
             diagnostics,
-            [&](const std::string&, int percent) { lastProgress = percent; },
-            []() { return false; });
+            [&](const std::string& message, int percent) { lastProgress = percent; lastMessage = message; },
+            []() { return false; }); };
+        run();
 
         require(lastProgress == 100, "Backend contract did not report completion");
         require(diagnostics.mitsuba.attempted, "Backend attempt was not recorded");
         require(diagnostics.mitsuba.succeeded, "Completed backend result was not recognized");
         require(!diagnostics.mitsuba.accepted, "Fake rejected candidate was marked accepted");
         require(diagnostics.mitsuba.decision == "fake_contract_rejection", "Decision was not parsed");
+        require(diagnostics.mitsuba.candidateSaved, "Unvalidated candidate was not recorded");
+        require(diagnostics.mitsuba.candidateExportStatus == "saved_unvalidated", "Candidate export status was lost");
+        require(fs::is_regular_file(diagnostics.mitsuba.candidateReviewPath), "Review path did not survive staging rename");
+        require(lastMessage.find("fake_contract_rejection") != std::string::npos, "Progress omitted rejection reason");
+        require(lastMessage.find("Unvalidated candidate review:") != std::string::npos, "Progress omitted review path");
         require(diagnostics.mitsuba.iterationsCompleted == 3, "Iteration count was not parsed");
         require(fs::is_regular_file(output / "inverse" / "result.json"), "Result was not committed");
         require(
             !fs::exists(output / "inverse" / "input_observations"),
             "Temporary linear observation handoff was retained in completed outputs");
         require(!fs::exists(output / "inverse.part"), "A partial inverse directory was left behind");
+
+        // The fake worker uses Standard to return an accepted result on the next run.
+        options.mitsubaQualityMode = MitsubaQualityMode::Standard;
+        run();
+        require(diagnostics.mitsuba.accepted, "Accepted rerun was not recognized");
+        require(!diagnostics.mitsuba.candidateSaved && diagnostics.mitsuba.candidateReviewPath.empty(),
+                "Accepted rerun advertised a stale candidate");
+        require(!fs::exists(output / "inverse" / "unvalidated_candidate"),
+                "Accepted rerun retained stale rejected candidate files");
 
         fs::remove_all(output, error);
         std::cout << "Mitsuba process and output contract passed.\n";

@@ -14,6 +14,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #endif
 
 #include <algorithm>
@@ -28,7 +29,7 @@
 namespace fs = std::filesystem;
 
 #ifndef WHAT_A_RELIEF_VERSION
-#define WHAT_A_RELIEF_VERSION "0.2.1"
+#define WHAT_A_RELIEF_VERSION "0.2.3"
 #endif
 
 namespace {
@@ -1952,6 +1953,18 @@ void updateGuiProgress(const std::string& text, int percent) {
 #else
     (void)text;
     (void)percent;
+#endif
+}
+
+void openGuiReviewFile(const std::string& path) {
+#ifdef _WIN32
+    const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+        nullptr, L"open", fs::path(path).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+        showGuiInfo("what-a-relief Review", "Could not open the review. It is available at:\n\n" + path);
+    }
+#else
+    (void)path;
 #endif
 }
 

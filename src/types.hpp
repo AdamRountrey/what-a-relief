@@ -66,6 +66,9 @@ struct MitsubaRefinementDiagnostics {
     bool attempted = false;
     bool succeeded = false;
     bool accepted = false;
+    bool candidateSaved = false;
+    std::string candidateReviewPath;
+    std::string candidateExportStatus;
     std::string status = "not_requested";
     std::string decision = "not_requested";
     std::string requestedBackend = "auto";

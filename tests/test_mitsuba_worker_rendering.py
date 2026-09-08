@@ -145,6 +145,8 @@ class RenderingTests(unittest.TestCase):
                         if name == 'tilted':
                             baseline_error = np.degrees(np.arctan(np.hypot(0.15, 0.06)))
                             self.assertTrue(result['accepted'])
+                            self.assertFalse(result['candidate_saved'])
+                            self.assertFalse((output / 'unvalidated_candidate').exists())
                             self.assertLess(mean_error, 0.85 * baseline_error)
                             initial_delta = baseline[roi] - truth[roi]
                             self.assertLess(height_rmse, float(np.std(initial_delta)))
@@ -154,6 +156,15 @@ class RenderingTests(unittest.TestCase):
                             self.assertLess(mean_error, 1.0)
                             self.assertLess(height_rmse, 0.05)
                             self.assertFalse(result['normal_prior_enabled'])  # Legacy jobs remain supported.
+                            self.assertFalse(result['accepted'])
+                            np.testing.assert_array_equal(reconstructed, np.where(mask, baseline, 0))
+                            self.assertTrue(result['candidate_saved'])
+                            candidate = output / result['candidate_directory']
+                            candidate_height = w.read_pfm(candidate / 'candidate_height.pfm')
+                            correction = w.read_pfm(candidate / 'height_correction.pfm')
+                            np.testing.assert_array_equal(candidate_height, np.where(mask, baseline + correction, 0))
+                            self.assertFalse(json.loads((candidate / 'candidate.json').read_text())['accepted'])
+                            self.assertTrue((candidate / 'review.html').is_file())
                         self.assertTrue(np.all(np.isfinite(reconstructed)))
                         self.assertTrue(np.all(reconstructed[~mask] == 0))
                         self.assertEqual(result['reference_surface_z_mm'], 10)

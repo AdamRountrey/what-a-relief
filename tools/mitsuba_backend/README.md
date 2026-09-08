@@ -117,6 +117,64 @@ candidates. These lights still influenced the classical initialization;
 neither withholding nor a new render seed provides independent physical
 accuracy calibration. Rejection leaves the inverse height at the baseline.
 
+## Rejected candidate outputs and review
+
+After the unchanged acceptance gate, a finite rejected candidate is retained
+under `inverse/unvalidated_candidate/`. It is the selected checkpoint's
+full-resolution baseline height plus the upsampled correction, not necessarily
+the final optimization iteration. The guarded `inverse/inverse_height.pfm`,
+inverse geometry previews/mesh, and material maps still retain the baseline;
+`inverse/height_correction.pfm` and its PNG represent a zero correction.
+Accepted runs deliver the refinement in `inverse/` without an extra candidate
+copy. Nonfinite candidate geometry is not exported.
+
+Files in `inverse/unvalidated_candidate/` are:
+
+| Files | Meaning |
+| --- | --- |
+| `candidate_height.pfm`, `candidate_height.png` | Floating-point candidate height and its display-stretched preview |
+| `candidate_normal_rgb.png`, `candidate_normal_x.png`, `candidate_normal_y.png`, `candidate_normal_z.png` | Encoded normals derived from candidate height, not the original photometric normal map or ground truth |
+| `candidate_hillshade_ul.png` | Upper-left hillshade from those height-derived normals |
+| `candidate_surface.ply` | Open inspection mesh with an unvalidated-candidate warning in its PLY header |
+| `height_correction.pfm`, `height_correction.png` | Proposed candidate correction and signed visualization, separate from the zero guarded correction in the parent directory |
+| `candidate.json` | Rejection decision, validation metrics, selected-checkpoint/runtime provenance, units, and export status; `accepted:false`, `automatically_accepted:false`, and `selected_for_default_outputs:false` |
+| `review_baseline_height.png`, `review_candidate_height.png` | Baseline/candidate height previews with one shared display range |
+| `review.html` | Offline comparison report with relative links to the candidate files and parent `result.json` |
+
+The report offers baseline-only, candidate-only, and side-by-side modes, with
+height, height-derived RGB or X normals, hillshade, and mean training-render
+views. It displays the rejection reason and baseline/candidate training,
+withheld-image, and normal-prior losses. Full rejection metrics remain in the
+JSON records. Candidate file links are revealed only after checking the
+failed-validation acknowledgement. This checkbox is a review warning, not an
+access restriction or an acceptance action; files remain directly accessible
+in the output folder. GUI completion asks whether to open the report and
+defaults to **No**. The report can also be opened directly without a server.
+Neither viewing nor downloading a candidate promotes it or changes acceptance.
+
+The parent `inverse/render_before.png` and `inverse/render_after.png` now use
+one shared display range. The after image always represents the candidate,
+including on rejection, whereas guarded geometry and material files revert to
+the baseline. Each render uses its corresponding fitted material. These are
+mean training renders, not geometric error maps or independent accuracy tests.
+Shared-range height previews are for comparison; ordinary height PNGs remain
+individually stretched, and PNGs do not replace quantitative PFM data.
+
+Height and correction PFMs use image-pixel height units. PLY XY uses pixels and
+Z is height multiplied by the run's `height_scale`; it is not automatically a
+millimeter mesh or a watertight printable solid. Normal PNGs derive from the
+unscaled height field. `candidate.json` records these conventions, the shared
+height display range, and its parent result; keep it with candidate files.
+The parent result records `candidate_saved`, `candidate_directory`,
+`candidate_export_status`, and `delivered_geometry`. Export status distinguishes
+`saved_unvalidated`, `not_needed_accepted`, and `not_saved_nonfinite_geometry`.
+
+This is inspection-only retention: solver settings and acceptance thresholds
+are unchanged, and no numerical accuracy improvement is claimed. Reusing an
+output folder replaces its old `inverse/` directory, including any retained
+candidate and report; it does not archive candidates across runs. For focused
+regressions and remaining checks, see [validation.md](../../docs/validation.md#rejected-candidate-review-gates).
+
 ## Finite sources and datum
 
 The `direct_projective` inverse scenes now use finite, reference-facing disks

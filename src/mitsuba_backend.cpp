@@ -39,7 +39,7 @@
 namespace fs = std::filesystem;
 
 #ifndef WHAT_A_RELIEF_VERSION
-#define WHAT_A_RELIEF_VERSION "0.2.1"
+#define WHAT_A_RELIEF_VERSION "0.2.3"
 #endif
 
 namespace {
@@ -625,6 +625,10 @@ void populateDiagnostics(
     }
     diagnostics.succeeded = jsonString(text, "status") == "complete";
     diagnostics.accepted = jsonBool(text, "accepted", false);
+    diagnostics.candidateSaved = jsonBool(text, "candidate_saved", false);
+    diagnostics.candidateExportStatus = jsonString(text, "candidate_export_status", "not_reported");
+    diagnostics.candidateReviewPath = diagnostics.candidateSaved
+        ? absolutePathString(resultPath.parent_path() / "unvalidated_candidate" / "review.html") : "";
     diagnostics.status = jsonString(text, "status", "invalid_result");
     diagnostics.decision = jsonString(text, "decision", "missing_decision");
     diagnostics.selectedBackend = jsonString(text, "selected_backend");
@@ -825,13 +829,29 @@ void runMitsubaInverseRefinement(
         if (!result.succeeded) {
             throw std::runtime_error("Mitsuba backend returned an incomplete result. Inspect backend.log.");
         }
+        if (result.candidateSaved) {
+            if (result.accepted) {
+                throw std::runtime_error("Mitsuba result cannot mark a candidate both accepted and unvalidated.");
+            }
+            for (const std::string& name : {
+                     "candidate.json", "review.html", "candidate_height.pfm", "candidate_height.png",
+                     "candidate_normal_rgb.png", "candidate_normal_x.png", "candidate_normal_y.png",
+                     "candidate_normal_z.png", "candidate_hillshade_ul.png", "candidate_surface.ply",
+                     "height_correction.pfm", "height_correction.png",
+                     "review_baseline_height.png", "review_candidate_height.png"}) {
+                requireNonempty(staging / "unvalidated_candidate" / name);
+            }
+        }
         std::error_code observationCleanupError;
         fs::remove_all(observationDirectory, observationCleanupError);
         replaceDirectoryTransactionally(staging, finalDirectory);
         if (progress) {
-            progress(result.accepted
+            const std::string message = result.accepted
                 ? "Mitsuba refinement accepted; baseline outputs retained beside inverse results."
-                : "Mitsuba refinement rejected by validation checks; inverse outputs equal the baseline.", 100);
+                : "Mitsuba refinement not accepted (" + result.decision + "); default inverse height retains the baseline. " +
+                    (result.candidateSaved ? "Unvalidated candidate review: " + result.candidateReviewPath
+                                           : "Candidate export: " + result.candidateExportStatus + ". See inverse/result.json.");
+            progress(message, 100);
         }
     } catch (...) {
         std::error_code observationCleanupError;

@@ -1,7 +1,7 @@
 param(
     [string]$VsDevCmd = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat",
     [string]$CMake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-    [string]$Version = "0.2.2"
+    [string]$Version = "0.2.3"
 )
 
 $ErrorActionPreference = "Stop"

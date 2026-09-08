@@ -89,6 +89,39 @@ ctest --test-dir build\ninja-vcpkg -R '^mitsuba-worker-(numerics|rendering)$' --
 
 These entries are named `mitsuba-worker-numerics` and `mitsuba-worker-rendering`. Selecting them does not demonstrate that the full matrix above is implemented or passing. An explicitly selected runtime must work; unavailability is a failure, not a silent successful skip.
 
+### Rejected Candidate Review Gates
+
+Finite rejected candidates are now retained for inspection in
+`inverse/unvalidated_candidate/`, with an offline report and explicit
+unvalidated provenance. The solver and acceptance thresholds are unchanged;
+retaining or opening a candidate is not acceptance or reconstruction success.
+The numerical suite covers finite retention for all six rejection labels,
+unchanged baseline file hashes, nonfinite geometry, failed writes, PFM/PLY units,
+mask holes, shared display ranges, and escaped report text. The process contract
+covers candidate promotion from staging and rejected-to-accepted reruns. The
+live renderer test checks accepted tilt recovery and rejected truth-start
+retention. The following list also describes broader regression targets; not
+every combination below has an automated gate.
+
+- **Rejected versus accepted outputs:** Force a finite rejected correction and require `accepted:false`, unchanged guarded inverse height, zero guarded correction, matching baseline material outputs, and a distinct candidate height equal to baseline plus correction. Accepted runs must not create an extra candidate directory. Nonfinite supported candidate geometry must not be exported.
+- **Artifact contract and provenance:** Verify every file in the [candidate file list](../tools/mitsuba_backend/README.md#rejected-candidate-outputs-and-review), conditional manifest/output checks, candidate export status, matching rejection metrics and selected iteration, `accepted:false` in `candidate.json`, and the PLY warning. Keep absent/skipped validation distinct from a passing metric.
+- **Geometry and preview semantics:** Use finite synthetic planes/bumps with a datum offset, mask holes, non-square dimensions, resampling, and nonunit `height_scale`. Check height/correction pixel units, PLY XY/Z conventions, height-derived normals, shared-range review height previews, and shared-range root renders. `render_after.png` must still represent the candidate on rejection, not the guarded baseline.
+- **Offline review and GUI consent:** Open the report without a server or network dependency; exercise baseline/candidate/both and product selectors. Candidate links must start hidden, appear after failed-validation acknowledgement, and resolve with the completed output folder relocated. Escape rejection text safely. Verify the GUI open-report prompt defaults to No and that opening, acknowledgement, and file access never change acceptance or default outputs.
+- **Reruns and partial exports:** Exercise rejected-to-accepted and repeated rejected runs in the same output folder, with no stale candidate/report advertised. Inject export failures to ensure partial candidate files are not presented as a complete result. Retention is per run, not an archive.
+
+These tests can use small arrays, mocked worker decisions, and fake-process
+contracts for export behavior; renderer recovery remains a separate evidence
+tier. Candidate normals and normal-prior agreement are not raw normal-map
+ground truth, and shared-scale PNG comparisons make no numerical accuracy claim.
+
+Local verification on 2026-09-08: 14 numerical/export tests passed, the live
+Mitsuba CPU tilt/truth regression passed, and all six application CTest gates
+passed. A synthetic export report was exercised offline in headless Edge at
+1440x1100 and 390x844: every product image loaded, baseline/candidate selection
+and acknowledgement worked, and there were no script errors or horizontal
+overflow. This does not verify native Windows dialog interaction, relocation
+of a real network-share run, or physical accuracy on the plant specimen.
+
 ### Verified CPU run
 
 On 2026-09-08, all eight entries passed in `build/owned-mitsuba-gates`: the six baseline suites plus worker numerics and live rendering, in 61.06 seconds total. The [preserved log](../build/review-packaged-validation.log) records eight passes, the extracted interpreter path, the 50.23-second renderer gate, the 1.26-second numerical gate, and exact metrics. The passing assertion set includes height RMSE. The final method-label/cleanup rerun also passed all eight entries in 50.62 seconds, as recorded in [LastTest.log](../build/owned-mitsuba-gates/Testing/Temporary/LastTest.log).

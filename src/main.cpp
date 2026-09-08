@@ -100,7 +100,7 @@ const char* heightFlattenName(HeightFlattenMode mode) {
     }
 }
 
-void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
+MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     if (!opt.uncalibratedLighting && opt.lightsFile.empty() && !opt.hasSphere) {
         std::cout << "Select the highlight sphere on the first image.\n";
         opt.sphere = chooseSphereInteractive(loadDisplayImage(opt.imagePaths.front()));
@@ -416,6 +416,7 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     if (opt.guiMode && opt.openRelightViewer) {
         launchRelightViewer(normalMap, validMask, opt.outputDir);
     }
+    return diagnostics.mitsuba;
 }
 
 } // namespace
@@ -433,7 +434,7 @@ int main(int argc, char** argv) {
             showGuiProgress("what-a-relief Processing", "Starting photometric stereo...");
             progressShown = true;
         }
-        runPhotometricStereo(
+        const MitsubaRefinementDiagnostics inverse = runPhotometricStereo(
             opt,
             opt.guiMode
                 ? ProgressCallback([](const std::string& message, int percent) {
@@ -448,7 +449,22 @@ int main(int argc, char** argv) {
             progressShown = false;
         }
         if (opt.guiMode) {
-            showGuiInfo("what-a-relief Complete", "Outputs were written to:\n\n" + opt.outputDir);
+            const std::string complete = "Outputs were written to:\n\n" + opt.outputDir;
+            if (inverse.candidateSaved) {
+                if (askGuiYesNo("what-a-relief Complete", complete +
+                    "\n\nMitsuba refinement was not accepted: " + inverse.decision +
+                    "\nThe default inverse height retains the baseline. An unvalidated candidate was saved separately."
+                    "\n\nOpen the comparison report? Viewing it does not accept the candidate.", false)) {
+                    openGuiReviewFile(inverse.candidateReviewPath);
+                }
+            } else {
+                const std::string inverseStatus = inverse.attempted && !inverse.accepted
+                    ? "\n\nMitsuba refinement was not accepted: " + inverse.decision +
+                      "\nThe default inverse height retains the baseline."
+                      "\nCandidate export: " + inverse.candidateExportStatus + ". See inverse/result.json."
+                    : "";
+                showGuiInfo("what-a-relief Complete", complete + inverseStatus);
+            }
         }
         return 0;
     } catch (const std::exception& e) {

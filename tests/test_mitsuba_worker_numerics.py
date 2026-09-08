@@ -2,6 +2,7 @@
 import importlib.util
 import contextlib
 import io
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -18,6 +19,96 @@ spec.loader.exec_module(w)
 
 
 class NumericalTests(unittest.TestCase):
+    def test_rejected_candidate_is_retained_without_promoting_geometry(self):
+        yy, xx = np.mgrid[:9, :11].astype(np.float32)
+        baseline = 7 + 0.1 * xx - 0.2 * yy
+        correction = 0.4 * np.exp(-((xx - 5)**2 + (yy - 4)**2) / 6)
+        mask = np.ones(baseline.shape, bool)
+        mask[3, 4] = False
+        correction[~mask] = 0
+        albedo = np.full_like(baseline, 0.4)
+        original = baseline.copy()
+        for decision in ('rejected_withheld_lights_worsened', 'rejected_insufficient_training_improvement',
+                         'rejected_normal_prior_worsened', 'rejected_independent_validation_seed',
+                         'rejected_excessive_slope_change', 'rejected_excessive_height_change'):
+            with self.subTest(decision=decision), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                # Exercise the real PFM/PLY writers; only renderer-dependent PNG encoding is stubbed.
+                def png(_mi, path, values):
+                    path.write_bytes(np.asarray(values, np.float32).tobytes())
+                result = dict(accepted=False, status='complete', decision=decision, selected_iteration=12)
+                with patch.object(w, 'save_gray', side_effect=png), patch.object(w, 'save_rgb', side_effect=png):
+                    w.output_products(None, output, baseline, np.zeros_like(baseline), mask, albedo, 2)
+                    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir()}
+                    w.retain_unvalidated_candidate(None, output, baseline, correction, mask, albedo, 2, result)
+                self.assertFalse(result['accepted'])
+                self.assertEqual(result['decision'], decision)
+                self.assertEqual(result['delivered_geometry'], 'baseline')
+                self.assertTrue(result['candidate_saved'])
+                candidate = output / result['candidate_directory']
+                expected = np.where(mask, baseline + correction, 0)
+                np.testing.assert_array_equal(w.read_pfm(candidate / 'candidate_height.pfm'), expected)
+                np.testing.assert_array_equal(w.read_pfm(candidate / 'height_correction.pfm'), correction)
+                np.testing.assert_array_equal(baseline, original)
+                for name, digest in hashes.items():
+                    self.assertEqual(hashlib.sha256((output / name).read_bytes()).hexdigest(), digest)
+                provenance = json.loads((candidate / 'candidate.json').read_text())
+                self.assertFalse(provenance['accepted'])
+                self.assertFalse(provenance['selected_for_default_outputs'])
+                self.assertEqual(provenance['validation_status'], 'unvalidated_candidate')
+                self.assertEqual(provenance['selected_iteration'], 12)
+                self.assertEqual(provenance['mesh_z_scale'], 2)
+                header, data = (candidate / 'candidate_surface.ply').read_bytes().split(b'end_header\n', 1)
+                self.assertIn(b'UNVALIDATED CANDIDATE', header)
+                vertices = np.frombuffer(data, dtype=[('xyz', '<f4', (3,)), ('rgb', 'u1', (3,))], count=int(mask.sum()))
+                ys, xs = np.nonzero(mask)
+                np.testing.assert_allclose(vertices['xyz'], np.stack((xs, -ys, 2 * expected[mask]), axis=-1))
+                page = (candidate / 'review.html').read_text()
+                self.assertIn(decision, page)
+                self.assertIn('id="files" class="files" hidden', page)
+                self.assertIn('not the original photometric normal maps', page)
+                self.assertNotIn('https://', page)
+
+    def test_candidate_not_advertised_on_acceptance_nonfinite_or_write_failure(self):
+        height = np.ones((5, 7), np.float32)
+        mask = np.ones(height.shape, bool)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for accepted, correction, status in ((True, height, 'not_needed_accepted'),
+                                                (False, height * np.nan, 'not_saved_nonfinite_geometry'),
+                                                (False, height * np.inf, 'not_saved_nonfinite_geometry')):
+                result = dict(accepted=accepted, decision='test')
+                w.retain_unvalidated_candidate(None, output, height, correction, mask, height, 1, result)
+                self.assertEqual(result['accepted'], accepted)
+                self.assertFalse(result['candidate_saved'])
+                self.assertEqual(result['candidate_export_status'], status)
+                self.assertFalse((output / 'unvalidated_candidate').exists())
+            result = dict(accepted=False, decision='test')
+            with patch.object(w, 'output_products', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    w.retain_unvalidated_candidate(None, output, height, height, mask, height, 1, result)
+            self.assertFalse(result['candidate_saved'])
+            self.assertFalse(result['accepted'])
+
+    def test_comparison_uses_shared_range_and_report_escapes_text(self):
+        baseline = np.arange(20, dtype=np.float32).reshape(4, 5)
+        mask = np.ones(baseline.shape, bool)
+        mask[0, 0] = False
+        previews, limits = w.comparison_stretch(baseline, baseline + 5, mask)
+        self.assertTrue(np.all(previews[1][mask] >= previews[0][mask]))
+        self.assertGreater(float(np.mean(previews[1][mask] - previews[0][mask])), 0.1)
+        self.assertEqual(previews[0][0, 0], 0)
+        self.assertGreater(limits[1], float(baseline.max()))
+        with tempfile.TemporaryDirectory() as directory:
+            w.write_candidate_review(Path(directory), dict(decision='<script>alert(1)</script>', train_loss_after=float('nan')))
+            page = (Path(directory) / 'review.html').read_text()
+            self.assertNotIn('<script>alert(1)</script>', page)
+            self.assertIn('&lt;script&gt;', page)
+            self.assertIn('Not evaluated', page)
+            w.write_candidate_review(Path(directory), dict(decision='test', normal_prior_enabled=False,
+                                                           normal_prior_loss_before=0, normal_prior_loss_after=0))
+            self.assertIn('Not used', (Path(directory) / 'review.html').read_text())
+
     def test_unavailable_runtime_produces_actionable_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             result = Path(temporary) / 'probe.json'

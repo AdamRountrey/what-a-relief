@@ -57,6 +57,7 @@ int main(int argc, char** argv) {
         }
         const fs::path output = fs::path(jobPath).parent_path();
         const std::string job = readFile(jobPath);
+        const bool accepted = job.find("\"quality\": \"standard\"") != std::string::npos;
         if (job.find("\"encoding\": \"png16\"") == std::string::npos ||
             job.find("\"photometry\": \"linear_luminance\"") == std::string::npos ||
             job.find("\"srgb_decode\": false") == std::string::npos ||
@@ -110,14 +111,28 @@ int main(int argc, char** argv) {
         for (const std::string& name : required) {
             writeFile(output / name, "fake-contract-output\n");
         }
+        const fs::path candidate = output / "unvalidated_candidate";
+        if (!accepted) {
+            fs::create_directories(candidate);
+            for (const std::string& name : {
+                 "candidate.json", "review.html", "candidate_height.pfm", "candidate_height.png",
+                 "candidate_normal_rgb.png", "candidate_normal_x.png", "candidate_normal_y.png",
+                 "candidate_normal_z.png", "candidate_hillshade_ul.png", "candidate_surface.ply",
+                 "height_correction.pfm", "height_correction.png",
+                 "review_baseline_height.png", "review_candidate_height.png"}) {
+                writeFile(candidate / name, "fake-unvalidated-candidate\n");
+            }
+        }
         writeFile(
             output / "result.json",
             "{\n"
             "  \"schema_version\": 2,\n"
             "  \"method\": \"mitsuba_heightfield_inverse_v2\",\n"
             "  \"status\": \"complete\",\n"
-            "  \"accepted\": false,\n"
-            "  \"decision\": \"fake_contract_rejection\",\n"
+            "  \"accepted\": " + std::string(accepted ? "true" : "false") + ",\n"
+            "  \"candidate_saved\": " + std::string(accepted ? "false" : "true") + ",\n"
+            "  \"candidate_export_status\": \"" + std::string(accepted ? "not_needed_accepted" : "saved_unvalidated") + "\",\n"
+            "  \"decision\": \"" + std::string(accepted ? "fake_contract_acceptance" : "fake_contract_rejection") + "\",\n"
             "  \"selected_backend\": \"cuda\",\n"
             "  \"variant\": \"fake_ad_rgb\",\n"
             "  \"optimizer\": \"fake_adam\",\n"
