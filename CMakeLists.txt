@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhatARelief
-    VERSION 0.2.1
+    VERSION 0.2.2
     DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
@@ -54,7 +54,43 @@ endif()
 target_compile_features(what-a-relief PRIVATE cxx_std_17)
 
 include(CTest)
+set(WHAT_A_RELIEF_MITSUBA_PYTHON "" CACHE FILEPATH
+    "Optional Python interpreter with NumPy, Mitsuba, and working LLVM for worker tests")
+option(WHAT_A_RELIEF_MITSUBA_PIPELINE_TEST
+    "Enable the additional experimental curved-scene inverse-improvement acceptance test" OFF)
+if(WHAT_A_RELIEF_MITSUBA_PIPELINE_TEST AND NOT WHAT_A_RELIEF_MITSUBA_PYTHON)
+    message(FATAL_ERROR "The inverse pipeline acceptance test requires WHAT_A_RELIEF_MITSUBA_PYTHON")
+endif()
 if(BUILD_TESTING)
+    if(WHAT_A_RELIEF_MITSUBA_PYTHON)
+        add_test(
+            NAME mitsuba-worker-numerics
+            COMMAND "${WHAT_A_RELIEF_MITSUBA_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mitsuba_worker_numerics.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py")
+        add_test(
+            NAME mitsuba-worker-rendering
+            COMMAND "${WHAT_A_RELIEF_MITSUBA_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mitsuba_worker_rendering.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py")
+        set_tests_properties(mitsuba-worker-numerics mitsuba-worker-rendering
+            PROPERTIES LABELS "mitsuba;python")
+        set_tests_properties(mitsuba-worker-numerics PROPERTIES TIMEOUT 60)
+        # Opting in requires a working LLVM backend; unavailable runtimes must fail.
+        set_tests_properties(mitsuba-worker-rendering PROPERTIES TIMEOUT 900)
+        if(WHAT_A_RELIEF_MITSUBA_PIPELINE_TEST)
+            add_test(NAME mitsuba-pipeline-reconstruction
+                COMMAND ${CMAKE_COMMAND}
+                    "-DPYTHON_EXECUTABLE=${WHAT_A_RELIEF_MITSUBA_PYTHON}"
+                    "-DAPP_EXECUTABLE=$<TARGET_FILE:what-a-relief>"
+                    "-DSOURCE_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}"
+                    "-DOUTPUT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/inverse-pipeline-test"
+                    "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_mitsuba_pipeline.cmake")
+            set_tests_properties(mitsuba-pipeline-reconstruction
+                PROPERTIES LABELS "mitsuba;python;research" TIMEOUT 2100 RUN_SERIAL TRUE)
+        endif()
+    endif()
     add_executable(what-a-relief-tests
         tests/test_photometric.cpp)
     target_link_libraries(what-a-relief-tests PRIVATE what-a-relief-core)
@@ -171,6 +207,11 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# A worker-only fix must refresh the executable's adjacent runtime files too.
+set_property(TARGET what-a-relief APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/worker.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/requirements.lock.txt"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/mitsuba_backend/README.md")
 add_custom_command(TARGET what-a-relief POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:what-a-relief>/models"
     COMMAND ${CMAKE_COMMAND} -E copy_directory

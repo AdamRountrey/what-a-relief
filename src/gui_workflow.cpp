@@ -104,6 +104,7 @@ constexpr int kIdMitsubaStatus = 1048;
 constexpr int kIdProgressCancel = 1049;
 constexpr int kIdShadowReferenceZ = 1050;
 constexpr int kIdShadowLedDiameter = 1051;
+constexpr int kIdMitsubaLightAngle = 1052;
 constexpr int kIdPromptEdit = 2001;
 constexpr int kIdPromptOk = 2002;
 constexpr int kIdPromptCancel = 2003;
@@ -151,12 +152,15 @@ struct SetupDialogState {
     HWND shadowHeightRefinementCheck = nullptr;
     HWND shadowReferenceZEdit = nullptr;
     HWND shadowLedDiameterEdit = nullptr;
+    HWND sourceSizeLabel = nullptr;
+    HWND sourceSizeUnits = nullptr;
     HWND neuralFusionCheck = nullptr;
     HWND mitsubaInverseCheck = nullptr;
     HWND mitsubaBackendCombo = nullptr;
     HWND mitsubaQualityCombo = nullptr;
     HWND mitsubaPythonButton = nullptr;
     HWND mitsubaStatus = nullptr;
+    HWND mitsubaLightAngleEdit = nullptr;
     std::vector<HWND> sectionHeaders;
     bool nextStepRequired = true;
     HBRUSH requiredBrush = nullptr;
@@ -741,6 +745,16 @@ std::string nextStepText(const SetupDialogState& state, bool& required) {
     if (buttonChecked(state.mitsubaInverseCheck) && !resolveMitsubaBackend(opt).available()) {
         return "Next required (Advanced tab): locate or install the optional Mitsuba backend.";
     }
+    if (buttonChecked(state.mitsubaInverseCheck) && buttonChecked(state.nearFieldCheck)) {
+        try {
+            const double diameter = editDouble(state.shadowLedDiameterEdit, "LED diameter");
+            if (!std::isfinite(diameter) || diameter <= 0.0) {
+                return "Next required (Advanced tab): enter the measured LED emitting diameter in mm for inverse refinement.";
+            }
+        } catch (const std::exception&) {
+            return "Next required (Advanced tab): enter a positive LED emitting diameter in mm.";
+        }
+    }
 
     required = false;
     if (opt.pixelScaleMm <= 0.0) {
@@ -791,7 +805,7 @@ void updateSetupControls(SetupDialogState& state) {
     }
     EnableWindow(state.shadowHeightRefinementCheck, supportsShadowHeightRefinement);
     const bool shadowGeometryEnabled = supportsShadowHeightRefinement &&
-        buttonChecked(state.shadowHeightRefinementCheck) &&
+        (buttonChecked(state.shadowHeightRefinementCheck) || buttonChecked(state.mitsubaInverseCheck)) &&
         buttonChecked(state.nearFieldCheck);
     EnableWindow(state.shadowReferenceZEdit, shadowGeometryEnabled);
     EnableWindow(state.shadowLedDiameterEdit, shadowGeometryEnabled);
@@ -806,6 +820,14 @@ void updateSetupControls(SetupDialogState& state) {
     EnableWindow(state.mitsubaBackendCombo, mitsubaEnabled);
     EnableWindow(state.mitsubaQualityCombo, mitsubaEnabled);
     EnableWindow(state.mitsubaPythonButton, mitsubaEnabled);
+    EnableWindow(state.mitsubaLightAngleEdit, mitsubaEnabled && !buttonChecked(state.nearFieldCheck));
+    const bool angularSource = mitsubaEnabled && !buttonChecked(state.nearFieldCheck);
+    ShowWindow(state.shadowLedDiameterEdit, angularSource ? SW_HIDE : SW_SHOW);
+    ShowWindow(state.mitsubaLightAngleEdit, angularSource ? SW_SHOW : SW_HIDE);
+    SetWindowTextA(state.sourceSizeLabel, angularSource ? "Angular Diameter" : "LED Diameter");
+    SetWindowTextA(state.sourceSizeUnits, angularSource
+        ? "degrees; directional inverse approximation"
+        : "mm; inverse requires >0; shadow allows 0");
     if (state.mitsubaStatus != nullptr) {
         const std::string status = mitsubaEnabled
             ? describeMitsubaBackend(opt)
@@ -1119,6 +1141,7 @@ bool validateAndAccept(SetupDialogState& state) {
             state.shadowReferenceZEdit, "shadow reference surface Z");
         opt.shadowLedDiameterMm = editDouble(
             state.shadowLedDiameterEdit, "shadow LED diameter");
+        opt.mitsubaLightAngleDegrees = editDouble(state.mitsubaLightAngleEdit, "source angular diameter");
     } catch (const std::exception& e) {
         showOwnerMessage(state.hwnd, "Setup", e.what(), MB_ICONWARNING);
         return false;
@@ -1284,6 +1307,15 @@ bool validateAndAccept(SetupDialogState& state) {
         return false;
     }
     if (opt.mitsubaInverseRefinement) {
+        if (opt.lightingModel == LightingModel::NearFieldRing &&
+            (opt.shadowLedDiameterMm <= 0.0 || opt.shadowReferenceZMm >= opt.ringLightHeightMm)) {
+            showOwnerMessage(state.hwnd, "Setup", "Near-field inverse refinement requires a positive LED diameter and a reference Z below the ring lights (Advanced tab).", MB_ICONWARNING);
+            return false;
+        }
+        if (!std::isfinite(opt.mitsubaLightAngleDegrees) || opt.mitsubaLightAngleDegrees < 0.1 || opt.mitsubaLightAngleDegrees > 10.0) {
+            showOwnerMessage(state.hwnd, "Setup", "Source angular diameter must be between 0.1 and 10 degrees.", MB_ICONWARNING);
+            return false;
+        }
         const MitsubaBackendPaths backend = resolveMitsubaBackend(opt);
         if (!backend.available()) {
             showOwnerMessage(state.hwnd, "Mitsuba Backend", backend.problem, MB_ICONWARNING);
@@ -1496,7 +1528,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
 
     HWND advancedPage = makeTabPage(hwnd, state, "Advanced");
     y = 16;
-    state.specularDiagnosticsCheck = makeControl(advancedPage, "BUTTON", "Write experimental robust observation diagnostics", BS_AUTOCHECKBOX, kIdSpecularDiagnostics, kControlX, y, kControlWidth, 24);
+    state.specularDiagnosticsCheck = makeControl(advancedPage, "BUTTON", "Write additional robust diagnostic images (summary and per-light)", BS_AUTOCHECKBOX, kIdSpecularDiagnostics, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.specularDiagnosticsCheck, state.opt->specularDiagnostics);
 
     y += 36;
@@ -1516,10 +1548,12 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     makeLabel(advancedPage, "near-field mm above calibration datum", kControlX + 135, y, 290, kRowHeight);
 
     y += 34;
-    makeLabel(advancedPage, "LED Diameter", kMargin, y, kLabelWidth, kRowHeight);
+    state.sourceSizeLabel = makeLabel(advancedPage, "LED Diameter", kMargin, y, kLabelWidth, kRowHeight);
     state.shadowLedDiameterEdit = makeControl(advancedPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdShadowLedDiameter, kControlX, y, 120, kRowHeight);
     setEditDouble(state.shadowLedDiameterEdit, state.opt->shadowLedDiameterMm);
-    makeLabel(advancedPage, "near-field effective mm; 0 = point", kControlX + 135, y, 290, kRowHeight);
+    state.mitsubaLightAngleEdit = makeControl(advancedPage, "EDIT", "", ES_LEFT | WS_BORDER | WS_TABSTOP, kIdMitsubaLightAngle, kControlX, y, 120, kRowHeight);
+    setEditDouble(state.mitsubaLightAngleEdit, state.opt->mitsubaLightAngleDegrees);
+    state.sourceSizeUnits = makeLabel(advancedPage, "mm; inverse requires >0; shadow allows 0", kControlX + 135, y, 290, kRowHeight);
 
     y += 36;
     state.neuralFusionCheck = makeControl(advancedPage, "BUTTON", "Experimental: PS-FCN neural prior + fusion (3 to 25 calibrated images)", BS_AUTOCHECKBOX, kIdNeuralFusion, kControlX, y, kControlWidth, 24);
@@ -1551,7 +1585,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     state.mitsubaQualityCombo = makeCombo(advancedPage, kIdMitsubaQuality, kControlX, y, kControlWidth);
     addComboItem(state.mitsubaQualityCombo, "Preview (fast setup check)");
     addComboItem(state.mitsubaQualityCombo, "Standard");
-    addComboItem(state.mitsubaQualityCombo, "Research (slowest)");
+    addComboItem(state.mitsubaQualityCombo, "High sampling (slowest; experimental)");
     int mitsubaQualityIndex = 1;
     if (state.opt->mitsubaQualityMode == MitsubaQualityMode::Preview) {
         mitsubaQualityIndex = 0;
@@ -1662,6 +1696,11 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case kIdMitsubaBackend:
         case kIdMitsubaQuality:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
+                updateSetupControls(*state);
+            }
+            return 0;
+        case kIdShadowLedDiameter:
+            if (HIWORD(wParam) == EN_CHANGE && state->heightMaskStatus != nullptr && state->mitsubaStatus != nullptr) {
                 updateSetupControls(*state);
             }
             return 0;

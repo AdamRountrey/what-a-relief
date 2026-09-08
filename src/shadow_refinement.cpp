@@ -204,11 +204,19 @@ cv::Mat removeTinyComponents(const cv::Mat& mask, int validPixels) {
     const int count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
     const int minimumArea = std::clamp(validPixels / 500000, 3, 64);
     cv::Mat filtered(mask.size(), CV_8U, cv::Scalar(0));
+    std::vector<uchar> keep(static_cast<size_t>(count), 0);
     for (int label = 1; label < count; ++label) {
-        if (stats.at<int>(label, cv::CC_STAT_AREA) >= minimumArea) {
-            filtered.setTo(255, labels == label);
-        }
+        keep[static_cast<size_t>(label)] = stats.at<int>(label, cv::CC_STAT_AREA) >= minimumArea ? 255 : 0;
     }
+    cv::parallel_for_(cv::Range(0, labels.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const int* source = labels.ptr<int>(y);
+            uchar* destination = filtered.ptr<uchar>(y);
+            for (int x = 0; x < labels.cols; ++x) {
+                destination[x] = keep[static_cast<size_t>(source[x])];
+            }
+        }
+    });
     return filtered;
 }
 
@@ -511,7 +519,7 @@ RayResult traceNearFieldRayToSource(
         const double sampleY = static_cast<double>(y) + t * dy;
         if (sampleX < 0.0 || sampleX > height.cols - 1.0 ||
             sampleY < 0.0 || sampleY > height.rows - 1.0) {
-            continue;
+            break;
         }
         cv::Point blocker;
         const float terrain = sampleMaskedHeight(height, mask, sampleX, sampleY, blocker);
@@ -1225,6 +1233,10 @@ cv::Mat resizeMaskToFull(const cv::Mat& mask, const cv::Size& fullSize, const cv
 
 } // namespace
 
+double heightReferencePlane(const cv::Mat& height, const cv::Mat& mask, const cv::Mat& normals) {
+    return referencePlaneHeight(height, mask, normals);
+}
+
 void refineHeightFromCastShadows(
     cv::Mat& height,
     const cv::Mat& receiverMask,
@@ -1241,8 +1253,9 @@ void refineHeightFromCastShadows(
     requireImage(receiverMask, height.size(), CV_8U, "Shadow refinement receiver mask");
     requireImage(occluderMask, height.size(), CV_8U, "Shadow refinement occluder mask");
     requireImage(normalMap, height.size(), CV_32FC3, "Shadow refinement normal map");
+    const bool packed = diagnostics.packedObservationMaps.size() == lights.size();
     if (images.size() != lights.size() || images.size() < 6 ||
-        diagnostics.shadowObservationMasks.size() != lights.size()) {
+        (!packed && diagnostics.shadowObservationMasks.size() != lights.size())) {
         throw std::runtime_error(
             "Shadow height refinement requires at least six calibrated images and per-light robust shadow masks.");
     }
@@ -1301,17 +1314,46 @@ void refineHeightFromCastShadows(
         progress("regularizing per-light cast-shadow evidence");
     }
     const double referenceHeightPixels = referencePlaneHeight(height, receiverMask, normalMap);
-    std::vector<cv::Mat> fullEligible(lights.size());
-    std::vector<cv::Mat> fullObserved(lights.size());
-    std::vector<cv::Mat> fullConfidence(lights.size());
+    const CoarseGrid grid = chooseCoarseGrid(height.size(), settings.maximumCoarseSide);
+    cv::Mat coarseMask = resizeMaskConservatively(receiverMask, grid.size, 0.70);
+    if (cv::countNonZero(coarseMask) < 64) {
+        throw std::runtime_error("Shadow height refinement has too little valid surface area.");
+    }
+    std::vector<cv::Mat> coarseEligible(lights.size());
+    std::vector<cv::Mat> coarseObserved(lights.size());
+    std::vector<cv::Mat> coarseConfidence(lights.size());
+    if (packed || !settings.retainFullResolutionDiagnostics) {
+        diagnostics.shadowObservationConfidence.resize(lights.size());
+    }
     for (size_t i = 0; i < lights.size(); ++i) {
-        const cv::Mat highlight = diagnostics.highlightObservationMasks.size() == lights.size()
+        cv::Mat highlight = diagnostics.highlightObservationMasks.size() == lights.size()
             ? diagnostics.highlightObservationMasks[i]
             : cv::Mat();
-        const cv::Mat saturation = diagnostics.saturationObservationMasks.size() == lights.size()
+        cv::Mat saturation = diagnostics.saturationObservationMasks.size() == lights.size()
             ? diagnostics.saturationObservationMasks[i]
             : cv::Mat();
-        fullEligible[i] = buildEligibleCastRegion(
+        cv::Mat rawShadow = packed ? cv::Mat(height.size(), CV_8U, cv::Scalar(0)) : diagnostics.shadowObservationMasks[i];
+        cv::Mat rawConfidence = diagnostics.shadowObservationConfidence.empty() ? cv::Mat() : diagnostics.shadowObservationConfidence[i];
+        if (packed) {
+            highlight = cv::Mat(height.size(), CV_8U, cv::Scalar(0));
+            saturation = cv::Mat(height.size(), CV_8U, cv::Scalar(0));
+            rawConfidence = cv::Mat(height.size(), CV_32F, cv::Scalar(0));
+            requireImage(diagnostics.packedObservationMaps[i], height.size(), CV_16U, "Packed shadow observations");
+            cv::parallel_for_(cv::Range(0, height.rows), [&](const cv::Range& range) {
+                for (int y = range.start; y < range.end; ++y) {
+                    const unsigned short* source = diagnostics.packedObservationMaps[i].ptr<unsigned short>(y);
+                    for (int x = 0; x < height.cols; ++x) {
+                        const auto label = static_cast<RobustObservationClass>(source[x] >> 13);
+                        rawShadow.ptr<uchar>(y)[x] = label == RobustObservationClass::Shadow ? 255 : 0;
+                        highlight.ptr<uchar>(y)[x] = label == RobustObservationClass::Highlight ? 255 : 0;
+                        saturation.ptr<uchar>(y)[x] = label == RobustObservationClass::Saturated ? 255 : 0;
+                        rawConfidence.ptr<float>(y)[x] = static_cast<float>(source[x] & 8191) / 8191.0f;
+                    }
+                }
+            });
+            diagnostics.packedObservationMaps[i].release();
+        }
+        const cv::Mat fullEligible = buildEligibleCastRegion(
             receiverMask,
             height,
             referenceHeightPixels,
@@ -1322,27 +1364,34 @@ void refineHeightFromCastShadows(
             static_cast<int>(i),
             static_cast<int>(lights.size()),
             settings);
-        const cv::Mat rawConfidence = diagnostics.shadowObservationConfidence.empty()
-            ? cv::Mat()
-            : diagnostics.shadowObservationConfidence[i];
         if (!rawConfidence.empty()) {
             requireImage(rawConfidence, height.size(), CV_32F, "Shadow observation confidence");
         }
-        fullObserved[i] = regularizeObservedCastMask(
-            diagnostics.shadowObservationMasks[i],
+        cv::Mat fullConfidence;
+        const cv::Mat fullObserved = regularizeObservedCastMask(
+            rawShadow,
             rawConfidence,
             images[i],
             normalMap,
-            fullEligible[i],
-            fullConfidence[i]);
+            fullEligible,
+            fullConfidence);
+        coarseEligible[i] = resizeMaskConservatively(fullEligible, grid.size, 0.60);
+        cv::bitwise_and(coarseEligible[i], coarseMask, coarseEligible[i]);
+        coarseObserved[i] = resizeMaskConservatively(fullObserved, grid.size, 0.42);
+        cv::bitwise_and(coarseObserved[i], coarseEligible[i], coarseObserved[i]);
+        cv::resize(fullConfidence, coarseConfidence[i], grid.size, 0.0, 0.0, cv::INTER_AREA);
+        coarseConfidence[i].setTo(0.0f, coarseEligible[i] == 0);
+        diagnostics.shadowObservedCastMasks[i] = settings.retainFullResolutionDiagnostics ? fullObserved : coarseObserved[i];
+        if (!settings.retainFullResolutionDiagnostics) {
+            diagnostics.shadowObservationConfidence[i] = coarseConfidence[i];
+        } else if (packed) {
+            diagnostics.shadowObservationConfidence[i] = rawConfidence;
+        }
+        if (progress) {
+            progress("shadow evidence " + std::to_string(i + 1) + "/" + std::to_string(lights.size()));
+        }
     }
-    diagnostics.shadowObservedCastMasks = fullObserved;
-
-    const CoarseGrid grid = chooseCoarseGrid(height.size(), settings.maximumCoarseSide);
-    cv::Mat coarseMask = resizeMaskConservatively(receiverMask, grid.size, 0.70);
-    if (cv::countNonZero(coarseMask) < 64) {
-        throw std::runtime_error("Shadow height refinement has too little valid surface area.");
-    }
+    diagnostics.packedObservationMaps.clear();
     cv::Mat coarseHeight = resizeMaskedScalar(height, receiverMask, grid.size);
     const cv::Mat coarseNormals = resizeMaskedNormals(normalMap, receiverMask, grid.size);
     coarseHeight -= static_cast<float>(referenceHeightPixels);
@@ -1355,17 +1404,15 @@ void refineHeightFromCastShadows(
         occlusionMask, height.size(), supportedOccluderMask);
     ShadowRefinementSettings coarseSettings = settings;
 
-    std::vector<cv::Mat> coarseEligible(lights.size());
-    std::vector<cv::Mat> coarseObserved(lights.size());
-    std::vector<cv::Mat> coarseConfidence(lights.size());
-    for (size_t i = 0; i < lights.size(); ++i) {
-        coarseEligible[i] = resizeMaskConservatively(fullEligible[i], grid.size, 0.60);
-        cv::bitwise_and(coarseEligible[i], coarseMask, coarseEligible[i]);
-        coarseObserved[i] = resizeMaskConservatively(fullObserved[i], grid.size, 0.42);
-        cv::bitwise_and(coarseObserved[i], coarseEligible[i], coarseObserved[i]);
-        cv::resize(fullConfidence[i], coarseConfidence[i], grid.size, 0.0, 0.0, cv::INTER_AREA);
-        coarseConfidence[i].setTo(0.0f, coarseEligible[i] == 0);
-    }
+    auto auditMask = [&](const cv::Mat& source) {
+        return settings.retainFullResolutionDiagnostics ? resizeMaskToFull(source, height.size(), receiverMask) : source;
+    };
+    auto auditProbability = [&](const cv::Mat& source) {
+        if (!settings.retainFullResolutionDiagnostics) return source;
+        cv::Mat result = resizeFloatToFull(source, height.size());
+        result.setTo(0.0f, receiverMask == 0);
+        return result;
+    };
 
     int coherentShadowLights = 0;
     const std::vector<int> selected = selectRefinementLights(
@@ -1452,15 +1499,11 @@ void refineHeightFromCastShadows(
     diagnostics.shadowMismatchBefore = resizeFloatToFull(mismatchBeforeCoarse, height.size());
     diagnostics.shadowMismatchAfter = diagnostics.shadowMismatchBefore.clone();
     for (const int index : selected) {
-        diagnostics.shadowPredictedBeforeMasks[static_cast<size_t>(index)] = resizeMaskToFull(
-            predictedBefore.masks[static_cast<size_t>(index)], height.size(), receiverMask);
+        diagnostics.shadowPredictedBeforeMasks[static_cast<size_t>(index)] = auditMask(predictedBefore.masks[static_cast<size_t>(index)]);
         diagnostics.shadowPredictedAfterMasks[static_cast<size_t>(index)] =
             diagnostics.shadowPredictedBeforeMasks[static_cast<size_t>(index)].clone();
         diagnostics.shadowPredictedBeforeProbability[static_cast<size_t>(index)] =
-            resizeFloatToFull(
-                predictedBefore.probabilities[static_cast<size_t>(index)], height.size());
-        diagnostics.shadowPredictedBeforeProbability[static_cast<size_t>(index)].setTo(
-            0.0f, receiverMask == 0);
+            auditProbability(predictedBefore.probabilities[static_cast<size_t>(index)]);
         diagnostics.shadowPredictedAfterProbability[static_cast<size_t>(index)] =
             diagnostics.shadowPredictedBeforeProbability[static_cast<size_t>(index)].clone();
     }
@@ -1756,15 +1799,10 @@ void refineHeightFromCastShadows(
     diagnostics.shadowMismatchBefore = resizeFloatToFull(mismatchBeforeCoarse, height.size());
     diagnostics.shadowMismatchAfter = resizeFloatToFull(selectedMismatch, height.size());
     for (const int index : selected) {
-        diagnostics.shadowPredictedBeforeMasks[static_cast<size_t>(index)] = resizeMaskToFull(
-            predictedBefore.masks[static_cast<size_t>(index)], height.size(), receiverMask);
-        diagnostics.shadowPredictedAfterMasks[static_cast<size_t>(index)] = resizeMaskToFull(
-            selectedPredictions.masks[static_cast<size_t>(index)], height.size(), receiverMask);
+        diagnostics.shadowPredictedBeforeMasks[static_cast<size_t>(index)] = auditMask(predictedBefore.masks[static_cast<size_t>(index)]);
+        diagnostics.shadowPredictedAfterMasks[static_cast<size_t>(index)] = auditMask(selectedPredictions.masks[static_cast<size_t>(index)]);
         diagnostics.shadowPredictedAfterProbability[static_cast<size_t>(index)] =
-            resizeFloatToFull(
-                selectedPredictions.probabilities[static_cast<size_t>(index)], height.size());
-        diagnostics.shadowPredictedAfterProbability[static_cast<size_t>(index)].setTo(
-            0.0f, receiverMask == 0);
+            auditProbability(selectedPredictions.probabilities[static_cast<size_t>(index)]);
     }
 
     if (progress) {

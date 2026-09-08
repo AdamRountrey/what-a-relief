@@ -48,6 +48,14 @@ int main(int argc, char** argv) {
         const cv::Mat albedo(8, 8, CV_32F, cv::Scalar(0.5f));
         const cv::Mat height(8, 8, CV_32F, cv::Scalar(0.0f));
         const cv::Mat mask(8, 8, CV_8U, cv::Scalar(255));
+        cv::Mat normals(8, 8, CV_32FC3);
+        for (int y = 0; y < 8; ++y) {
+            for (int x = 0; x < 8; ++x) {
+                const float nx = 0.02f * (x - 3);
+                const float ny = 0.03f * (y - 4);
+                normals.at<cv::Vec3f>(y, x) = cv::Vec3f(nx, ny, std::sqrt(1.0f - nx * nx - ny * ny));
+            }
+        }
         std::vector<cv::Vec3f> lights;
         std::vector<cv::Mat> images;
         for (int i = 0; i < 6; ++i) {
@@ -65,6 +73,8 @@ int main(int argc, char** argv) {
             albedo,
             height,
             mask,
+            normals,
+            std::vector<cv::Mat>(6, cv::Mat(8, 8, CV_8U, cv::Scalar(0))),
             diagnostics,
             [&](const std::string&, int percent) { lastProgress = percent; },
             []() { return false; });

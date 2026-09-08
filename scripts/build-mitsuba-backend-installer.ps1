@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.1",
+    [string]$Version = "0.2.2",
     [string]$CacheDirectory = "",
     [ValidateRange(1, 5)]
     [int]$BackendProbeAttempts = 2
@@ -25,13 +25,13 @@ $pythonVersion = "3.13.13"
 $pythonArchiveName = "python-$pythonVersion-embed-amd64.zip"
 $pythonArchiveSha256 = "8766a8775746235e23cf5aee5027ab1060bb981d93110577adcf3508aa0cbd55"
 $pythonArchiveUrl = "https://www.python.org/ftp/python/$pythonVersion/$pythonArchiveName"
-$llvmVersion = "18.1.6"
+$llvmVersion = "15.0.7"
 $llvmInstallerName = "LLVM-$llvmVersion-win64.exe"
-$llvmInstallerSha256 = "e4cf89db2f4ce3aa8f661891faa59f4961b1e12df0217c9a88d20de9ca2fe25e"
+$llvmInstallerSha256 = "5428cb72acf63ce3bc4328e546a36674c9736ec040ecc176d362201c6548e6a8"
 $llvmInstallerUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/$llvmInstallerName"
-$llvmDllSha256 = "76208d0506c4cde1178b4af7eec75dc907448f97a69c5a1d6259a29f629a1a8b"
+$llvmDllSha256 = "df43ac672e50ffa24a844fb0b24cc63326ac942d6555be35b72366ab6857d6b8"
 $llvmLicenseSha256 = "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
-$llvmLicenseUrl = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$llvmVersion/LICENSE.TXT"
+$llvmLicenseUrl = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$llvmVersion/llvm/LICENSE.TXT"
 
 $wheels = @(
     @{
@@ -259,21 +259,33 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runtime "backend-manifest.json") -Encoding UTF8
 
 $runtimePython = Join-Path $runtime "python.exe"
-& $runtimePython `
+& $runtimePython -B `
     (Join-Path $repo "tests\test_mitsuba_worker_progress.py") `
     (Join-Path $runtime "worker.py")
 if ($LASTEXITCODE -ne 0) {
     throw "The Mitsuba network progress-writer regression test failed."
 }
-& $runtimePython `
+& $runtimePython -B `
     (Join-Path $repo "tests\test_mitsuba_worker_png.py") `
     (Join-Path $runtime "worker.py")
 if ($LASTEXITCODE -ne 0) {
     throw "The Mitsuba preview PNG-writer regression test failed."
 }
+& $runtimePython -B `
+    (Join-Path $repo "tests\test_mitsuba_worker_numerics.py") `
+    (Join-Path $runtime "worker.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "The required Mitsuba worker numerical regression tests failed."
+}
 
 if (-not (Test-BackendProbe -RuntimeDirectory $runtime -Backend "llvm" -Attempts $BackendProbeAttempts)) {
     throw "The self-contained LLVM CPU backend failed its live render probe."
+}
+& $runtimePython -B `
+    (Join-Path $repo "tests\test_mitsuba_worker_rendering.py") `
+    (Join-Path $runtime "worker.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "The required Mitsuba worker LLVM CPU rendering regression tests failed."
 }
 $cudaAvailable = Test-BackendProbe -RuntimeDirectory $runtime -Backend "cuda"
 Remove-Item -LiteralPath (Join-Path $runtime "probe-llvm.json") -Force -ErrorAction SilentlyContinue

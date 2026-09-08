@@ -580,6 +580,33 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
         staleRti << "{\"status\":\"complete\"}\n";
     }
 
+    opt.mitsubaInverseRefinement = true;
+    for (const char* method : {"mitsuba_heightfield_inverse_v1", "mitsuba_heightfield_inverse_v2"}) {
+        fs::create_directories(root / "output" / "inverse");
+        {
+            std::ofstream marker(root / "output" / "inverse" / "result.json");
+            marker << "{\"method\":\"" << method << "\"}\n";
+        }
+        beginRunManifest(opt);
+        context.check(!fs::exists(root / "output" / "inverse"),
+            "repeat-run cleanup must recognize both legacy and current inverse products");
+    }
+    fs::create_directories(root / "output" / "inverse");
+    {
+        std::ofstream notes(root / "output" / "inverse" / "notes.txt");
+        notes << "unrelated user data\n";
+    }
+    bool rejectedUnrecognizedInverse = false;
+    try {
+        beginRunManifest(opt);
+    } catch (const std::exception&) {
+        rejectedUnrecognizedInverse = true;
+    }
+    context.check(rejectedUnrecognizedInverse &&
+        fs::is_regular_file(root / "output" / "inverse" / "notes.txt"),
+        "inverse cleanup must refuse unrelated directories");
+    opt.mitsubaInverseRefinement = false;
+
     const RunManifestContext run = beginRunManifest(opt);
     context.check(
         readText(root / "output" / "run_manifest.json").find("\"status\": \"in_progress\"") != std::string::npos,

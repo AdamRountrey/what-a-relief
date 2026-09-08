@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -70,8 +71,35 @@ int main(int argc, char** argv) {
                 ++observationCount;
             }
         }
-        if (observationCount != 6) {
-            throw std::runtime_error("Mitsuba job did not provide six encoded observations.");
+        if (observationCount != 12 || job.find("\"observation_validity\"") == std::string::npos ||
+            job.find("\"reference_height_pixels\"") == std::string::npos) {
+            throw std::runtime_error("Mitsuba job did not provide six observations with validity masks and datum.");
+        }
+        if (job.find("\"normal_prior_pfm\"") == std::string::npos) {
+            throw std::runtime_error("Mitsuba job did not declare its photometric normal prior.");
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            const std::string name = "input_normal_" + std::to_string(axis) + ".pfm";
+            std::ifstream in(output / name, std::ios::binary);
+            std::string magic, dimensions, scale;
+            std::getline(in, magic);
+            std::getline(in, dimensions);
+            std::getline(in, scale);
+            if (magic != "Pf" || dimensions != "8 8" || scale != "-1.0" || job.find(name) == std::string::npos) {
+                throw std::runtime_error("Invalid normal-prior PFM handoff.");
+            }
+            for (int y = 7; y >= 0; --y) {
+                for (int x = 0; x < 8; ++x) {
+                    float actual = 0;
+                    in.read(reinterpret_cast<char*>(&actual), sizeof(actual));
+                    const float nx = 0.02f * (x - 3);
+                    const float ny = 0.03f * (y - 4);
+                    const float expected = axis == 0 ? nx : axis == 1 ? ny : std::sqrt(1.0f - nx * nx - ny * ny);
+                    if (!in || !std::isfinite(actual) || std::abs(actual - expected) > 1e-7f) {
+                        throw std::runtime_error("Normal-prior axes, row orientation, or precision changed.");
+                    }
+                }
+            }
         }
         const std::vector<std::string> required = {
             "inverse_height.pfm", "inverse_height.png", "inverse_normal_rgb.png",
@@ -85,8 +113,8 @@ int main(int argc, char** argv) {
         writeFile(
             output / "result.json",
             "{\n"
-            "  \"schema_version\": 1,\n"
-            "  \"method\": \"mitsuba_heightfield_inverse_v1\",\n"
+            "  \"schema_version\": 2,\n"
+            "  \"method\": \"mitsuba_heightfield_inverse_v2\",\n"
             "  \"status\": \"complete\",\n"
             "  \"accepted\": false,\n"
             "  \"decision\": \"fake_contract_rejection\",\n"

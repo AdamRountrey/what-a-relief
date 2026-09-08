@@ -1,6 +1,7 @@
 #include "mitsuba_backend.hpp"
 
 #include "checked_io.hpp"
+#include "shadow_refinement.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -43,7 +44,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kJobSchemaVersion = 1;
+constexpr int kJobSchemaVersion = 2;
 
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -179,12 +180,14 @@ void writePfm(const fs::path& path, const cv::Mat& image, const cv::Mat& mask) {
 
 struct ObservationHandoff {
     std::vector<fs::path> paths;
+    std::vector<fs::path> validityPaths;
     double normalizationDivisor = 1.0;
 };
 
 ObservationHandoff writeObservationHandoff(
     const fs::path& directory,
     const std::vector<cv::Mat>& images,
+    const std::vector<cv::Mat>& saturationMasks,
     const cv::Size& expectedSize) {
     if (images.empty()) {
         throw std::runtime_error("Mitsuba handoff requires a nonempty linear image stack.");
@@ -210,20 +213,32 @@ ObservationHandoff writeObservationHandoff(
     }
 
     ObservationHandoff handoff;
+    if (!saturationMasks.empty() && saturationMasks.size() != images.size()) {
+        throw std::runtime_error("Mitsuba saturation mask count differs from the image count.");
+    }
     handoff.normalizationDivisor = std::max(1.0, peak);
     handoff.paths.reserve(images.size());
     fs::create_directories(directory);
     for (size_t index = 0; index < images.size(); ++index) {
         const cv::Mat& image = images[index];
         cv::Mat encoded(image.size(), CV_16U, cv::Scalar(0));
+        cv::Mat validity(image.size(), CV_8U, cv::Scalar(0));
+        if (!saturationMasks.empty() &&
+            (saturationMasks[index].size() != image.size() || saturationMasks[index].type() != CV_8U)) {
+            throw std::runtime_error("Mitsuba saturation mask dimensions/type differ from observations.");
+        }
         for (int y = 0; y < image.rows; ++y) {
             const float* source = image.ptr<float>(y);
             uint16_t* destination = encoded.ptr<uint16_t>(y);
+            uchar* valid = validity.ptr<uchar>(y);
+            const uchar* saturated = saturationMasks.empty() ? nullptr : saturationMasks[index].ptr<uchar>(y);
             for (int x = 0; x < image.cols; ++x) {
                 const double value = std::isfinite(source[x])
                     ? std::clamp(static_cast<double>(source[x]) / handoff.normalizationDivisor, 0.0, 1.0)
                     : 0.0;
                 destination[x] = cv::saturate_cast<uint16_t>(value * 65535.0);
+                valid[x] = std::isfinite(source[x]) && source[x] >= 0.0f &&
+                    (saturated == nullptr || saturated[x] == 0) ? 255 : 0;
             }
         }
         std::ostringstream name;
@@ -231,6 +246,9 @@ ObservationHandoff writeObservationHandoff(
         const fs::path path = directory / name.str();
         writeImageChecked(path, encoded, {cv::IMWRITE_PNG_COMPRESSION, 1});
         handoff.paths.push_back(path);
+        const fs::path validPath = directory / ("valid_" + name.str());
+        writeImageChecked(validPath, validity, {cv::IMWRITE_PNG_COMPRESSION, 1});
+        handoff.validityPaths.push_back(validPath);
     }
     return handoff;
 }
@@ -245,7 +263,9 @@ void writeJob(
     const fs::path& heightPath,
     const fs::path& albedoPath,
     const fs::path& maskPath,
-    const fs::path& robustWeightPath) {
+    double referenceHeightPixels,
+    const fs::path& robustWeightPath,
+    const std::vector<fs::path>& normalPaths) {
     CheckedOutputFile checked(path);
     std::ostream& out = checked.stream();
     out << std::setprecision(17);
@@ -253,12 +273,18 @@ void writeJob(
     out << "  \"schema_version\": " << kJobSchemaVersion << ",\n";
     out << "  \"application\": {\"name\": \"what-a-relief\", \"version\": \""
         << WHAT_A_RELIEF_VERSION << "\"},\n";
-    out << "  \"method\": \"mitsuba_heightfield_inverse_v1\",\n";
+    out << "  \"method\": \"mitsuba_heightfield_inverse_v2\",\n";
     out << "  \"inputs\": {\n";
     out << "    \"images\": [\n";
     for (size_t i = 0; i < observations.paths.size(); ++i) {
         out << "      \"" << jsonEscape(absolutePathString(observations.paths[i])) << "\""
             << (i + 1 == observations.paths.size() ? "\n" : ",\n");
+    }
+    out << "    ],\n";
+    out << "    \"observation_validity\": [\n";
+    for (size_t i = 0; i < observations.validityPaths.size(); ++i) {
+        out << "      \"" << jsonEscape(absolutePathString(observations.validityPaths[i])) << "\""
+            << (i + 1 == observations.validityPaths.size() ? "\n" : ",\n");
     }
     out << "    ],\n";
     out << "    \"image_transfer\": {\"encoding\": \"png16\", "
@@ -273,6 +299,11 @@ void writeJob(
     out << "    \"height_pfm\": \"" << jsonEscape(absolutePathString(heightPath)) << "\",\n";
     out << "    \"albedo_pfm\": \"" << jsonEscape(absolutePathString(albedoPath)) << "\",\n";
     out << "    \"mask_png\": \"" << jsonEscape(absolutePathString(maskPath)) << "\",\n";
+    out << "    \"normal_prior_pfm\": [";
+    for (size_t i = 0; i < normalPaths.size(); ++i) {
+        out << (i == 0 ? "" : ", ") << "\"" << jsonEscape(absolutePathString(normalPaths[i])) << "\"";
+    }
+    out << "],\n";
     out << "    \"robust_weight_pfm\": ";
     if (robustWeightPath.empty()) {
         out << "null,\n";
@@ -292,6 +323,10 @@ void writeJob(
         << "\",\n";
     out << "    \"ring_radius_mm\": " << opt.ringLightRadiusMm << ",\n";
     out << "    \"ring_height_mm\": " << opt.ringLightHeightMm << ",\n";
+    out << "    \"reference_surface_z_mm\": " << opt.shadowReferenceZMm << ",\n";
+    out << "    \"reference_height_pixels\": " << referenceHeightPixels << ",\n";
+    out << "    \"led_diameter_mm\": " << opt.shadowLedDiameterMm << ",\n";
+    out << "    \"angular_diameter_degrees\": " << opt.mitsubaLightAngleDegrees << ",\n";
     out << "    \"pixel_scale_mm_per_pixel\": " << opt.pixelScaleMm << ",\n";
     out << "    \"crop\": ";
     if (opt.hasCrop) {
@@ -584,6 +619,10 @@ void populateDiagnostics(
     MitsubaRefinementDiagnostics& diagnostics,
     const std::string& text,
     const fs::path& resultPath) {
+    if (jsonNumber(text, "schema_version", -1) != kJobSchemaVersion ||
+        jsonString(text, "method") != "mitsuba_heightfield_inverse_v2") {
+        throw std::runtime_error("Incompatible Mitsuba result schema; update the optional backend with the application.");
+    }
     diagnostics.succeeded = jsonString(text, "status") == "complete";
     diagnostics.accepted = jsonBool(text, "accepted", false);
     diagnostics.status = jsonString(text, "status", "invalid_result");
@@ -681,6 +720,8 @@ void runMitsubaInverseRefinement(
     const cv::Mat& albedo,
     const cv::Mat& height,
     const cv::Mat& heightMask,
+    const cv::Mat& normalMap,
+    const std::vector<cv::Mat>& saturationMasks,
     PhotometricDiagnostics& diagnostics,
     const std::function<void(const std::string&, int)>& progress,
     const std::function<bool()>& cancellationRequested) {
@@ -696,6 +737,9 @@ void runMitsubaInverseRefinement(
     }
     if (height.empty() || albedo.empty() || heightMask.empty()) {
         throw std::runtime_error("Mitsuba inverse refinement did not receive baseline height, albedo, and mask data.");
+    }
+    if (normalMap.size() != height.size() || normalMap.type() != CV_32FC3) {
+        throw std::runtime_error("Mitsuba refinement requires full-precision baseline normals matching the height field.");
     }
 
     const MitsubaBackendPaths paths = resolveMitsubaBackend(opt);
@@ -720,12 +764,20 @@ void runMitsubaInverseRefinement(
         writePfm(heightPath, height, heightMask);
         writePfm(albedoPath, albedo, heightMask);
         writeImageChecked(maskPath, heightMask);
+        std::vector<fs::path> normalPaths;
+        cv::Mat component;
+        for (int axis = 0; axis < 3; ++axis) {
+            normalPaths.push_back(staging / ("input_normal_" + std::to_string(axis) + ".pfm"));
+            cv::extractChannel(normalMap, component, axis);
+            writePfm(normalPaths.back(), component, heightMask);
+        }
+        component.release();
 
         if (progress) {
             progress("Encoding linear observations for the Mitsuba handoff...", 1);
         }
         const ObservationHandoff observations =
-            writeObservationHandoff(observationDirectory, images, height.size());
+            writeObservationHandoff(observationDirectory, images, saturationMasks, height.size());
 
         fs::path robustWeightPath;
         if (!diagnostics.robustWeight.empty() && diagnostics.robustWeight.size() == height.size()) {
@@ -739,7 +791,7 @@ void runMitsubaInverseRefinement(
         const fs::path jobPath = staging / "job.json";
         writeJob(
             jobPath, staging, opt, lights, observations, selectedBackend,
-            heightPath, albedoPath, maskPath, robustWeightPath);
+            heightPath, albedoPath, maskPath, heightReferencePlane(height, heightMask, normalMap), robustWeightPath, normalPaths);
 
         const int exitCode = runProcess(
             paths.python,
@@ -779,7 +831,7 @@ void runMitsubaInverseRefinement(
         if (progress) {
             progress(result.accepted
                 ? "Mitsuba refinement accepted; baseline outputs retained beside inverse results."
-                : "Mitsuba refinement rejected by holdout checks; inverse outputs equal the baseline.", 100);
+                : "Mitsuba refinement rejected by validation checks; inverse outputs equal the baseline.", 100);
         }
     } catch (...) {
         std::error_code observationCleanupError;

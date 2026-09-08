@@ -90,16 +90,20 @@ set(required_outputs
     "${printable_path}")
 if(NOT UNCALIBRATED)
     list(APPEND required_outputs
+        "${rti_dir}/info.json"
+        "${rti_dir}/rti_manifest.json")
+endif()
+if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
+    list(APPEND required_outputs
         "${output_dir}/robust_weight.png"
+        "${output_dir}/robust_fallback_mask.png"
         "${output_dir}/robust_unsupported_mask.png"
         "${output_dir}/robust_inlier_count.png"
         "${output_dir}/robust_local_condition.png"
         "${output_dir}/shadow_count.png"
         "${output_dir}/highlight_outlier_count.png"
         "${output_dir}/saturation_count.png"
-        "${output_dir}/model_mismatch_count.png"
-        "${rti_dir}/info.json"
-        "${rti_dir}/rti_manifest.json")
+        "${output_dir}/model_mismatch_count.png")
 endif()
 if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
     list(APPEND required_outputs
@@ -163,6 +167,47 @@ if(UNCALIBRATED)
     string(JSON condition_type TYPE "${manifest}" diagnostics lighting_condition_number)
     if(NOT condition_type STREQUAL "NULL")
         message(FATAL_ERROR "Uncalibrated workflow manifest must mark lighting condition as not applicable")
+    endif()
+endif()
+
+if(NOT UNCALIBRATED AND NOT ENABLE_NEURAL)
+    # Reuse the diagnostics-rich folder with ordinary output settings. Check
+    # scientific products and cleanup, not merely the list of expected files.
+    set(core_images normal_rgb normal_x normal_y normal_z hillshade_ul albedo residual valid_mask liquid_metal)
+    foreach(name IN LISTS core_images)
+        file(SHA256 "${output_dir}/${name}.png" before_${name})
+    endforeach()
+    set(default_arguments --out "${output_dir}" --no-gui --no-height --solver robust
+        --lights-file "${output_dir}/lights.csv")
+    foreach(index RANGE 0 7)
+        list(APPEND default_arguments --image "${FIXTURE_DIRECTORY}/inputs/image_${index}.png")
+    endforeach()
+    execute_process(COMMAND "${APP_EXECUTABLE}" ${default_arguments}
+        RESULT_VARIABLE default_result OUTPUT_VARIABLE default_stdout ERROR_VARIABLE default_stderr)
+    if(NOT default_result EQUAL 0)
+        message(FATAL_ERROR "Default robust export failed:\n${default_stdout}\n${default_stderr}")
+    endif()
+    file(GLOB default_images "${output_dir}/*.png")
+    list(LENGTH default_images default_image_count)
+    if(NOT default_image_count EQUAL 9)
+        message(FATAL_ERROR "Default robust export wrote ${default_image_count} PNGs, expected exactly nine")
+    endif()
+    foreach(name IN LISTS core_images)
+        file(SHA256 "${output_dir}/${name}.png" after_hash)
+        if(NOT after_hash STREQUAL before_${name})
+            message(FATAL_ERROR "Toggling diagnostic export changed ${name}.png")
+        endif()
+    endforeach()
+    file(GLOB stale_observations "${output_dir}/robust_observations/*.png")
+    if(stale_observations)
+        message(FATAL_ERROR "A default rerun retained stale per-light diagnostics")
+    endif()
+    file(READ "${output_dir}/run_manifest.json" default_manifest)
+    string(JSON default_status GET "${default_manifest}" status)
+    string(JSON diagnostics_enabled GET "${default_manifest}" parameters specular_diagnostics)
+    string(FIND "${default_manifest}" "robust_weight.png" diagnostic_output_index)
+    if(NOT default_status STREQUAL "complete" OR diagnostics_enabled OR NOT diagnostic_output_index EQUAL -1)
+        message(FATAL_ERROR "Default manifest still requires diagnostic images or is incomplete")
     endif()
 endif()
 

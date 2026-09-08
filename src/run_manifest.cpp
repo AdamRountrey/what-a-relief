@@ -315,7 +315,8 @@ bool fileContainsMitsubaMethodMarker(const fs::path& path) {
     text.resize(kMaximumMarkerBytes);
     in.read(text.data(), static_cast<std::streamsize>(text.size()));
     text.resize(static_cast<size_t>(in.gcount()));
-    return text.find("mitsuba_heightfield_inverse_v1") != std::string::npos;
+    return text.find("mitsuba_heightfield_inverse_v1") != std::string::npos ||
+        text.find("mitsuba_heightfield_inverse_v2") != std::string::npos;
 }
 
 void removeKnownMitsubaDirectory(const Options& opt) {
@@ -436,7 +437,7 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
         outputDir / "residual.png",
         outputDir / "valid_mask.png",
         outputDir / "liquid_metal.png"};
-    if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust) {
+    if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust && opt.specularDiagnostics) {
         paths.push_back(outputDir / "robust_weight.png");
         paths.push_back(outputDir / "robust_fallback_mask.png");
         paths.push_back(outputDir / "robust_unsupported_mask.png");
@@ -671,6 +672,7 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"mitsuba_inverse_refinement\": " << (opt.mitsubaInverseRefinement ? "true" : "false") << ",\n";
     out << "    \"mitsuba_backend_requested\": \"" << mitsubaBackendName(opt.mitsubaBackendMode) << "\",\n";
     out << "    \"mitsuba_quality\": \"" << mitsubaQualityName(opt.mitsubaQualityMode) << "\",\n";
+    out << "    \"mitsuba_light_angle_degrees\": " << opt.mitsubaLightAngleDegrees << ",\n";
     out << "    \"mitsuba_python_override\": ";
     writePathOrNull(out, opt.mitsubaPythonPath);
     out << ",\n";
@@ -809,7 +811,7 @@ void completeRunManifest(
     if (opt.mitsubaInverseRefinement) {
         const MitsubaRefinementDiagnostics& inverse = diagnostics.mitsuba;
         out << ", \"mitsuba_inverse_refinement\": {"
-            << "\"method\": \"mitsuba_heightfield_inverse_v1\""
+            << "\"method\": \"mitsuba_heightfield_inverse_v2\""
             << ", \"attempted\": " << (inverse.attempted ? "true" : "false")
             << ", \"succeeded\": " << (inverse.succeeded ? "true" : "false")
             << ", \"accepted\": " << (inverse.accepted ? "true" : "false")

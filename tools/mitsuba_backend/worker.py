@@ -26,8 +26,9 @@ from typing import Any
 import numpy as np
 
 
-JOB_SCHEMA_VERSION = 1
-METHOD_ID = "mitsuba_heightfield_inverse_v1"
+JOB_SCHEMA_VERSION = 2
+METHOD_ID = "mitsuba_heightfield_inverse_v2"
+NORMAL_PRIOR_STRENGTH = 0.25
 METHOD_REFERENCES = (
     {"id": "zhang2023projective", "doi": "10.1145/3618385"},
     {"id": "jakob2022drjit", "doi": "10.1145/3528223.3530099"},
@@ -37,23 +38,29 @@ METHOD_REFERENCES = (
 QUALITY = {
     "preview": {
         "max_side": 64,
-        "iterations_ad": 6,
-        "spp": 1,
-        "control_spacing": 12,
+        "iterations_ad": 12,
+        "spp": 16,
+        "validation_spp": 64,
+        "control_spacing": 2,
+        "material_refit_interval": 4,
         "learning_rate": 0.018,
     },
     "standard": {
         "max_side": 128,
-        "iterations_ad": 18,
-        "spp": 2,
-        "control_spacing": 10,
+        "iterations_ad": 24,
+        "spp": 16,
+        "validation_spp": 128,
+        "control_spacing": 2,
+        "material_refit_interval": 4,
         "learning_rate": 0.012,
     },
     "research": {
         "max_side": 256,
         "iterations_ad": 50,
-        "spp": 4,
-        "control_spacing": 8,
+        "spp": 32,
+        "validation_spp": 256,
+        "control_spacing": 2,
+        "material_refit_interval": 5,
         "learning_rate": 0.008,
     },
 }
@@ -154,49 +161,82 @@ def configure_backend(name: str):
         return mi, "cuda_ad_rgb", "adam_projective_autodiff"
     if name == "llvm":
         mi.set_variant("llvm_ad_rgb")
+        import drjit as dr
+        if os.name == "nt" and dr.detail.llvm_version()[0] != 15:
+            raise RuntimeError("Windows CPU inverse rendering requires the packaged LLVM 15 runtime. Reinstall the current what-a-relief Mitsuba backend; older LLVM 18 packages have native JIT failures.")
+        dr.set_thread_count(min(8, max(1, (os.cpu_count() or 1) // 2)))
         return mi, "llvm_ad_rgb", "adam_projective_autodiff"
     raise ValueError(f"Unsupported backend selection: {name}")
 
 
 def tiny_probe(mi, backend: str) -> None:
+    gradient, _ = shadow_gradient_probe(mi, "near_field_ring", side=16, spp=32)
+    if not np.all(np.isfinite(gradient)) or float(np.mean(np.abs(gradient))) <= 1.0e-5:
+        raise RuntimeError("Mitsuba projective probe returned no finite moving-shadow derivative")
+
+
+def shadow_gradient_probe(mi, lighting_model: str, side: int = 40, spp: int = 128, finite_difference: bool = False):
+    """Only the blocker's shadow is visible, so a material gradient cannot pass."""
+    import drjit as dr
+
     transform = mi.ScalarTransform4f
-    integrator = "direct_projective"
+    geometry = {
+        "lighting_model": lighting_model, "ring_radius_world": 3.0,
+        "ring_height_world": 5.0, "led_diameter_world": 0.2,
+        "directional_distance_world": 100.0, "angular_diameter_degrees": 2.0,
+        "fallback_azimuth": math.pi,
+    }
     scene = mi.load_dict(
         {
             "type": "scene",
-            "integrator": {"type": integrator},
+            "integrator": {"type": "direct_projective"},
             "sensor": {
                 "type": "perspective",
                 "to_world": transform().look_at(
-                    origin=[0.0, 0.0, 3.0], target=[0.0, 0.0, 0.0], up=[0.0, 1.0, 0.0]
+                    origin=[0.0, 0.0, 10.0], target=[0.0, 0.0, 0.0], up=[0.0, 1.0, 0.0]
                 ),
-                "fov": 38.0,
+                "fov": 8.0,
                 "fov_axis": "x",
-                "sampler": {"type": "independent", "sample_count": 1},
+                "sampler": {"type": "independent", "sample_count": spp},
                 "film": {
                     "type": "hdrfilm",
-                    "width": 2,
-                    "height": 2,
+                    "width": side,
+                    "height": side,
                     "pixel_format": "rgb",
                     "component_format": "float32",
+                    "sample_border": True,
                     "rfilter": {"type": "box"},
                 },
             },
             "surface": {
                 "type": "rectangle",
+                "to_world": transform().scale(10),
                 "bsdf": {"type": "diffuse", "reflectance": 0.5},
             },
-            "emitter": {
-                "type": "directional",
-                "direction": [0.0, 0.0, -1.0],
-                "irradiance": math.pi,
+            "blocker": {
+                "type": "sphere", "to_world": transform().translate([-1.5, 0, 2.5]).scale(0.22),
+                "bsdf": {"type": "diffuse", "reflectance": 0.5},
             },
+            "emitter": finite_emitter(mi, np.array([-0.6, 0, 1.0]), geometry),
         }
     )
-    image = mi.render(scene, spp=1, seed=11)
-    value = float(np.asarray(image).mean())
-    if not math.isfinite(value) or value <= 0.0:
-        raise RuntimeError("Mitsuba live render probe returned no finite illumination")
+    params = mi.traverse(scene)
+    z = mi.Float(2.5)
+    dr.enable_grad(z)
+    params["blocker.to_world"] = mi.Transform4f().translate(mi.Vector3f(-1.5, 0, z)).scale(0.22)
+    params.update()
+    image = mi.render(scene, params, spp=spp, spp_grad=spp, seed=812)
+    dr.forward(z)
+    gradient = np.array(dr.grad(image), copy=True)
+    numerical = None
+    if finite_difference:
+        pair = []
+        for height in (2.48, 2.52):
+            params["blocker.to_world"] = mi.Transform4f().translate([-1.5, 0, height]).scale(0.22)
+            params.update()
+            pair.append(np.array(mi.render(scene, params, spp=4 * spp, seed=93), copy=True))
+        numerical = (pair[1] - pair[0]) / 0.04
+    return gradient, numerical
 
 
 def probe(backend: str, result_path: Path) -> int:
@@ -216,6 +256,7 @@ def probe(backend: str, result_path: Path) -> int:
                 "drjit_version": dr.__version__,
                 "numpy_version": np.__version__,
                 "python_version": platform.python_version(),
+                "llvm_version": list(dr.detail.llvm_version()) if backend == "llvm" else None,
             },
         )
         return 0
@@ -326,8 +367,8 @@ def resize_bilinear(image: np.ndarray, new_height: int, new_width: int) -> np.nd
     old_height, old_width = image.shape[-2:]
     if (old_height, old_width) == (new_height, new_width):
         return image.copy()
-    ys = np.linspace(0.0, old_height - 1.0, new_height, dtype=np.float32)
-    xs = np.linspace(0.0, old_width - 1.0, new_width, dtype=np.float32)
+    ys = np.clip((np.arange(new_height, dtype=np.float32) + 0.5) * old_height / new_height - 0.5, 0, old_height - 1)
+    xs = np.clip((np.arange(new_width, dtype=np.float32) + 0.5) * old_width / new_width - 0.5, 0, old_width - 1)
     y0 = np.floor(ys).astype(np.int32)
     x0 = np.floor(xs).astype(np.int32)
     y1 = np.minimum(y0 + 1, old_height - 1)
@@ -343,6 +384,30 @@ def resize_nearest(image: np.ndarray, new_height: int, new_width: int) -> np.nda
     ys = np.rint(np.linspace(0.0, image.shape[-2] - 1.0, new_height)).astype(np.int32)
     xs = np.rint(np.linspace(0.0, image.shape[-1] - 1.0, new_width)).astype(np.int32)
     return image[..., ys[:, None], xs[None, :]].copy()
+
+
+def resize_area(image: np.ndarray, new_height: int, new_width: int) -> np.ndarray:
+    """Integrate source pixel footprints; no new imaging dependency is needed."""
+    result = np.asarray(image, dtype=np.float32)
+    for axis, count in ((-2, new_height), (-1, new_width)):
+        old = result.shape[axis]
+        if count == old:
+            continue
+        if count > old:
+            return resize_bilinear(result, new_height, new_width)
+        values = np.moveaxis(result, axis, -1)
+        cumulative = np.concatenate((np.zeros_like(values[..., :1]), np.cumsum(values, axis=-1, dtype=np.float64)), axis=-1)
+        edges = np.linspace(0, old, count + 1)
+        index = np.minimum(edges.astype(np.int64), old - 1)
+        integrals = cumulative[..., index] + values[..., index] * (edges - index)
+        result = np.moveaxis(np.diff(integrals, axis=-1) / (old / count), -1, axis).astype(np.float32)
+    return result
+
+
+def masked_resize(image: np.ndarray, mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    coverage = resize_area(mask.astype(np.float32), height, width)
+    total = resize_area(np.where(mask, image, 0.0), height, width)
+    return np.divide(total, coverage, out=np.zeros_like(total), where=coverage > 1.0e-6)
 
 
 def crop_bounds(mask: np.ndarray, margin: int = 3) -> tuple[int, int, int, int]:
@@ -369,11 +434,98 @@ def normalized_height(height: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray,
     return result, datum
 
 
-def surface_normals(height: np.ndarray) -> np.ndarray:
-    q, p = np.gradient(height.astype(np.float32))
+def masked_slopes(height: np.ndarray, mask: np.ndarray, spacing_y=1.0, spacing_x=1.0):
+    slopes = []
+    for axis, spacing in ((0, spacing_y), (1, spacing_x)):
+        previous = np.roll(height, 1, axis=axis)
+        following = np.roll(height, -1, axis=axis)
+        before = np.roll(mask, 1, axis=axis) & mask
+        after = np.roll(mask, -1, axis=axis) & mask
+        edge = [slice(None)] * 2
+        edge[axis] = 0
+        before[tuple(edge)] = False
+        edge[axis] = -1
+        after[tuple(edge)] = False
+        difference = np.where(after, following - height, 0.0) + np.where(before, height - previous, 0.0)
+        steps = before.astype(np.float32) + after.astype(np.float32)
+        slopes.append(np.divide(difference, steps * spacing, out=np.zeros_like(height), where=steps > 0))
+    return tuple(slopes)
+
+
+def surface_normals(height: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    if mask is None:
+        mask = np.ones_like(height, dtype=bool)
+    q, p = masked_slopes(height.astype(np.float32), mask)
     normals = np.stack((-p, q, np.ones_like(height)), axis=-1)
     length = np.linalg.norm(normals, axis=-1, keepdims=True)
     return normals / np.maximum(length, 1.0e-8)
+
+
+def slope_stencils(mask: np.ndarray, spacing_y: float, spacing_x: float):
+    center = np.arange(mask.size, dtype=np.uint32).reshape(mask.shape)
+    stencils = []
+    for axis, spacing in ((0, spacing_y), (1, spacing_x)):
+        before = np.roll(mask, 1, axis=axis) & mask
+        after = np.roll(mask, -1, axis=axis) & mask
+        edge = [slice(None), slice(None)]
+        edge[axis] = 0
+        before[tuple(edge)] = False
+        edge[axis] = -1
+        after[tuple(edge)] = False
+        left = np.where(before, np.roll(center, 1, axis=axis), center)
+        right = np.where(after, np.roll(center, -1, axis=axis), center)
+        steps = before.astype(np.float32) + after.astype(np.float32)
+        scale = np.divide(1.0, steps * spacing, out=np.zeros_like(steps), where=steps > 0)
+        stencils.append((left.ravel(), right.ravel(), scale.ravel()))
+    return stencils
+
+
+def load_normal_prior(inputs, mask, confidence, bounds, shape):
+    paths = inputs.get("normal_prior_pfm")
+    if paths is None:
+        return np.zeros((*shape, 3), np.float32), np.zeros(shape, np.float32)
+    if not isinstance(paths, list) or len(paths) != 3:
+        raise ValueError("Normal prior requires three full-precision XYZ component maps")
+    z = read_pfm(Path(paths[2]))
+    if z.shape != mask.shape:
+        raise ValueError("Normal prior dimensions differ from height")
+    supported = mask & np.isfinite(z) & (z > 0.15)
+    weight = np.where(supported, np.clip(confidence, 0, 1) * np.clip(z, 0, 1)**2, 0)
+    x0, y0, x1, y1 = bounds
+    crop = np.s_[y0:y1, x0:x1]
+    reduced_weight = resize_area(weight[crop], *shape)
+    prior = np.zeros((*shape, 3), np.float32)
+    for axis in (2, 0, 1):
+        component = z if axis == 2 else read_pfm(Path(paths[axis]))
+        if component.shape != mask.shape or np.any(~np.isfinite(component[weight > 0])) or np.any(np.abs(component[weight > 0]) > 1.0001):
+            raise ValueError("Invalid supported normal-prior component")
+        weighted = np.where(weight > 0, component, 0) * weight
+        prior[..., axis] = np.divide(resize_area(weighted[crop], *shape), reduced_weight,
+                                    out=np.zeros(shape, np.float32), where=reduced_weight > 0)
+    length = np.linalg.norm(prior, axis=-1)
+    prior /= np.maximum(length[..., None], 1e-8)
+    reduced_weight[length < 1e-6] = 0
+    return prior, reduced_weight
+
+
+def normal_prior_loss(prepared, height_world):
+    weight = prepared["normal_prior_weight"]
+    if not np.any(weight > 0):
+        return 0.0
+    spacing_y, spacing_x = prepared["world_spacing"]
+    q, p = masked_slopes(height_world, prepared["mask_small"], spacing_y, spacing_x)
+    n = np.stack((-p, q, np.ones_like(p)), axis=-1)
+    n /= np.linalg.norm(n, axis=-1, keepdims=True)
+    return float(np.sum(np.sum((n - prepared["normal_prior"])**2, axis=-1) * weight) / weight.sum())
+
+
+def normal_prior_loss_ad(mi, dr, z, prior, weight, stencils, denominator):
+    q, p = [(dr.gather(mi.Float, z, b) - dr.gather(mi.Float, z, a)) * scale
+            for a, b, scale in stencils]
+    inv_length = dr.rsqrt(1.0 + p * p + q * q)
+    error = ((-p * inv_length - prior[0])**2
+             + (q * inv_length - prior[1])**2 + (inv_length - prior[2])**2)
+    return dr.sum(error * weight) / denominator
 
 
 def control_mapping(height: int, width: int, spacing: int):
@@ -410,7 +562,7 @@ def expand_control_numpy(control: np.ndarray, mapping) -> np.ndarray:
     return expanded
 
 
-def write_grid_ply(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
+def write_grid_ply(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, mask: np.ndarray) -> None:
     height, width = z.shape
     xx, yy = np.meshgrid(x, y)
     vertices = np.stack((xx, yy, z), axis=-1).reshape((-1, 3))
@@ -427,6 +579,9 @@ def write_grid_ply(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> N
         ),
         axis=0,
     )
+    faces = faces[np.all(mask.ravel()[faces], axis=1)]
+    if not len(faces):
+        raise ValueError("Inverse mask contains no supported triangles")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as stream:
         stream.write(
@@ -492,6 +647,34 @@ def write_masked_ply(path: Path, height: np.ndarray, mask: np.ndarray, albedo: n
         records.tofile(stream)
 
 
+def finite_emitter(mi, light: np.ndarray, geometry: dict[str, Any]):
+    if geometry["lighting_model"] == "near_field_ring":
+        radial = math.hypot(float(light[0]), float(light[1]))
+        if radial <= 1.0e-8:
+            angle = geometry["fallback_azimuth"]
+            ax, ay = math.cos(angle), math.sin(angle)
+        else:
+            ax, ay = float(light[0]) / radial, float(light[1]) / radial
+        position = np.array([geometry["ring_radius_world"] * ax, geometry["ring_radius_world"] * ay, geometry["ring_height_world"]])
+        radius = 0.5 * geometry["led_diameter_world"]
+    else:
+        direction = light / np.linalg.norm(light)
+        distance = geometry["directional_distance_world"]
+        position = direction * distance
+        radius = distance * math.tan(math.radians(geometry["angular_diameter_degrees"] * 0.5))
+    if not math.isfinite(radius) or radius <= 0 or not np.all(np.isfinite(position)) or np.linalg.norm(position) <= 1.0e-8:
+        raise ValueError("Projective inverse rendering requires a positive finite emitter size")
+    # A disk facing the reference origin. Its radiance gives pi irradiance on
+    # a perpendicular plane at that origin: E = pi * L * r^2 / (d^2 + r^2).
+    direction = -position / np.linalg.norm(position)
+    up = [1.0, 0.0, 0.0] if abs(direction[1]) > 0.95 else [0.0, 1.0, 0.0]
+    transform = mi.ScalarTransform4f().look_at(origin=position.tolist(), target=[0, 0, 0], up=up).scale(radius)
+    return {
+        "type": "disk", "to_world": transform,
+        "emitter": {"type": "area", "radiance": float((position @ position + radius * radius) / (radius * radius))},
+    }
+
+
 def scene_dictionary(mi, mesh_path: Path, basis: str, light: np.ndarray, geometry: dict[str, Any], camera: dict[str, Any], backend: str, spp: int):
     transform = mi.ScalarTransform4f
     if basis == "diffuse":
@@ -508,28 +691,7 @@ def scene_dictionary(mi, mesh_path: Path, basis: str, light: np.ndarray, geometr
             "specular_reflectance": 1.0,
             "nonlinear": False,
         }
-    if geometry["lighting_model"] == "near_field_ring":
-        radial = math.hypot(float(light[0]), float(light[1]))
-        if radial <= 1.0e-8:
-            azimuth = geometry["fallback_azimuth"]
-            ax, ay = math.cos(azimuth), math.sin(azimuth)
-        else:
-            ax, ay = float(light[0]) / radial, float(light[1]) / radial
-        radius = geometry["ring_radius_world"]
-        light_height = geometry["ring_height_world"]
-        position = [radius * ax, radius * ay, light_height]
-        reference_squared = radius * radius + light_height * light_height
-        emitter = {
-            "type": "point",
-            "position": position,
-            "intensity": math.pi * reference_squared,
-        }
-    else:
-        emitter = {
-            "type": "directional",
-            "direction": [-float(light[0]), -float(light[1]), -float(light[2])],
-            "irradiance": math.pi,
-        }
+    emitter = finite_emitter(mi, light, geometry)
     integrator = "direct_projective"
     return {
         "type": "scene",
@@ -550,6 +712,7 @@ def scene_dictionary(mi, mesh_path: Path, basis: str, light: np.ndarray, geometr
                 "height": camera["height"],
                 "pixel_format": "rgb",
                 "component_format": "float32",
+                "sample_border": True,
                 "rfilter": {"type": "box"},
             },
         },
@@ -563,64 +726,83 @@ def scene_dictionary(mi, mesh_path: Path, basis: str, light: np.ndarray, geometr
     }
 
 
-def scene_parameters(mi, scenes):
-    result = []
-    for scene in scenes:
-        params = mi.traverse(scene)
-        keys = [key for key in params.keys() if key.endswith("vertex_positions")]
-        if len(keys) != 1:
-            raise RuntimeError(f"Expected one differentiable mesh in Mitsuba scene, found: {keys}")
-        result.append((params, keys[0]))
-    return result
+def update_scene_parameters(mi, record, positions):
+    params, key, emitter = record
+    params[key] = positions
+    params["emitter.to_world"] = emitter["to_world"]
+    params["emitter.emitter.radiance.value"] = mi.Color3f(emitter["emitter"]["radiance"])
+    params.update()
+    return params
 
 
 def render_numpy(mi, scenes, parameters, positions: np.ndarray, spp: int, seed: int) -> np.ndarray:
     rendered = []
     flattened = mi.Float(positions.astype(np.float32).ravel())
-    for index, (scene, (params, key)) in enumerate(zip(scenes, parameters)):
-        params[key] = flattened
-        params.update()
+    for index, (scene, record) in enumerate(zip(scenes, parameters)):
+        params = update_scene_parameters(mi, record, flattened)
         image = np.asarray(mi.render(scene, params, spp=spp, seed=seed + index))
         rendered.append(image.mean(axis=2).astype(np.float32))
     return np.stack(rendered, axis=0)
 
 
-def fit_material_maps(basis: np.ndarray, observed: np.ndarray, mask: np.ndarray, albedo_prior: np.ndarray, train: list[int]):
+def fit_material_maps(basis: np.ndarray, observed: np.ndarray, mask: np.ndarray, albedo_prior: np.ndarray, train: list[int], weights: np.ndarray | None = None):
     # basis has shape [basis, light, y, x]. Solve three nonnegative coefficients
     # per pixel with a weak prior on classical diffuse albedo.
     x = np.moveaxis(basis[:, train], 0, -1)  # [light, y, x, basis]
     x = np.moveaxis(x, 0, -2)  # [y, x, light, basis]
     y = np.moveaxis(observed[train], 0, -1)[..., None]  # [y, x, light, 1]
-    xt = np.swapaxes(x, -1, -2)
+    if weights is None:
+        weights = np.broadcast_to(mask, observed.shape).astype(np.float32)
+    selected = np.moveaxis(weights[train], 0, -1)[..., None]
+    xt = np.swapaxes(x * selected, -1, -2)
     normal = xt @ x
     rhs = (xt @ y)[..., 0]
     ridge = np.array([0.08, 0.14, 0.14], dtype=np.float32)
     normal += np.eye(3, dtype=np.float32) * ridge
     rhs[..., 0] += ridge[0] * albedo_prior
-    try:
-        coefficients = np.linalg.solve(normal, rhs[..., None])[..., 0]
-    except np.linalg.LinAlgError:
-        coefficients = np.zeros((*mask.shape, 3), dtype=np.float32)
-        for row, col in zip(*np.nonzero(mask)):
-            coefficients[row, col] = np.linalg.lstsq(
-                normal[row, col], rhs[row, col], rcond=1.0e-5
-            )[0]
-    coefficients = np.maximum(coefficients, 0.0).astype(np.float32)
-    coefficients[..., 0] = np.minimum(coefficients[..., 0], max(2.0, float(np.quantile(albedo_prior[mask], 0.995)) * 2.5))
-    specular_limit = max(0.25, float(np.quantile(observed[:, mask], 0.995)) * 3.0)
-    coefficients[..., 1:] = np.minimum(coefficients[..., 1:], specular_limit)
+    valid_values = observed[train][weights[train] > 0]
+    if not valid_values.size:
+        raise ValueError("No valid training observations for inverse material fitting")
+    specular_limit = max(0.25, float(np.quantile(valid_values, 0.995)) * 3.0)
+    upper = np.array([max(2.0, float(np.quantile(albedo_prior[mask], 0.995)) * 2.5), specular_limit, specular_limit])
+    coefficients = bounded_material_solve(normal, rhs, upper)
     coefficients[~mask] = 0.0
-    specular = coefficients[..., 1] + coefficients[..., 2]
-    roughness = np.where(
-        specular > 1.0e-6,
-        (0.075 * coefficients[..., 1] + 0.32 * coefficients[..., 2]) / np.maximum(specular, 1.0e-6),
-        0.32,
-    ).astype(np.float32)
-    return coefficients, roughness
+    return coefficients, material_roughness(coefficients)
+
+
+def bounded_material_solve(normal: np.ndarray, rhs: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    # Three coefficients permit exact enumeration of lower/free/upper active
+    # sets. Refit free variables after binding any correlated coefficient.
+    best = np.zeros_like(rhs)
+    best_loss = np.full(rhs.shape[:-1], np.inf)
+    for code in range(27):
+        states = [(code // 3**i) % 3 for i in range(3)]
+        free = [i for i in range(3) if states[i] == 1]
+        candidate = np.zeros_like(rhs)
+        for i in range(3):
+            if states[i] == 2:
+                candidate[..., i] = upper[i]
+        if free:
+            adjusted = rhs - (normal @ candidate[..., None])[..., 0]
+            block = normal[..., free, :][..., :, free]
+            candidate[..., free] = np.linalg.solve(block, adjusted[..., free, None])[..., 0]
+        feasible = np.all((candidate >= 0) & (candidate <= upper), axis=-1)
+        loss = np.sum(candidate * ((normal @ candidate[..., None])[..., 0] - 2 * rhs), axis=-1)
+        improve = feasible & (loss < best_loss)
+        best[improve] = candidate[improve]
+        best_loss[improve] = loss[improve]
+    return best.astype(np.float32)
 
 
 def prediction_numpy(basis: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
     return np.sum(basis * np.moveaxis(coefficients, -1, 0)[:, None, :, :], axis=0)
+
+
+def material_roughness(coefficients: np.ndarray) -> np.ndarray:
+    specular = coefficients[..., 1] + coefficients[..., 2]
+    return np.where(specular > 1.0e-6,
+                    (0.075 * coefficients[..., 1] + 0.32 * coefficients[..., 2])
+                    / np.maximum(specular, 1.0e-6), 0.32).astype(np.float32)
 
 
 def data_loss_numpy(prediction: np.ndarray, observed: np.ndarray, weights: np.ndarray, indices: list[int]) -> float:
@@ -629,6 +811,17 @@ def data_loss_numpy(prediction: np.ndarray, observed: np.ndarray, weights: np.nd
     selected = weights[indices]
     denominator = float(selected.sum())
     return float((robust * selected).sum() / max(denominator, 1.0e-8))
+
+
+def refit_training_material(basis, observed, mask, albedo, train, weights, coefficients):
+    refitted, _ = fit_material_maps(basis, observed, mask, albedo, train, weights)
+    current_loss = data_loss_numpy(prediction_numpy(basis, coefficients), observed, weights, train)
+    refitted_loss = data_loss_numpy(prediction_numpy(basis, refitted), observed, weights, train)
+    # The bounded least-squares material fit and Charbonnier geometry loss
+    # differ. Retain the current material if refitting increases the latter.
+    if math.isfinite(refitted_loss) and refitted_loss < current_loss:
+        return refitted, refitted_loss
+    return coefficients.copy(), current_loss
 
 
 def _is_remote_path(path: Path) -> bool:
@@ -703,7 +896,7 @@ def display_stretch(values: np.ndarray, mask: np.ndarray, symmetric: bool = Fals
 def output_products(mi, output: Path, baseline: np.ndarray, correction: np.ndarray, mask: np.ndarray, albedo: np.ndarray, height_scale: float) -> None:
     final_height = baseline + correction
     final_height[~mask] = 0.0
-    normals = surface_normals(final_height)
+    normals = surface_normals(final_height, mask)
     normals[~mask] = 0.0
     write_pfm(output / "inverse_height.pfm", final_height)
     write_pfm(output / "height_correction.pfm", correction)
@@ -743,30 +936,68 @@ def prepare_job(
     lights = np.asarray(inputs["lights"], dtype=np.float32)
     if len(image_paths) < 6 or lights.shape != (len(image_paths), 3):
         raise ValueError("Inverse rendering requires at least six images and one 3-vector per image")
+    if not np.all(np.isfinite(lights)) or np.any(np.linalg.norm(lights, axis=1) <= 1.0e-8):
+        raise ValueError("Inverse light directions must be finite and nonzero")
     progress(5, "Loading linear image stack and baseline geometry")
-    images = read_stack(mi, image_paths, bool(parameters["srgb_decode"]))
+    validity_paths = [Path(path) for path in inputs["observation_validity"]]
+    if len(validity_paths) != len(image_paths):
+        raise ValueError("Inverse handoff requires one validity mask per observation")
     height = read_pfm(Path(inputs["height_pfm"]))
     albedo = read_pfm(Path(inputs["albedo_pfm"]))
     mask = bitmap_array(mi, Path(inputs["mask_png"])) > 0.0
-    if images.shape[1:] != height.shape or height.shape != albedo.shape or mask.shape != height.shape:
+    if height.shape != albedo.shape or mask.shape != height.shape:
         raise ValueError("Mitsuba handoff image, height, albedo, and mask dimensions differ")
-    robust_weight = np.ones_like(height, dtype=np.float32)
+    if not np.all(np.isfinite(height[mask])) or not np.all(np.isfinite(albedo[mask])):
+        raise ValueError("Supported inverse height and albedo values must be finite")
+    raw_robust_weight = np.ones_like(height, dtype=np.float32)
+    robust_weight = raw_robust_weight
     robust_path = inputs.get("robust_weight_pfm")
     if robust_path:
-        robust_weight = np.clip(read_pfm(Path(robust_path)), 0.05, 1.0)
+        raw_robust_weight = read_pfm(Path(robust_path))
+        robust_weight = np.clip(raw_robust_weight, 0.05, 1.0)
+        if robust_weight.shape != height.shape or not np.all(np.isfinite(robust_weight[mask])):
+            raise ValueError("Inverse confidence dimensions or values are invalid")
     x0, y0, x1, y1 = crop_bounds(mask)
-    images_crop = images[:, y0:y1, x0:x1]
     height_crop = height[y0:y1, x0:x1]
     albedo_crop = albedo[y0:y1, x0:x1]
     mask_crop = mask[y0:y1, x0:x1]
     weight_crop = robust_weight[y0:y1, x0:x1]
     render_height, render_width = target_size(y1 - y0, x1 - x0, int(settings["max_side"]))
-    images_small = resize_bilinear(images_crop, render_height, render_width)
-    height_small = resize_bilinear(height_crop, render_height, render_width)
-    albedo_small = resize_bilinear(albedo_crop, render_height, render_width)
-    mask_small = resize_nearest(mask_crop.astype(np.float32), render_height, render_width) > 0.5
-    weight_small = resize_bilinear(weight_crop, render_height, render_width)
-    height_small, datum = normalized_height(height_small, mask_small)
+    coverage = resize_area(mask_crop.astype(np.float32), render_height, render_width)
+    mask_small = coverage >= 0.999
+    if np.count_nonzero(mask_small) < 64:
+        raise ValueError("Too little supported surface at the selected inverse resolution")
+    images_small, valid_small = [], []
+    peak = 0.0
+    for index, (path, validity_path) in enumerate(zip(image_paths, validity_paths)):
+        image = bitmap_array(mi, path)
+        valid = bitmap_array(mi, validity_path) > 0
+        if image.shape != height.shape or valid.shape != height.shape:
+            raise ValueError("Inverse observation or validity-mask dimensions differ from height")
+        valid &= np.isfinite(image)
+        image[~np.isfinite(image)] = 0
+        if bool(parameters["srgb_decode"]):
+            image = srgb_to_linear(image)
+        peak = max(peak, float(np.max(image)))
+        images_small.append(resize_area(image[y0:y1, x0:x1], render_height, render_width))
+        valid_small.append(resize_area(valid[y0:y1, x0:x1].astype(np.float32), render_height, render_width) >= 0.999)
+        progress(5 + int(4 * (index + 1) / len(image_paths)), f"Reduced inverse observation {index + 1}/{len(image_paths)}")
+    if peak <= np.finfo(np.float32).eps:
+        raise ValueError("Inverse-rendering image stack contains no positive finite samples")
+    images_small = np.stack(images_small) / max(1.0, peak)
+    valid_small = np.stack(valid_small)
+    height_small = masked_resize(height_crop, mask_crop, render_height, render_width)
+    albedo_small = masked_resize(albedo_crop, mask_crop, render_height, render_width)
+    normalization = float(transfer.get("normalization_divisor", 1.0)) if transfer else 1.0
+    if not math.isfinite(normalization) or normalization <= 0:
+        raise ValueError("Invalid inverse observation normalization")
+    albedo_small /= normalization * max(1.0, peak)
+    weight_small = masked_resize(weight_crop, mask_crop, render_height, render_width)
+    datum = float(geometry_job["reference_height_pixels"])
+    if not math.isfinite(datum):
+        raise ValueError("Inverse height reference must be finite")
+    height_small -= datum
+    height_small[~mask_small] = 0.0
 
     full_center_x = 0.5 * (height.shape[1] - 1)
     full_center_y = 0.5 * (height.shape[0] - 1)
@@ -774,12 +1005,23 @@ def prepare_job(
     if crop:
         full_center_x = float(crop["x"]) + 0.5 * (float(crop["width"]) - 1.0)
         full_center_y = float(crop["y"]) + 0.5 * (float(crop["height"]) - 1.0)
-    original_x = np.linspace(x0, x1 - 1, render_width, dtype=np.float32)
-    original_y = np.linspace(y0, y1 - 1, render_height, dtype=np.float32)
+    original_x = x0 - 0.5 + (np.arange(render_width, dtype=np.float32) + 0.5) * ((x1 - x0) / render_width)
+    original_y = y0 - 0.5 + (np.arange(render_height, dtype=np.float32) + 0.5) * ((y1 - y0) / render_height)
     near_field = geometry_job["lighting_model"] == "near_field_ring"
     pixel_scale = float(geometry_job["pixel_scale_mm_per_pixel"])
-    if near_field and pixel_scale <= 0.0:
+    if near_field and (not math.isfinite(pixel_scale) or pixel_scale <= 0.0):
         raise ValueError("Near-field Mitsuba refinement requires positive mm/pixel scale")
+    reference_z = float(geometry_job["reference_surface_z_mm"])
+    led_diameter = float(geometry_job["led_diameter_mm"])
+    ring_radius = float(geometry_job["ring_radius_mm"])
+    ring_height = float(geometry_job["ring_height_mm"])
+    angle = float(geometry_job["angular_diameter_degrees"])
+    if not math.isfinite(reference_z) or not math.isfinite(led_diameter) or not math.isfinite(angle):
+        raise ValueError("Inverse emitter geometry must be finite")
+    if not near_field and not 0.1 <= angle <= 10.0:
+        raise ValueError("Directional inverse angular diameter must be between 0.1 and 10 degrees")
+    if near_field and (not math.isfinite(ring_radius) or ring_radius <= 0 or not math.isfinite(ring_height) or led_diameter <= 0 or reference_z >= ring_height):
+        raise ValueError("Near-field inverse refinement needs positive LED diameter and reference Z below the lights")
     physical_scale = pixel_scale if near_field else 1.0
     world_x = (original_x - full_center_x) * physical_scale
     world_y = (full_center_y - original_y) * physical_scale
@@ -798,7 +1040,7 @@ def prepare_job(
     baseline_positions = np.concatenate((baseline_positions, world_z[..., None]), axis=-1).astype(np.float32)
     renderer_directory.mkdir(parents=True, exist_ok=True)
     mesh_path = renderer_directory / "optimization_mesh.ply"
-    write_grid_ply(mesh_path, world_x, world_y, world_z)
+    write_grid_ply(mesh_path, world_x, world_y, world_z, mask_small)
     audit_mesh_path = Path(job["outputs"]["directory"]) / "optimization_mesh.ply"
     _copy_completed_file(mesh_path, audit_mesh_path)
     camera_center_x = 0.5 * float(world_x[0] + world_x[-1])
@@ -822,16 +1064,30 @@ def prepare_job(
     geometry = {
         "lighting_model": geometry_job["lighting_model"],
         "ring_radius_world": float(geometry_job["ring_radius_mm"]) * scene_scale,
-        "ring_height_world": float(geometry_job["ring_height_mm"]) * scene_scale,
+        "ring_height_world": (float(geometry_job["ring_height_mm"]) - reference_z) * scene_scale,
+        "led_diameter_world": led_diameter * scene_scale,
+        "angular_diameter_degrees": float(geometry_job["angular_diameter_degrees"]),
+        "directional_distance_world": 100.0 * camera_extent,
         "fallback_azimuth": 0.0,
     }
+    # Border pixels may sample outside the open triangle mesh. Do not ask
+    # geometry to explain those coverage changes as material or shading.
+    fit_mask = mask_small.copy()
+    fit_mask[1:] &= mask_small[:-1]
+    fit_mask[:-1] &= mask_small[1:]
+    fit_mask[:, 1:] &= mask_small[:, :-1]
+    fit_mask[:, :-1] &= mask_small[:, 1:]
+    fit_mask[[0, -1], :] = False
+    fit_mask[:, [0, -1]] = False
     weights = (
-        mask_small[None, :, :].astype(np.float32)
+        fit_mask[None, :, :].astype(np.float32)
         * np.clip(weight_small[None, :, :], 0.05, 1.0)
-        * (images_small < 0.995).astype(np.float32)
+        * valid_small.astype(np.float32)
     )
+    normal_prior, normal_prior_weight = load_normal_prior(
+        inputs, mask, raw_robust_weight, (x0, y0, x1, y1), (render_height, render_width))
+    normal_prior_weight *= fit_mask
     return {
-        "images": images,
         "height": height,
         "albedo": albedo,
         "mask": mask,
@@ -849,6 +1105,10 @@ def prepare_job(
         "scene_scale": scene_scale,
         "physical_scale": physical_scale,
         "height_datum": datum,
+        "grid_spacing": ((y1 - y0) / render_height, (x1 - x0) / render_width),
+        "normal_prior": normal_prior,
+        "normal_prior_weight": normal_prior_weight,
+        "world_spacing": (abs(float(world_y[1] - world_y[0])), abs(float(world_x[1] - world_x[0]))),
     }
 
 
@@ -856,26 +1116,21 @@ def make_scenes(mi, prepared, backend: str, spp: int):
     scenes_by_basis = []
     parameters_by_basis = []
     for basis in ("diffuse", "narrow", "broad"):
-        scenes = []
+        scene = mi.load_dict(scene_dictionary(
+            mi, prepared["mesh_path"], basis, prepared["lights"][0],
+            prepared["geometry"], prepared["camera"], backend, spp))
+        params = mi.traverse(scene)
+        keys = [key for key in params.keys() if key.endswith("vertex_positions")]
+        if len(keys) != 1:
+            raise RuntimeError(f"Expected one differentiable mesh in Mitsuba scene, found: {keys}")
+        records = []
         for index, light in enumerate(prepared["lights"]):
             geometry = dict(prepared["geometry"])
             geometry["fallback_azimuth"] = 2.0 * math.pi * index / len(prepared["lights"])
-            scenes.append(
-                mi.load_dict(
-                    scene_dictionary(
-                        mi,
-                        prepared["mesh_path"],
-                        basis,
-                        light,
-                        geometry,
-                        prepared["camera"],
-                        backend,
-                        spp,
-                    )
-                )
-            )
-        scenes_by_basis.append(scenes)
-        parameters_by_basis.append(scene_parameters(mi, scenes))
+            records.append((params, keys[0], finite_emitter(mi, light, geometry)))
+        # Lights are evaluated serially, so each basis needs only one scene.
+        scenes_by_basis.append([scene] * len(prepared["lights"]))
+        parameters_by_basis.append(records)
     return scenes_by_basis, parameters_by_basis
 
 
@@ -918,6 +1173,16 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
     iterations = int(settings["iterations_ad"])
     maximum_delta = 0.22
     render_height, render_width = prepared["height_small"].shape
+    refit_interval = int(settings.get("material_refit_interval", 0))
+    history = []
+    best = None
+    prior_weight = mi.Float(prepared["normal_prior_weight"].ravel())
+    prior = [mi.Float(prepared["normal_prior"][..., axis].ravel()) for axis in range(3)]
+    prior_denominator = max(float(prepared["normal_prior_weight"].sum()), 1e-8)
+    prior_enabled = bool(np.any(prepared["normal_prior_weight"] > 0))
+    stencils = [(mi.UInt(a), mi.UInt(b), mi.Float(scale))
+                for a, b, scale in slope_stencils(prepared["mask_small"], *prepared["world_spacing"])]
+    baseline_z = mi.Float(prepared["baseline_positions"][..., 2].ravel())
 
     def expanded_control():
         control = optimizer["height_control"]
@@ -926,19 +1191,43 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
             for index, weight in zip(index_arrays, weight_arrays)
         )
 
+    def checkpoint(iteration):
+        nonlocal material, best
+        control = optimizer["height_control"].numpy().reshape((control_height, control_width)).astype(np.float32)
+        expanded = expand_control_numpy(control, mapping).reshape(prepared["height_small"].shape)
+        positions = prepared["baseline_positions"].copy()
+        positions[..., 2] += expanded
+        basis = render_basis_numpy(mi, scenes_by_basis, parameters_by_basis, positions,
+                                   int(settings["validation_spp"]), 20000)
+        refitted, current_loss = refit_training_material(
+            basis, prepared["images_small"], prepared["mask_small"], prepared["albedo_small"],
+            train, prepared["weights"], coefficients)
+        coefficients[:] = refitted
+        material = [mi.TensorXf(coefficients[..., index]) for index in range(3)]
+        prior_loss = normal_prior_loss(prepared, positions[..., 2])
+        objective = current_loss + NORMAL_PRIOR_STRENGTH * prior_loss
+        history.append({"iteration": iteration, "training_loss": current_loss,
+                        "normal_prior_loss": prior_loss, "objective": objective})
+        if math.isfinite(objective) and (best is None or objective < best[0]):
+            best = (objective, control.copy(), expanded.copy(), coefficients.copy(), iteration)
+
+    if refit_interval > 0:
+        checkpoint(0)
+    denominator = max(float(prepared["weights"][train].sum()), 1.0e-8)
     for iteration in range(iterations):
-        expanded = expanded_control()
-        positions = baseline_flat + dr.ravel(mi.Vector3f(
-            dr.zeros(mi.Float, render_height * render_width),
-            dr.zeros(mi.Float, render_height * render_width),
-            expanded,
-        ))
-        rendered_by_basis = []
-        for basis_index, (basis_scenes, basis_parameters) in enumerate(zip(scenes_by_basis, parameters_by_basis)):
-            rendered_lights = []
-            for light_index, (scene, (params, key)) in enumerate(zip(basis_scenes, basis_parameters)):
-                params[key] = positions
-                params.update()
+        # Accumulate the exact summed-objective gradient one light at a time;
+        # retaining every renderer's AD graph scales poorly with image count.
+        for training_index, light_index in enumerate(train):
+            expanded = expanded_control()
+            positions = baseline_flat + dr.ravel(mi.Vector3f(
+                dr.zeros(mi.Float, render_height * render_width),
+                dr.zeros(mi.Float, render_height * render_width),
+                expanded,
+            ))
+            rendered = []
+            for basis_index, (basis_scenes, basis_parameters) in enumerate(zip(scenes_by_basis, parameters_by_basis)):
+                scene = basis_scenes[light_index]
+                params = update_scene_parameters(mi, basis_parameters[light_index], positions)
                 image = mi.render(
                     scene,
                     params,
@@ -946,20 +1235,16 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
                     spp_grad=int(settings["spp"]),
                     seed=30000 + iteration * 1009 + basis_index * 101 + light_index,
                 )
-                rendered_lights.append(dr.mean(image, axis=2))
-            rendered_by_basis.append(rendered_lights)
-
-        total = mi.Float(0.0)
-        denominator = mi.Float(0.0)
-        for light_index in train:
+                rendered.append(dr.mean(image, axis=2))
             prediction = sum(
-                rendered_by_basis[basis][light_index] * material[basis]
+                rendered[basis] * material[basis]
                 for basis in range(3)
             )
             residual = prediction - observed[light_index]
             robust = dr.sqrt(residual * residual + 0.0025**2) - 0.0025
-            total += dr.sum(robust * data_weights[light_index])
-            denominator += dr.sum(data_weights[light_index])
+            dr.backward(dr.sum(robust * data_weights[light_index]) / denominator)
+            progress(22 + int(58 * (iteration + (training_index + 1) / len(train)) / iterations),
+                     f"Inverse iteration {iteration + 1}/{iterations}, light {training_index + 1}/{len(train)}")
 
         control = optimizer["height_control"]
         grid = mi.TensorXf(control, shape=(control_height, control_width))
@@ -972,11 +1257,23 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
             + 0.025 * (dr.mean(dx * dx) + dr.mean(dy * dy))
             + 0.018 * (dr.mean(dxx * dxx) + dr.mean(dyy * dyy))
         )
-        loss = total / dr.maximum(denominator, 1.0e-8) + regularization
-        dr.backward(loss)
+        if prior_enabled:
+            z = baseline_z + expanded_control()
+            regularization += NORMAL_PRIOR_STRENGTH * normal_prior_loss_ad(
+                mi, dr, z, prior, prior_weight, stencils, prior_denominator)
+        dr.backward(regularization)
         optimizer.step()
         optimizer["height_control"] = dr.clip(optimizer["height_control"], -maximum_delta, maximum_delta)
+        if refit_interval > 0 and ((iteration + 1) % refit_interval == 0 or iteration + 1 == iterations):
+            progress(22 + int(58 * (iteration + 1) / iterations), "Refitting material from training lights")
+            checkpoint(iteration + 1)
         progress(22 + int(58 * (iteration + 1) / iterations), f"Differentiable inverse iteration {iteration + 1}/{iterations}")
+    if best is not None:
+        _, control, expanded, best_material, selected_iteration = best
+        coefficients[:] = best_material
+        prepared["optimization_history"] = history
+        prepared["selected_iteration"] = selected_iteration
+        return control, expanded, iterations
     control = optimizer["height_control"].numpy().reshape((control_height, control_width)).astype(np.float32)
     expanded = expand_control_numpy(control, mapping).reshape(prepared["height_small"].shape)
     return control, expanded, iterations
@@ -1012,6 +1309,7 @@ def run_job(job_path: Path) -> int:
                 "variant": variant,
                 "optimizer": optimizer_name,
                 "quality": quality,
+                "llvm_version": list(dr.detail.llvm_version()) if selected_backend == "llvm" else None,
                 "mitsuba_version": mi.__version__,
                 "drjit_version": dr.__version__,
                 "numpy_version": np.__version__,
@@ -1034,6 +1332,9 @@ def run_job(job_path: Path) -> int:
             mi, prepared, selected_backend, int(settings["spp"])
         )
         train, holdout = split_lights(len(prepared["lights"]))
+        support = np.count_nonzero(prepared["weights"] > 0, axis=(1, 2))
+        if any(support[index] < 64 for index in train + holdout):
+            raise ValueError("Each training and withheld light needs at least 64 supported, unclipped reduced pixels")
         result["training_light_indices"] = train
         result["holdout_light_indices"] = holdout
         progress(15, "Rendering baseline material and visibility bases")
@@ -1042,7 +1343,7 @@ def run_job(job_path: Path) -> int:
             scenes_by_basis,
             parameters_by_basis,
             prepared["baseline_positions"],
-            int(settings["spp"]),
+            int(settings["validation_spp"]),
             10000,
         )
         coefficients, roughness = fit_material_maps(
@@ -1051,7 +1352,9 @@ def run_job(job_path: Path) -> int:
             prepared["mask_small"],
             prepared["albedo_small"],
             train,
+            prepared["weights"],
         )
+        baseline_coefficients = coefficients.copy()
         prediction_before = prediction_numpy(baseline_basis, coefficients)
         train_before = data_loss_numpy(
             prediction_before, prepared["images_small"], prepared["weights"], train
@@ -1081,7 +1384,7 @@ def run_job(job_path: Path) -> int:
             scenes_by_basis,
             parameters_by_basis,
             candidate_positions,
-            int(settings["spp"]),
+            int(settings["validation_spp"]),
             10000,
         )
         prediction_after = prediction_numpy(candidate_basis, coefficients)
@@ -1096,10 +1399,16 @@ def run_job(job_path: Path) -> int:
         masked_correction = correction_small_pixels[prepared["mask_small"]]
         correction_rms = float(np.sqrt(np.mean(masked_correction**2)))
         correction_maximum = float(np.max(np.abs(masked_correction)))
-        q, p = np.gradient(correction_small_pixels)
-        slope_rms = float(np.sqrt(np.mean((p[prepared["mask_small"]] ** 2 + q[prepared["mask_small"]] ** 2))))
+        x0, y0, x1, y1 = prepared["bounds"]
+        correction_crop = resize_bilinear(correction_small_pixels, y1 - y0, x1 - x0)
+        crop_mask = prepared["mask"][y0:y1, x0:x1]
+        q, p = masked_slopes(correction_crop, crop_mask)
+        slope_rms = float(np.sqrt(np.mean(p[crop_mask] ** 2 + q[crop_mask] ** 2)))
         train_improvement = (train_before - train_after) / max(train_before, 1.0e-8)
         holdout_improvement = (holdout_before - holdout_after) / max(holdout_before, 1.0e-8)
+        prior_before = normal_prior_loss(prepared, prepared["baseline_positions"][..., 2])
+        prior_after = normal_prior_loss(prepared, candidate_positions[..., 2])
+        prior_consistent = math.isfinite(prior_after) and prior_after <= 1.05 * prior_before + 1e-6
         accepted = (
             math.isfinite(train_after)
             and math.isfinite(holdout_after)
@@ -1107,24 +1416,35 @@ def run_job(job_path: Path) -> int:
             and holdout_improvement >= -0.002
             and slope_rms <= 0.45
             and correction_maximum <= 0.20 * max(prepared["height"].shape)
+            and prior_consistent
         )
+        # A separate Monte Carlo seed must confirm the decision; common random
+        # numbers within each pair reduce variance without reusing optimization samples.
+        independent_holdout_improvement = None
+        if accepted:
+            validation_losses = []
+            for positions, material in ((prepared["baseline_positions"], baseline_coefficients),
+                                        (candidate_positions, coefficients)):
+                basis = render_basis_numpy(mi, scenes_by_basis, parameters_by_basis, positions, int(settings["validation_spp"]), 71000)
+                prediction = prediction_numpy(basis, material)
+                validation_losses.append(data_loss_numpy(prediction, prepared["images_small"], prepared["weights"], holdout))
+            independent_holdout_improvement = (validation_losses[0] - validation_losses[1]) / max(validation_losses[0], 1.0e-8)
+            accepted = math.isfinite(independent_holdout_improvement) and independent_holdout_improvement >= -0.002
         if accepted:
             decision = "accepted_train_and_holdout_gate"
         elif train_improvement < 0.01:
             decision = "rejected_insufficient_training_improvement"
         elif holdout_improvement < -0.002:
             decision = "rejected_withheld_lights_worsened"
+        elif independent_holdout_improvement is not None and (not math.isfinite(independent_holdout_improvement) or independent_holdout_improvement < -0.002):
+            decision = "rejected_independent_validation_seed"
         elif slope_rms > 0.45:
             decision = "rejected_excessive_slope_change"
+        elif not prior_consistent:
+            decision = "rejected_normal_prior_worsened"
         else:
             decision = "rejected_excessive_height_change"
 
-        x0, y0, x1, y1 = prepared["bounds"]
-        correction_crop = resize_bilinear(
-            correction_small_pixels,
-            y1 - y0,
-            x1 - x0,
-        )
         correction_full = np.zeros_like(prepared["height"], dtype=np.float32)
         if accepted:
             correction_full[y0:y1, x0:x1] = correction_crop
@@ -1139,12 +1459,14 @@ def run_job(job_path: Path) -> int:
             prepared["albedo"],
             float(job["parameters"]["height_scale"]),
         )
+        delivered_material = coefficients if accepted else baseline_coefficients
+        roughness = material_roughness(delivered_material)
         diffuse_full = np.zeros_like(prepared["height"], dtype=np.float32)
         specular_full = np.zeros_like(prepared["height"], dtype=np.float32)
         roughness_full = np.zeros_like(prepared["height"], dtype=np.float32)
-        diffuse_full[y0:y1, x0:x1] = resize_bilinear(coefficients[..., 0], y1 - y0, x1 - x0)
+        diffuse_full[y0:y1, x0:x1] = resize_bilinear(delivered_material[..., 0], y1 - y0, x1 - x0)
         specular_full[y0:y1, x0:x1] = resize_bilinear(
-            coefficients[..., 1] + coefficients[..., 2], y1 - y0, x1 - x0
+            delivered_material[..., 1] + delivered_material[..., 2], y1 - y0, x1 - x0
         )
         roughness_full[y0:y1, x0:x1] = resize_bilinear(roughness, y1 - y0, x1 - x0)
         save_gray(mi, output / "material_diffuse.png", display_stretch(diffuse_full, prepared["mask"]))
@@ -1160,6 +1482,15 @@ def run_job(job_path: Path) -> int:
                 "accepted": accepted,
                 "decision": decision,
                 "iterations_completed": iterations,
+                "selected_iteration": prepared.get("selected_iteration", iterations),
+                "optimization_history": prepared.get("optimization_history", []),
+                "control_grid_shape": list(mapping[:2]),
+                "optimization_spp": settings["spp"],
+                "material_refit_interval": settings.get("material_refit_interval", 0),
+                "normal_prior_enabled": bool(np.any(prepared["normal_prior_weight"] > 0)),
+                "normal_prior_strength": NORMAL_PRIOR_STRENGTH,
+                "normal_prior_loss_before": prior_before,
+                "normal_prior_loss_after": prior_after,
                 "train_loss_before": train_before,
                 "train_loss_after": train_after,
                 "holdout_loss_before": holdout_before,
@@ -1171,7 +1502,16 @@ def run_job(job_path: Path) -> int:
                 "candidate_correction_rms_pixels": correction_rms,
                 "candidate_correction_maximum_pixels": correction_maximum,
                 "candidate_slope_change_rms": slope_rms,
-                "height_datum_assumption": "median masked integrated height equals the light-reference plane",
+                "height_datum_assumption": "shared flat-surface/percentile reference assigned to explicit physical reference Z",
+                "reference_height_pixels": prepared["height_datum"],
+                "reference_surface_z_mm": job["geometry"]["reference_surface_z_mm"],
+                "emitter_model": "finite_reference_facing_disk" if prepared["geometry"]["lighting_model"] == "near_field_ring" else "distant_disk_angular_approximation",
+                "led_diameter_mm": job["geometry"]["led_diameter_mm"],
+                "angular_diameter_degrees": job["geometry"]["angular_diameter_degrees"],
+                "independent_holdout_relative_improvement": independent_holdout_improvement,
+                "validation_spp": settings["validation_spp"],
+                "primary_visibility_derivatives": True,
+                "indirect_visibility_derivatives": True,
                 "material_model": "per-pixel nonnegative diffuse plus narrow- and broad-GGX rough-plastic bases",
                 "baseline_outputs_modified": False,
             }

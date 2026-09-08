@@ -173,13 +173,15 @@ void printUsage() {
         << "  --high-outlier-threshold v   Robust solve probable-clipping/bright-candidate cutoff. Default: 0.98\n"
         << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
         << "  --pixel-scale-mm s           Image pixel size in mm/pixel; 0 auto-reads TIFF tags when needed.\n"
-        << "  --specular-diagnostics       Write experimental shiny-cue and robust outlier diagnostic maps.\n"
+        << "  --specular-diagnostics       Write optional robust summary and per-light diagnostic images.\n"
         << "  --shadow-height-refinement   Experimentally refine broad height/mesh shape from coherent cast shadows.\n"
         << "                               Requires 6+ calibrated images, robust solve, and height output.\n"
-        << "  --shadow-reference-z-mm z    Near-field reference-surface Z above the light datum. Default: 0\n"
-        << "  --shadow-led-diameter-mm d   Near-field effective LED diameter for soft shadows; 0 is point source.\n"
+        << "  --shadow-reference-z-mm z    Shared shadow/inverse near-field surface Z above the light datum. Default: 0\n"
+        << "  --shadow-led-diameter-mm d   Measured effective near-field LED diameter in mm; 0 is point source.\n"
         << "  --mitsuba-inverse            Experimental inverse-rendering geometry refinement.\n"
         << "                               Requires 6+ calibrated robust images, height, and the optional backend.\n"
+        << "                               Near-field requires finite measured --shadow-led-diameter-mm > 0.\n"
+        << "  --mitsuba-light-angle-deg a  Full directional-light angular diameter: 0.1-10 degrees. Default: 1\n"
         << "  --mitsuba-python path        Python executable from the isolated what-a-relief Mitsuba backend.\n"
         << "  --mitsuba-worker path        Override the versioned Mitsuba worker script.\n"
         << "  --mitsuba-backend mode       auto, cuda, or cpu. Default: auto\n"
@@ -295,6 +297,9 @@ Options parseArgs(int argc, char** argv) {
             opt.shadowLedDiameterMm = parseDouble(argv[++i], "shadow LED diameter");
         } else if (arg == "--mitsuba-inverse") {
             opt.mitsubaInverseRefinement = true;
+        } else if (arg == "--mitsuba-light-angle-deg") {
+            need(1);
+            opt.mitsubaLightAngleDegrees = parseDouble(argv[++i], "inverse light angular diameter");
         } else if (arg == "--mitsuba-python") {
             need(1);
             opt.mitsubaPythonPath = argv[++i];
@@ -463,9 +468,15 @@ Options parseArgs(int argc, char** argv) {
             !std::isfinite(opt.ringLightHeightMm) || opt.ringLightHeightMm <= 0.0) {
             die("--near-field-ring radius and height must be positive finite values.");
         }
-        if (opt.shadowHeightRefinement && opt.shadowReferenceZMm >= opt.ringLightHeightMm) {
+        if ((opt.shadowHeightRefinement || opt.mitsubaInverseRefinement) && opt.shadowReferenceZMm >= opt.ringLightHeightMm) {
             die("--shadow-reference-z-mm must be below the ring-light height.");
         }
+        if (opt.mitsubaInverseRefinement && !opt.guiMode && opt.shadowLedDiameterMm <= 0.0) {
+            die("Near-field --mitsuba-inverse requires a positive --shadow-led-diameter-mm for shadow derivatives.");
+        }
+    }
+    if (!std::isfinite(opt.mitsubaLightAngleDegrees) || opt.mitsubaLightAngleDegrees < 0.1 || opt.mitsubaLightAngleDegrees > 10.0) {
+        die("--mitsuba-light-angle-deg must be between 0.1 and 10 degrees (full angular diameter).");
     }
     if (opt.integrationIterations < 0) {
         die("--integration-iterations must be non-negative.");

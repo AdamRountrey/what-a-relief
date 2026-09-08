@@ -137,6 +137,7 @@ struct Options {
     double pixelScaleMm = 0.0;
     double shadowReferenceZMm = 0.0;
     double shadowLedDiameterMm = 0.0;
+    double mitsubaLightAngleDegrees = 1.0;
     int integrationIterations = 800;
     int meshStep = 1;
     int neuralMaxSide = 2048;
@@ -147,8 +148,15 @@ struct Options {
     cv::Mat heightMask;
 };
 
+enum class RobustObservationClass : unsigned char {
+    Inlier, Shadow, Highlight, Saturated, OtherOutlier, Unusable
+};
+
 struct PhotometricDiagnostics {
     bool collectObservationMasks = false;
+    bool compactObservationMasks = false;
+    // Three class bits and thirteen confidence bits, only for shadow-only runs.
+    std::vector<cv::Mat> packedObservationMaps;
     double lightingConditionNumber = 0.0;
     double solvedFraction = 0.0;
     cv::Mat robustWeight;

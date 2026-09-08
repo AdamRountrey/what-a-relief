@@ -2,6 +2,31 @@
 
 This is the durable release checklist for the 0.2.1 quality update. A box is checked only when implementation, automated evidence, and user documentation are all present. Local validation and GitHub CI completion are tracked separately.
 
+Checked release items below record the earlier 0.2.1 baseline, not certification of the current September review changes. The [R1-R9 fix ledger](review-fixes-2026-09.md) separates those dirty-tree implementation changes from evidence still required.
+
+## September Review Verification
+
+- [x] Add and run the [independent curved-scene inverse pipeline test](inverse-pipeline-test.md) with eight ring lights, textured diffuse/glossy materials, sensor noise, and actual classical initialization. Preserve the initial CPU/CUDA failure records.
+- [x] Achieve accepted global geometry improvement on that fixed fixture without loosening accuracy thresholds: the alternating-fit worker passes the CUDA original and rotated-light captures. Record regional regressions rather than implying uniform improvement.
+- [ ] Qualify unseen shapes/materials, seeds, source sizes, resolutions, and higher presets; address bump/depression and cast-shadow-region height regressions. A small global benchmark gain is not general scientific accuracy validation.
+- [x] Correct pixel-center/edge discretization and DCT boundary/padding consistency. Add exact analytic plane/quadratic tests for even and padded sizes in both integrators, without changing photometric normals.
+- [x] Feed full-precision classical photometric normals into a confidence-weighted inverse constraint, test its derivatives and handoff, and retain image validation gates. Record the heuristic weights and reduced-resolution scope.
+- [ ] Require non-regression against the original photometric normal product, not only against normals derived from integrated height. The constrained inverse normals remain worse than the original classical map on the independent fixture; the test reports this distinction explicitly. Also qualify local height regressions rather than relying solely on global scores.
+
+- [x] Record the completed eight-test CTest run, including all six baseline suites and the schema-2/method-v2 backend contract: 61.06 seconds using the finished installer's extracted runtime and bundled official LLVM 15.0.7, without a DLL override.
+- [x] Record the seven passing worker-numerical tests for constrained fitting, observation validity/reduction, masking, units, and actionable unavailable-backend reporting.
+- [x] Record the real-CPU renderer gate pass (50.23 seconds, eight workers, no forced Debug flag, primary and indirect silhouette sampling enabled): finite-ring/directional-disk AD versus FD and 24 x 24/eight-light/six-iteration tilt recovery/truth-start with internal-hole, spatial diffuse/glossy, normal-angle, and height-RMSE checks. Exact logs and metrics are in [validation.md](validation.md#verified-cpu-run).
+- [ ] Complete the broader CPU matrix: explicit truth-start rejection/preservation assertions, independent geometry/BRDF cases, cast-shadow-driven recovery, irregular boundaries, coverage, and resolution/quality/source-size/seed sensitivity. The passing current gates do not certify this entire matrix.
+- [ ] Record separate CUDA derivative/recovery evidence; a startup moving-shadow AD probe or the LLVM 15 CPU pass does not certify full CUDA recovery.
+- [x] Verify official LLVM 15.0.7 resolves the tested native failures without the temporary Debug or `sppp=0` workarounds; remove both overrides. Record this as a compatibility pin, not a proven internal root-cause explanation.
+- [x] Build the LLVM 15.0.7 backend installer after staged numerical and real CPU shadow/inverse tests pass; record installer build exit 0 and independently verify artifact size/SHA-256 in the [package record](review-fixes-2026-09.md#backend-package). The installed user application/backend remains unchanged.
+- [x] Verify the finished installer's extracted runtime with all eight CTests, and complete a real C++-to-worker eight-image CPU smoke run that preserves baseline geometry when the withheld-light check rejects refinement.
+- [ ] Quantify fixed-XY/eroded-mask limits with both primary and indirect silhouettes enabled; enabled derivatives do not establish free-outline recovery or arbitrary camera-occlusion accuracy.
+- [ ] Verify the corrected R7 scope: preexisting mutual exclusion, shared flat/percentile datum, explicit near-field reference Z, measured positive inverse LED diameter, and declared directional angular-source approximation.
+- [ ] Check packed 13-bit confidence versus full diagnostics, near-threshold decisions, coarse audit dimensions, many-component semantics, and measured peak memory before claiming R8/R9 performance gains.
+- [ ] Profile inverse per-light input reduction, three-scene reuse, and one-light gradient accumulation on pinned LLVM 15; distinguish removed Python full stacks from the still-resident C++ input stack and geometry/caches.
+- [ ] Validate source-size, camera, sample-count/iteration, and calibration sensitivity on new unseen cases and independently measured specimens, including black glossy regions with per-material errors and coverage.
+
 ## Scientific Core
 
 - [x] Decode selected sRGB inputs with the standard piecewise transfer function and use one common stack scale so lighting ratios are preserved.

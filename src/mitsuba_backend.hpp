@@ -29,6 +29,8 @@ void runMitsubaInverseRefinement(
     const cv::Mat& albedo,
     const cv::Mat& height,
     const cv::Mat& heightMask,
+    const cv::Mat& normalMap,
+    const std::vector<cv::Mat>& saturationMasks,
     PhotometricDiagnostics& diagnostics,
     const std::function<void(const std::string&, int)>& progress = {},
     const std::function<bool()>& cancellationRequested = {});

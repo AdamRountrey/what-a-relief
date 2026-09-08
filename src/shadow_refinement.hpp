@@ -18,7 +18,10 @@ struct ShadowRefinementSettings {
     cv::Point2d lightingCenter;
     int maximumCoarseSide = 160;
     int iterations = 5;
+    bool retainFullResolutionDiagnostics = true;
 };
+
+double heightReferencePlane(const cv::Mat& height, const cv::Mat& mask, const cv::Mat& normals);
 
 void refineHeightFromCastShadows(
     cv::Mat& height,

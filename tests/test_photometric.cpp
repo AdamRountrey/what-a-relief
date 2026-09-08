@@ -125,9 +125,11 @@ SolveResult solve(
     double pixelScaleMm = 0.01,
     const std::vector<cv::Mat>& saturationMasks = {},
     bool collectObservationMasks = false,
-    const cv::Mat& inputMask = cv::Mat()) {
+    const cv::Mat& inputMask = cv::Mat(),
+    bool compactObservationMasks = false) {
     SolveResult result;
     result.diagnostics.collectObservationMasks = collectObservationMasks;
+    result.diagnostics.compactObservationMasks = compactObservationMasks;
     const cv::Mat mask = inputMask.empty()
         ? cv::Mat(images.front().size(), CV_8U, cv::Scalar(255))
         : inputMask;
@@ -153,6 +155,21 @@ SolveResult solve(
         result.diagnostics,
         saturationMasks);
     return result;
+}
+
+void checkSameMap(
+    TestContext& context,
+    const cv::Mat& actual,
+    const cv::Mat& expected,
+    const std::string& name,
+    double tolerance = 0.0) {
+    const bool compatible = actual.size() == expected.size() && actual.type() == expected.type();
+    context.check(compatible, name + " dimensions and type must agree");
+    if (compatible && !actual.empty()) {
+        context.check(cv::checkRange(actual), name + " must contain finite values");
+        context.check(cv::norm(actual, expected, cv::NORM_INF) <= tolerance,
+            name + " numerical values must agree");
+    }
 }
 
 std::vector<cv::Mat> renderNearFieldPlane(
@@ -512,11 +529,13 @@ void makeHeightFixture(cv::Mat& height, cv::Mat& normals) {
     normals = cv::Mat(rows, cols, CV_32FC3);
     for (int y = 0; y < rows; ++y) {
         cv::Vec3f* normalRow = normals.ptr<cv::Vec3f>(y);
-        const float* row = height.ptr<float>(y);
-        const float* nextRow = y + 1 < rows ? height.ptr<float>(y + 1) : nullptr;
+        const double fy = static_cast<double>(y) / static_cast<double>(rows - 1);
         for (int x = 0; x < cols; ++x) {
-            const float p = x + 1 < cols ? row[x + 1] - row[x] : 0.0f;
-            const float q = y + 1 < rows ? nextRow[x] - row[x] : 0.0f;
+            const double fx = static_cast<double>(x) / static_cast<double>(cols - 1);
+            const float p = static_cast<float>((-1.7 * kPi * std::sin(kPi * fx)
+                - 0.7 * kPi * std::sin(2.0 * kPi * fx) * std::cos(kPi * fy)) / (cols - 1));
+            const float q = static_cast<float>((-1.8 * kPi * std::sin(2.0 * kPi * fy)
+                - 0.35 * kPi * std::cos(2.0 * kPi * fx) * std::sin(kPi * fy)) / (rows - 1));
             normalRow[x] = normalized(cv::Vec3f(-p, q, 1.0f));
         }
     }
@@ -857,6 +876,136 @@ void testShadowOmission(TestContext& context) {
     context.check(
         std::abs(meanShadowCount - 1.0) < 1.0e-6,
         "hard-shadow fixture must report one omitted observation per pixel");
+}
+
+void testCompactRobustObservationStorage(TestContext& context) {
+    const std::vector<cv::Vec3f> lights = makeRingLights(8);
+    const cv::Vec3f normal = normalized(cv::Vec3f(0.19f, -0.13f, 1.0f));
+    for (const LightingModel model : {LightingModel::Directional, LightingModel::NearFieldRing}) {
+        const std::string name = model == LightingModel::Directional ? "compact directional" : "compact near-field";
+        std::vector<cv::Mat> images = model == LightingModel::Directional
+            ? renderLambertianPlane(18, 28, lights, normal, 0.68f)
+            : renderNearFieldPlane(18, 28, lights, normal, 0.68f, 10.0, 10.0, 0.01);
+        std::vector<cv::Mat> saturation;
+        for (size_t i = 0; i < lights.size(); ++i) {
+            saturation.emplace_back(images.front().size(), CV_8U, cv::Scalar(0));
+            for (int y = 0; y < images[i].rows; ++y) {
+                for (int x = 0; x < images[i].cols; ++x) {
+                    images[i].at<float>(y, x) += static_cast<float>(
+                        0.0007 * std::sin(0.7 * x + 0.3 * y + 1.1 * i));
+                }
+            }
+        }
+        images[2](cv::Rect(4, 0, 4, 18)).setTo(0.0f);
+        images[2](cv::Rect(8, 0, 4, 18)) *= 0.5f;
+        images[0](cv::Rect(12, 0, 4, 18)).setTo(1.0f);
+        images[1](cv::Rect(16, 0, 4, 18)).setTo(1.0f);
+        saturation[1](cv::Rect(16, 0, 4, 18)).setTo(255);
+        images[3](cv::Rect(20, 0, 4, 18)).setTo(std::numeric_limits<float>::quiet_NaN());
+        for (cv::Mat& image : images) {
+            image(cv::Rect(24, 0, 4, 18)).setTo(0.0f);
+        }
+        images[0](cv::Rect(24, 0, 4, 18)).setTo(1.0f);
+        saturation[0](cv::Rect(24, 0, 4, 18)).setTo(255);
+        cv::Mat mask(images.front().size(), CV_8U, cv::Scalar(255));
+        mask.row(0).setTo(0);
+
+        const SolveResult full = solve(images, lights, NormalSolverMode::Robust,
+            model, 10.0, 10.0, 0.01, saturation, true, mask);
+        const SolveResult compact = solve(images, lights, NormalSolverMode::Robust,
+            model, 10.0, 10.0, 0.01, saturation, true, mask, true);
+        checkSameMap(context, compact.normals, full.normals, name + " normals");
+        checkSameMap(context, compact.albedo, full.albedo, name + " albedo");
+        checkSameMap(context, compact.residual, full.residual, name + " residual");
+        checkSameMap(context, compact.validMask, full.validMask, name + " validity");
+        for (const auto member : {&PhotometricDiagnostics::robustWeight,
+                 &PhotometricDiagnostics::robustFallbackMask, &PhotometricDiagnostics::unsupportedMask,
+                 &PhotometricDiagnostics::effectiveInlierCount, &PhotometricDiagnostics::localConditionNumber,
+                 &PhotometricDiagnostics::shadowCount, &PhotometricDiagnostics::highlightOutlierCount,
+                 &PhotometricDiagnostics::saturationCount, &PhotometricDiagnostics::modelMismatchCount,
+                 &PhotometricDiagnostics::specularCueMask}) {
+            checkSameMap(context, compact.diagnostics.*member, full.diagnostics.*member, name + " aggregate map");
+        }
+        context.check(compact.diagnostics.solvedFraction == full.diagnostics.solvedFraction &&
+                compact.diagnostics.lightingConditionNumber == full.diagnostics.lightingConditionNumber,
+            name + " scalar diagnostics must agree");
+        context.check(full.diagnostics.packedObservationMaps.empty(), name + " full mode must not allocate packed maps");
+        context.check(compact.diagnostics.shadowObservationMasks.empty() &&
+                compact.diagnostics.shadowObservationConfidence.empty() &&
+                compact.diagnostics.highlightObservationMasks.empty() &&
+                compact.diagnostics.saturationObservationMasks.empty(),
+            name + " must not also allocate full observation maps");
+        context.check(compact.diagnostics.packedObservationMaps.size() == lights.size(),
+            name + " must allocate one packed map per light");
+        if (compact.diagnostics.packedObservationMaps.size() != lights.size()) {
+            continue;
+        }
+        int classCounts[6] = {};
+        double maximumConfidenceError = 0.0;
+        for (size_t i = 0; i < lights.size(); ++i) {
+            const cv::Mat& packed = compact.diagnostics.packedObservationMaps[i];
+            const bool validStorage = packed.size() == mask.size() && packed.type() == CV_16U;
+            context.check(validStorage && packed.elemSize() == 2, name + " must use two bytes per observation");
+            if (!validStorage) {
+                continue;
+            }
+            cv::Mat decodedShadow(mask.size(), CV_8U, cv::Scalar(0));
+            cv::Mat decodedHighlight(mask.size(), CV_8U, cv::Scalar(0));
+            cv::Mat decodedSaturation(mask.size(), CV_8U, cv::Scalar(0));
+            bool validClasses = true;
+            bool maskedUnusable = true;
+            bool zeroOutlierConfidence = true;
+            for (int y = 0; y < mask.rows; ++y) {
+                for (int x = 0; x < mask.cols; ++x) {
+                    const unsigned short value = packed.at<unsigned short>(y, x);
+                    const unsigned label = value >> 13;
+                    validClasses = validClasses && label < 6;
+                    if (label < 6) {
+                        ++classCounts[label];
+                    }
+                    const auto observation = static_cast<RobustObservationClass>(label);
+                    const float confidence = static_cast<float>(value & 8191) / 8191.0f;
+                    maximumConfidenceError = std::max(maximumConfidenceError, static_cast<double>(std::abs(
+                        confidence - full.diagnostics.shadowObservationConfidence[i].at<float>(y, x))));
+                    if (observation != RobustObservationClass::Shadow && observation != RobustObservationClass::Inlier) {
+                        zeroOutlierConfidence = zeroOutlierConfidence && (value & 8191) == 0;
+                    }
+                    if (mask.at<uchar>(y, x) == 0) {
+                        maskedUnusable = maskedUnusable && observation == RobustObservationClass::Unusable && confidence == 0.0f;
+                    }
+                    decodedShadow.at<uchar>(y, x) = observation == RobustObservationClass::Shadow ? 255 : 0;
+                    decodedHighlight.at<uchar>(y, x) = observation == RobustObservationClass::Highlight ? 255 : 0;
+                    decodedSaturation.at<uchar>(y, x) = observation == RobustObservationClass::Saturated ? 255 : 0;
+                }
+            }
+            context.check(validClasses && maskedUnusable && zeroOutlierConfidence,
+                name + " class bits, masked initialization, and outlier confidence must be valid");
+            checkSameMap(context, decodedShadow, full.diagnostics.shadowObservationMasks[i], name + " shadow classification");
+            checkSameMap(context, decodedHighlight, full.diagnostics.highlightObservationMasks[i], name + " highlight classification");
+            checkSameMap(context, decodedSaturation, full.diagnostics.saturationObservationMasks[i],
+                name + " saturation classification including unsupported pixels");
+        }
+        for (const auto label : {RobustObservationClass::Inlier, RobustObservationClass::Shadow,
+                 RobustObservationClass::Highlight, RobustObservationClass::Saturated, RobustObservationClass::Unusable}) {
+            context.check(classCounts[static_cast<unsigned>(label)] > 0, name + " fixture must exercise each expected class");
+        }
+        context.check(full.diagnostics.unsupportedMask.at<uchar>(1, 24) != 0 &&
+                full.diagnostics.saturationObservationMasks[0].at<uchar>(1, 24) != 0,
+            name + " fixture must exercise definite saturation at an unsupported pixel");
+        context.check(maximumConfidenceError <= 0.5 / 8191.0 + 1.0e-7,
+            name + " confidence error must not exceed half a quantization step");
+        std::cout << name << " maximum_confidence_error=" << maximumConfidenceError << '\n';
+
+        const SolveResult disabled = solve(images, lights, NormalSolverMode::Robust,
+            model, 10.0, 10.0, 0.01, saturation, false, mask, true);
+        context.check(disabled.diagnostics.packedObservationMaps.empty() &&
+                disabled.diagnostics.shadowObservationMasks.empty() &&
+                disabled.diagnostics.shadowObservationConfidence.empty() &&
+                disabled.diagnostics.highlightObservationMasks.empty() &&
+                disabled.diagnostics.saturationObservationMasks.empty(),
+            name + " collection disabled must allocate no per-observation diagnostics");
+        checkSameMap(context, disabled.normals, full.normals, name + " collection-disabled normals");
+    }
 }
 
 void testPenumbraRobustness(TestContext& context) {
@@ -1685,6 +1834,264 @@ NearFieldShadowFixture makeDirectionalShadowFixture() {
     return fixture;
 }
 
+PhotometricDiagnostics makeShadowStorageDiagnostics(
+    const NearFieldShadowFixture& fixture,
+    bool compact,
+    bool unitConfidence = false) {
+    PhotometricDiagnostics diagnostics;
+    diagnostics.collectObservationMasks = true;
+    diagnostics.compactObservationMasks = compact;
+    for (size_t i = 0; i < fixture.lights.size(); ++i) {
+        cv::Mat shadow = fixture.rawShadowMasks[i].clone();
+        cv::Mat highlight(fixture.mask.size(), CV_8U, cv::Scalar(0));
+        cv::Mat saturation(fixture.mask.size(), CV_8U, cv::Scalar(0));
+        cv::Mat confidence(fixture.mask.size(), CV_32F, cv::Scalar(0));
+        cv::Mat packed(fixture.mask.size(), CV_16U, cv::Scalar(0));
+        for (int y = 0; y < fixture.mask.rows; ++y) {
+            for (int x = 0; x < fixture.mask.cols; ++x) {
+                auto label = shadow.at<uchar>(y, x) != 0
+                    ? RobustObservationClass::Shadow : RobustObservationClass::Inlier;
+                if (!unitConfidence && y >= 8 && y < 12 && x >= 8 && x < 16) {
+                    label = x < 12 ? RobustObservationClass::Highlight : RobustObservationClass::Saturated;
+                    shadow.at<uchar>(y, x) = 0;
+                    highlight.at<uchar>(y, x) = x < 12 ? 255 : 0;
+                    saturation.at<uchar>(y, x) = x >= 12 ? 255 : 0;
+                }
+                // Exact packed fractions isolate storage/refinement parity from quantization error.
+                const unsigned confidenceBits = label == RobustObservationClass::Shadow || label == RobustObservationClass::Inlier
+                    ? (unitConfidence ? 8191u : 4096u + (17u * x + 31u * y + 67u * static_cast<unsigned>(i)) % 4096u)
+                    : 0u;
+                confidence.at<float>(y, x) = static_cast<float>(confidenceBits) / 8191.0f;
+                packed.at<unsigned short>(y, x) = static_cast<unsigned short>(
+                    (static_cast<unsigned>(label) << 13) | confidenceBits);
+            }
+        }
+        if (compact) {
+            diagnostics.packedObservationMaps.push_back(std::move(packed));
+        } else {
+            diagnostics.shadowObservationMasks.push_back(std::move(shadow));
+            diagnostics.highlightObservationMasks.push_back(std::move(highlight));
+            diagnostics.saturationObservationMasks.push_back(std::move(saturation));
+            diagnostics.shadowObservationConfidence.push_back(std::move(confidence));
+        }
+    }
+    return diagnostics;
+}
+
+void checkSameShadowRefinement(
+    TestContext& context,
+    const PhotometricDiagnostics& actual,
+    const PhotometricDiagnostics& expected,
+    const std::string& name) {
+    context.check(actual.shadowHeightRefinementApplied == expected.shadowHeightRefinementApplied &&
+            actual.shadowHeightRefinementDecision == expected.shadowHeightRefinementDecision &&
+            actual.shadowRefinementLightIndices == expected.shadowRefinementLightIndices,
+        name + " decisions and selected lights must agree");
+    for (const auto member : {&PhotometricDiagnostics::shadowMismatchRateBefore,
+             &PhotometricDiagnostics::shadowMismatchRateAfter, &PhotometricDiagnostics::shadowHoldoutMismatchRateBefore,
+             &PhotometricDiagnostics::shadowHoldoutMismatchRateAfter, &PhotometricDiagnostics::shadowNormalSlopeRmsBefore,
+             &PhotometricDiagnostics::shadowNormalSlopeRmsAfter, &PhotometricDiagnostics::shadowCorrectionRms,
+             &PhotometricDiagnostics::shadowSelectedStepFraction, &PhotometricDiagnostics::shadowWorstHoldoutDelta}) {
+        context.check(std::isfinite(actual.*member) && std::abs(actual.*member - expected.*member) <= 1.0e-7,
+            name + " numerical scores must agree");
+    }
+    context.check(actual.shadowRefinementConstraintCount == expected.shadowRefinementConstraintCount &&
+            actual.shadowRefinementShadowSamples == expected.shadowRefinementShadowSamples &&
+            actual.shadowRefinementLitSamples == expected.shadowRefinementLitSamples,
+        name + " constraint and sample counts must agree");
+    for (const auto member : {&PhotometricDiagnostics::shadowHeightCorrection,
+             &PhotometricDiagnostics::shadowConstraintCount, &PhotometricDiagnostics::shadowMismatchBefore,
+             &PhotometricDiagnostics::shadowMismatchAfter, &PhotometricDiagnostics::shadowObservability,
+             &PhotometricDiagnostics::shadowEdgeSupport, &PhotometricDiagnostics::shadowOccluderSupport}) {
+        checkSameMap(context, actual.*member, expected.*member, name + " full-resolution result map", 1.0e-7);
+    }
+}
+
+void testStreamedShadowDiagnosticStorage(TestContext& context) {
+    for (const LightingModel model : {LightingModel::Directional, LightingModel::NearFieldRing}) {
+        const std::string name = model == LightingModel::Directional ? "streamed directional" : "streamed near-field";
+        const NearFieldShadowFixture fixture = model == LightingModel::Directional
+            ? makeDirectionalShadowFixture() : makeNearFieldShadowFixture(4.2, 1.15, 0.035);
+        ShadowRefinementSettings settings;
+        settings.lightingModel = model;
+        settings.ringLightRadiusMm = 4.2;
+        settings.ringLightHeightMm = 1.15;
+        settings.pixelScaleMm = 0.035;
+        settings.lightingCenter = cv::Point2d(0.5 * (fixture.mask.cols - 1), 0.5 * (fixture.mask.rows - 1));
+        settings.maximumCoarseSide = 64;
+        settings.iterations = 2;
+        const cv::Size coarseSize(64, 48);
+        std::vector<PhotometricDiagnostics> results;
+        std::vector<cv::Mat> heights;
+        for (const bool retainFull : {true, false}) {
+            settings.retainFullResolutionDiagnostics = retainFull;
+            const cv::Size auditSize = retainFull ? fixture.mask.size() : coarseSize;
+            for (const bool compact : {false, true}) {
+                PhotometricDiagnostics diagnostics = makeShadowStorageDiagnostics(fixture, compact);
+                cv::Mat height = fixture.initialHeight.clone();
+                size_t evidenceUpdates = 0;
+                refineHeightFromCastShadows(height, fixture.mask, fixture.mask, fixture.normals,
+                    fixture.images, fixture.lights, settings, diagnostics, [&](const std::string& message) {
+                        if (message.rfind("shadow evidence ", 0) != 0) {
+                            return;
+                        }
+                        ++evidenceUpdates;
+                        if (compact) {
+                            context.check(diagnostics.packedObservationMaps.size() == fixture.lights.size(),
+                                name + " packed container must remain indexed while streaming");
+                            for (size_t i = 0; i < std::min(evidenceUpdates, diagnostics.packedObservationMaps.size()); ++i) {
+                                context.check(diagnostics.packedObservationMaps[i].empty(),
+                                    name + " consumed packed maps must be released before the next light");
+                            }
+                        }
+                    });
+                context.check(evidenceUpdates == fixture.lights.size(), name + " must process every light");
+                context.check(diagnostics.packedObservationMaps.empty(), name + " must release the packed container");
+                context.check(diagnostics.shadowRefinementLightIndices.size() >= 6 &&
+                        diagnostics.shadowRefinementConstraintCount > 0 &&
+                        diagnostics.shadowMismatchRateBefore >= 0.0,
+                    name + " fixture must reach ray prediction and constrained refinement");
+                for (const auto member : {&PhotometricDiagnostics::shadowObservedCastMasks,
+                         &PhotometricDiagnostics::shadowObservationConfidence, &PhotometricDiagnostics::shadowPredictedBeforeMasks,
+                         &PhotometricDiagnostics::shadowPredictedAfterMasks, &PhotometricDiagnostics::shadowPredictedBeforeProbability,
+                         &PhotometricDiagnostics::shadowPredictedAfterProbability}) {
+                    const std::vector<cv::Mat>& maps = diagnostics.*member;
+                    context.check(maps.size() == fixture.lights.size(), name + " audit maps must stay indexed by light");
+                    for (size_t i = 0; i < maps.size(); ++i) {
+                        const bool selected = std::find(diagnostics.shadowRefinementLightIndices.begin(),
+                            diagnostics.shadowRefinementLightIndices.end(), static_cast<int>(i)) != diagnostics.shadowRefinementLightIndices.end();
+                        const bool alwaysPresent = member == &PhotometricDiagnostics::shadowObservedCastMasks ||
+                            member == &PhotometricDiagnostics::shadowObservationConfidence;
+                        if (alwaysPresent || selected) {
+                            const bool probability = member == &PhotometricDiagnostics::shadowObservationConfidence ||
+                                member == &PhotometricDiagnostics::shadowPredictedBeforeProbability ||
+                                member == &PhotometricDiagnostics::shadowPredictedAfterProbability;
+                            context.check(maps[i].size() == auditSize && maps[i].type() == (probability ? CV_32F : CV_8U),
+                                name + " audit resolution and type must honor retainFullResolutionDiagnostics");
+                            context.check(!maps[i].empty() && cv::checkRange(maps[i], true, nullptr, 0.0, probability ? 1.000001 : 256.0),
+                                name + " audit values must be finite and in range");
+                        } else {
+                            context.check(maps[i].empty(), name + " unselected predictions must remain empty");
+                        }
+                    }
+                }
+                results.push_back(std::move(diagnostics));
+                heights.push_back(std::move(height));
+            }
+        }
+        for (size_t i = 1; i < results.size(); ++i) {
+            checkSameMap(context, heights[i], heights[0], name + " refined height", 1.0e-7);
+            checkSameShadowRefinement(context, results[i], results[0], name);
+        }
+        for (const size_t base : {size_t{0}, size_t{2}}) {
+            for (const auto member : {&PhotometricDiagnostics::shadowObservedCastMasks,
+                     &PhotometricDiagnostics::shadowObservationConfidence, &PhotometricDiagnostics::shadowPredictedBeforeMasks,
+                     &PhotometricDiagnostics::shadowPredictedAfterMasks, &PhotometricDiagnostics::shadowPredictedBeforeProbability,
+                     &PhotometricDiagnostics::shadowPredictedAfterProbability}) {
+                const auto& full = results[base].*member;
+                const auto& compact = results[base + 1].*member;
+                if (full.size() == compact.size()) {
+                    for (size_t i = 0; i < full.size(); ++i) {
+                        checkSameMap(context, compact[i], full[i], name + " packed/full audit parity", 1.0e-7);
+                    }
+                }
+            }
+        }
+        for (const auto member : {&PhotometricDiagnostics::shadowPredictedBeforeMasks,
+                 &PhotometricDiagnostics::shadowPredictedAfterMasks, &PhotometricDiagnostics::shadowPredictedBeforeProbability,
+                 &PhotometricDiagnostics::shadowPredictedAfterProbability}) {
+            const auto& full = results[0].*member;
+            const auto& coarse = results[2].*member;
+            for (size_t i = 0; i < std::min(full.size(), coarse.size()); ++i) {
+                if (coarse[i].empty()) {
+                    continue;
+                }
+                cv::Mat expanded;
+                cv::resize(coarse[i], expanded, fixture.mask.size(), 0.0, 0.0,
+                    coarse[i].type() == CV_8U ? cv::INTER_NEAREST : cv::INTER_LINEAR);
+                expanded.setTo(0, fixture.mask == 0);
+                checkSameMap(context, full[i], expanded, name + " full audit must expand the coarse prediction", 1.0e-7);
+            }
+        }
+        std::cout << name << " height_storage_difference=" << cv::norm(heights[0], heights[3], cv::NORM_INF)
+                  << " constraints=" << results[0].shadowRefinementConstraintCount << '\n';
+
+        if (model == LightingModel::Directional) {
+            settings.retainFullResolutionDiagnostics = false;
+            PhotometricDiagnostics unit = makeShadowStorageDiagnostics(fixture, false, true);
+            cv::Mat unitHeight = fixture.initialHeight.clone();
+            refineHeightFromCastShadows(unitHeight, fixture.mask, fixture.mask, fixture.normals,
+                fixture.images, fixture.lights, settings, unit);
+            for (const bool emptyEntries : {false, true}) {
+                PhotometricDiagnostics absent = makeShadowStorageDiagnostics(fixture, false, true);
+                absent.shadowObservationConfidence.clear();
+                if (emptyEntries) {
+                    absent.shadowObservationConfidence.resize(fixture.lights.size());
+                }
+                cv::Mat absentHeight = fixture.initialHeight.clone();
+                refineHeightFromCastShadows(absentHeight, fixture.mask, fixture.mask, fixture.normals,
+                    fixture.images, fixture.lights, settings, absent);
+                checkSameMap(context, absentHeight, unitHeight, name + " absent raw confidence height");
+                checkSameShadowRefinement(context, absent, unit, name + " absent raw confidence");
+                context.check(absent.shadowObservationConfidence.size() == fixture.lights.size(),
+                    name + " absent confidence must receive coarse output maps");
+                for (size_t i = 0; i < std::min(absent.shadowObservationConfidence.size(), unit.shadowObservationConfidence.size()); ++i) {
+                    checkSameMap(context, absent.shadowObservationConfidence[i], unit.shadowObservationConfidence[i],
+                        name + " absent confidence must default to unit input confidence");
+                }
+            }
+        }
+    }
+}
+
+void testStreamedShadowNoEvidenceStorage(TestContext& context) {
+    const cv::Size fullSize(64, 48);
+    const cv::Size coarseSize(32, 24);
+    const cv::Mat mask(fullSize, CV_8U, cv::Scalar(255));
+    const cv::Mat normals(fullSize, CV_32FC3, cv::Scalar(0, 0, 1));
+    const std::vector<cv::Vec3f> lights = makeRingLights(8);
+    const std::vector<cv::Mat> images = renderLambertianPlane(48, 64, lights, cv::Vec3f(0, 0, 1), 0.6f);
+    for (const bool retainFull : {true, false}) {
+        for (const bool compact : {false, true}) {
+            PhotometricDiagnostics diagnostics;
+            for (size_t i = 0; i < lights.size(); ++i) {
+                if (compact) {
+                    diagnostics.packedObservationMaps.emplace_back(fullSize, CV_16U,
+                        cv::Scalar((static_cast<unsigned>(RobustObservationClass::Inlier) << 13) | 8191u));
+                } else {
+                    diagnostics.shadowObservationMasks.emplace_back(fullSize, CV_8U, cv::Scalar(0));
+                }
+            }
+            ShadowRefinementSettings settings;
+            settings.maximumCoarseSide = 32;
+            settings.iterations = 1;
+            settings.retainFullResolutionDiagnostics = retainFull;
+            cv::Mat height(fullSize, CV_32F, cv::Scalar(3.0f));
+            refineHeightFromCastShadows(height, mask, mask, normals, images, lights, settings, diagnostics);
+            context.check(!diagnostics.shadowHeightRefinementApplied &&
+                    diagnostics.shadowHeightRefinementDecision == "rejected_insufficient_coherent_shadow_lights",
+                "streamed no-evidence input must reject refinement normally");
+            context.check(cv::norm(height, cv::Mat(fullSize, CV_32F, cv::Scalar(3.0f)), cv::NORM_INF) == 0.0,
+                "streamed no-evidence rejection must preserve height exactly");
+            context.check(diagnostics.packedObservationMaps.empty(),
+                "packed maps must also be released on no-evidence rejection");
+            for (const cv::Mat& observed : diagnostics.shadowObservedCastMasks) {
+                context.check(observed.size() == (retainFull ? fullSize : coarseSize) && cv::countNonZero(observed) == 0,
+                    "no-evidence observed audits must honor requested resolution");
+            }
+            if (!retainFull) {
+                context.check(diagnostics.shadowObservationConfidence.size() == lights.size(),
+                    "no-evidence streaming must allocate coarse confidence even when raw confidence is absent");
+                for (const cv::Mat& confidence : diagnostics.shadowObservationConfidence) {
+                    context.check(confidence.size() == coarseSize && confidence.type() == CV_32F &&
+                            cv::norm(confidence, cv::Mat(coarseSize, CV_32F, cv::Scalar(1.0f)), cv::NORM_INF) == 0.0,
+                        "no-evidence coarse confidence must preserve fully agreeing lit evidence");
+                }
+            }
+        }
+    }
+}
+
 double highFrequencyDifferenceRms(
     const cv::Mat& first,
     const cv::Mat& second,
@@ -2297,6 +2704,39 @@ void testHeightIntegration(TestContext& context) {
         "irregular-mask robust normalized height RMSE was " + std::to_string(robustError));
 }
 
+void testHeightIntegrationPixelCenterSlopes(TestContext& context) {
+    for (const cv::Size size : {cv::Size(32, 24), cv::Size(23, 17)}) {
+        for (const float curvature : {0.0f, 0.012f}) {
+            cv::Mat truth(size, CV_32F);
+            cv::Mat normals(size, CV_32FC3);
+            const cv::Mat mask(size, CV_8U, cv::Scalar(255));
+            for (int y = 0; y < size.height; ++y) {
+                for (int x = 0; x < size.width; ++x) {
+                    const float xx = static_cast<float>(x) - 0.5f * (size.width - 1);
+                    const float yy = static_cast<float>(y) - 0.5f * (size.height - 1);
+                    truth.at<float>(y, x) = 0.21f * xx - 0.13f * yy + curvature * (xx * xx + 0.7f * yy * yy);
+                    const float p = 0.21f + 2.0f * curvature * xx;
+                    const float q = -0.13f + 1.4f * curvature * yy;
+                    normals.at<cv::Vec3f>(y, x) = normalized(cv::Vec3f(-p, q, 1.0f));
+                }
+            }
+            const cv::Mat originalNormals = normals.clone();
+            for (const HeightSolverMode mode : {HeightSolverMode::FastDct, HeightSolverMode::RobustMasked}) {
+                // Disable deliberate slope compression to test integration alone.
+                const cv::Mat actual = integrateHeight(normals, mask, mode, 0.0, 800);
+                const double error = normalizedHeightRmse(actual, truth, mask);
+                std::cout << "pixel_center_" << (mode == HeightSolverMode::FastDct ? "dct_" : "robust_")
+                          << size.width << "x" << size.height
+                          << "_curvature=" << curvature << "_rmse=" << error << '\n';
+                context.check(error < 0.0001,
+                    "Integration must preserve analytic pixel-center plane/quadratic slopes, including padded sizes");
+                context.check(cv::norm(normals, originalNormals, cv::NORM_INF) == 0,
+                    "Height integration must not change photometric normals");
+            }
+        }
+    }
+}
+
 void testHeightFlatteningSemantics(TestContext& context) {
     constexpr int rows = 31;
     constexpr int cols = 37;
@@ -2347,8 +2787,15 @@ void testHeightFlatteningSemantics(TestContext& context) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     TestContext context;
+    testCompactRobustObservationStorage(context);
+    testStreamedShadowDiagnosticStorage(context);
+    testStreamedShadowNoEvidenceStorage(context);
+    if (argc == 2 && std::string(argv[1]) == "--observation-storage") {
+        std::cout << "Observation storage regression failures=" << context.failures << '\n';
+        return context.failures == 0 ? 0 : 1;
+    }
     testCalibrationIdentityAndValidation(context);
     testNearFieldRingModel(context);
     testRadiometricConversion(context);
@@ -2371,6 +2818,7 @@ int main() {
     testShadowHeightRefinementNoEvidence(context);
     testMitsubaShadowHeightHoldout(context);
     testHeightIntegration(context);
+    testHeightIntegrationPixelCenterSlopes(context);
     testHeightFlatteningSemantics(context);
 
     if (context.failures != 0) {

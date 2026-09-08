@@ -1816,7 +1816,7 @@ void saveOutputs(
         writeImageChecked(outDir / "neural_valid_mask.png", neuralMask);
         writeImageChecked(outDir / "fused_classical_confidence.png", normalizeFloatTo8U(diagnostics.classicalConfidence, validMask, true));
     }
-    if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustWeight.empty()) {
+    if (opt.specularDiagnostics && opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustWeight.empty()) {
         writeImageChecked(outDir / "robust_weight.png", normalizeFloatTo8U(diagnostics.robustWeight, validMask, true));
         if (!diagnostics.robustFallbackMask.empty()) {
             writeImageChecked(outDir / "robust_fallback_mask.png", diagnostics.robustFallbackMask);

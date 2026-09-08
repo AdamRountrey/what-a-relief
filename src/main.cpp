@@ -191,6 +191,13 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
     diagnostics.collectObservationMasks = !opt.uncalibratedLighting &&
         opt.solverMode == NormalSolverMode::Robust &&
         (opt.specularDiagnostics || opt.shadowHeightRefinement);
+    diagnostics.compactObservationMasks = opt.shadowHeightRefinement && !opt.specularDiagnostics;
+    if (diagnostics.collectObservationMasks) {
+        const double bytes = static_cast<double>(images.size()) * images[0].total() *
+            (diagnostics.compactObservationMasks ? 2.0 : 7.0);
+        std::cout << "      observation diagnostic storage: " << bytes / (1024.0 * 1024.0)
+                  << " MiB (in addition to images and geometry)" << std::endl;
+    }
     if (opt.uncalibratedLighting) {
         solveUncalibratedPhotometricStereo(
             images,
@@ -311,6 +318,7 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
                 settings.referenceSurfaceZMm = opt.shadowReferenceZMm;
                 settings.ledDiameterMm = opt.shadowLedDiameterMm;
                 settings.lightingCenter = lightingCenter;
+                settings.retainFullResolutionDiagnostics = opt.specularDiagnostics;
                 refineHeightFromCastShadows(
                     height,
                     heightMask,
@@ -382,6 +390,8 @@ void runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
             albedo,
             height,
             heightMask.empty() ? validMask : heightMask,
+            geometryNormalMap.empty() ? normalMap : geometryNormalMap,
+            saturationMasks,
             diagnostics,
             [&](const std::string& message, int backendPercent) {
                 const int mappedPercent = 92 + (7 * std::clamp(backendPercent, 0, 100)) / 100;

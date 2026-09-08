@@ -566,15 +566,6 @@ struct RobustTriple {
     double condition = std::numeric_limits<double>::infinity();
 };
 
-enum class RobustObservationClass : unsigned char {
-    Inlier,
-    Shadow,
-    Highlight,
-    Saturated,
-    OtherOutlier,
-    Unusable
-};
-
 struct RobustCandidateScore {
     int inliers = 0;
     int tested = 0;
@@ -1779,7 +1770,14 @@ void solvePhotometricStereo(
     diagnostics.shadowObservationConfidence.clear();
     diagnostics.highlightObservationMasks.clear();
     diagnostics.saturationObservationMasks.clear();
-    if (diagnostics.collectObservationMasks) {
+    diagnostics.packedObservationMaps.clear();
+    if (diagnostics.collectObservationMasks && diagnostics.compactObservationMasks) {
+        for (size_t i = 0; i < images.size(); ++i) {
+            diagnostics.packedObservationMaps.emplace_back(rows, cols, CV_16U,
+                cv::Scalar(static_cast<unsigned>(RobustObservationClass::Unusable) << 13));
+        }
+    }
+    if (diagnostics.collectObservationMasks && !diagnostics.compactObservationMasks) {
         diagnostics.shadowObservationMasks.reserve(images.size());
         diagnostics.shadowObservationConfidence.reserve(images.size());
         diagnostics.highlightObservationMasks.reserve(images.size());
@@ -1834,7 +1832,7 @@ void solvePhotometricStereo(
                 std::vector<float*> shadowConfidenceRows;
                 std::vector<uchar*> highlightObservationRows;
                 std::vector<uchar*> saturationObservationRows;
-                if (diagnostics.collectObservationMasks) {
+                if (diagnostics.collectObservationMasks && !diagnostics.compactObservationMasks) {
                     shadowObservationRows.reserve(images.size());
                     shadowConfidenceRows.reserve(images.size());
                     highlightObservationRows.reserve(images.size());
@@ -1885,7 +1883,12 @@ void solvePhotometricStereo(
                         }
                         ++rawSaturationCount;
                         if (diagnostics.collectObservationMasks) {
-                            saturationObservationRows[i][x] = 255;
+                            if (diagnostics.compactObservationMasks) {
+                                diagnostics.packedObservationMaps[i].ptr<unsigned short>(y)[x] =
+                                    static_cast<unsigned short>(static_cast<unsigned>(RobustObservationClass::Saturated) << 13);
+                            } else {
+                                saturationObservationRows[i][x] = 255;
+                            }
                         }
                     }
                     saturationRow[x] = static_cast<float>(rawSaturationCount);
@@ -1928,6 +1931,17 @@ void solvePhotometricStereo(
 
                     if (diagnostics.collectObservationMasks) {
                         for (size_t i = 0; i < scratch.classes.size(); ++i) {
+                            if (diagnostics.compactObservationMasks) {
+                                double confidence = 0.0;
+                                if (scratch.classes[i] == RobustObservationClass::Shadow) {
+                                    confidence = std::clamp(0.35 + 0.10 * std::max(0.0, -scratch.standardizedResiduals[i]), 0.35, 1.0);
+                                } else if (scratch.classes[i] == RobustObservationClass::Inlier) {
+                                    confidence = std::clamp(scratch.weights[i], 0.0, 1.0);
+                                }
+                                diagnostics.packedObservationMaps[i].ptr<unsigned short>(y)[x] = static_cast<unsigned short>(
+                                    (static_cast<unsigned>(scratch.classes[i]) << 13) | static_cast<unsigned>(std::lround(confidence * 8191.0)));
+                                continue;
+                            }
                             switch (scratch.classes[i]) {
                             case RobustObservationClass::Shadow:
                                 shadowObservationRows[i][x] = 255;
@@ -2697,6 +2711,30 @@ cv::Mat extendMaskedFloatField(const cv::Mat& src, const cv::Mat& validMask) {
     return filled;
 }
 
+void pixelCenterSlopesToEdges(cv::Mat& p, cv::Mat& q) {
+    cv::Mat edgeP(p.size(), CV_32F, cv::Scalar(0));
+    cv::Mat edgeQ(q.size(), CV_32F, cv::Scalar(0));
+    cv::parallel_for_(cv::Range(0, p.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* prow = p.ptr<float>(y);
+            const float* qrow = q.ptr<float>(y);
+            const float* nextQ = y + 1 < q.rows ? q.ptr<float>(y + 1) : nullptr;
+            float* ep = edgeP.ptr<float>(y);
+            float* eq = edgeQ.ptr<float>(y);
+            for (int x = 0; x < p.cols; ++x) {
+                if (x + 1 < p.cols) {
+                    ep[x] = 0.5f * (prow[x] + prow[x + 1]);
+                }
+                if (nextQ != nullptr) {
+                    eq[x] = 0.5f * (qrow[x] + nextQ[x]);
+                }
+            }
+        }
+    });
+    p = std::move(edgeP);
+    q = std::move(edgeQ);
+}
+
 cv::Mat integrateHeightDct(
     const cv::Mat& normalMap,
     const cv::Mat& validMask,
@@ -2727,18 +2765,25 @@ cv::Mat integrateHeightDct(
     clampSlopeMagnitude(p, q, validMask, slopeCap);
     p = extendMaskedFloatField(p, validMask);
     q = extendMaskedFloatField(q, validMask);
+    const int dctRows = 2 * cv::getOptimalDFTSize((rows + 1) / 2);
+    const int dctCols = 2 * cv::getOptimalDFTSize((cols + 1) / 2);
+    cv::copyMakeBorder(p, p, 0, dctRows - rows, 0, dctCols - cols, cv::BORDER_REPLICATE);
+    cv::copyMakeBorder(q, q, 0, dctRows - rows, 0, dctCols - cols, cv::BORDER_REPLICATE);
+    // Normals are sampled at pixel centers, while the Neumann graph
+    // Laplacian fits height differences on edges. No edge leaves the domain.
+    pixelCenterSlopesToEdges(p, q);
     if (progress) {
         progress(1, 3);
     }
 
-    cv::Mat divergence(rows, cols, CV_32F, cv::Scalar(0));
-    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+    cv::Mat divergence(dctRows, dctCols, CV_32F, cv::Scalar(0));
+    cv::parallel_for_(cv::Range(0, dctRows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             const float* prow = p.ptr<float>(y);
             const float* qrow = q.ptr<float>(y);
             const float* prevQ = y > 0 ? q.ptr<float>(y - 1) : nullptr;
             float* out = divergence.ptr<float>(y);
-            for (int x = 0; x < cols; ++x) {
+            for (int x = 0; x < dctCols; ++x) {
                 const float leftP = x > 0 ? prow[x - 1] : 0.0f;
                 const float upQ = y > 0 ? prevQ[x] : 0.0f;
                 out[x] = (prow[x] - leftP) + (qrow[x] - upQ);
@@ -2746,21 +2791,8 @@ cv::Mat integrateHeightDct(
         }
     });
 
-    const int dctRows = 2 * cv::getOptimalDFTSize((rows + 1) / 2);
-    const int dctCols = 2 * cv::getOptimalDFTSize((cols + 1) / 2);
-    cv::Mat padded;
-    cv::copyMakeBorder(
-        divergence,
-        padded,
-        0,
-        dctRows - rows,
-        0,
-        dctCols - cols,
-        cv::BORDER_CONSTANT,
-        cv::Scalar(0));
-
     cv::Mat dctCoeffs;
-    cv::dct(padded, dctCoeffs);
+    cv::dct(divergence, dctCoeffs);
     if (progress) {
         progress(2, 3);
     }
@@ -3021,6 +3053,7 @@ cv::Mat integrateHeightRobustMasked(
     cv::Mat q;
     cv::Mat confidence;
     normalsToWeightedSlopes(normalMap, validMask, slopeCap, p, q, confidence);
+    pixelCenterSlopesToEdges(p, q);
     if (progress) {
         progress(1, 6);
     }
