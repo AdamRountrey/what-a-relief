@@ -6,10 +6,12 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -910,6 +912,7 @@ struct PlyGridTopology {
     double minimumHeight = std::numeric_limits<double>::infinity();
     double maximumHeight = -std::numeric_limits<double>::infinity();
     std::vector<std::int32_t> indices;
+    std::vector<std::uint8_t> cellFaces;
     std::vector<std::int8_t> horizontalEdgeBalance;
     std::vector<std::int8_t> verticalEdgeBalance;
     std::vector<std::int8_t> diagonalEdgeBalance;
@@ -917,11 +920,21 @@ struct PlyGridTopology {
     std::int32_t index(int row, int col) const {
         return indices[static_cast<size_t>(row) * static_cast<size_t>(sampleCols) + static_cast<size_t>(col)];
     }
+
+    bool hasFace(int row, int col, int triangle) const {
+        return (cellFaces[static_cast<size_t>(row) * static_cast<size_t>(sampleCols - 1) +
+            static_cast<size_t>(col)] & (1u << triangle)) != 0;
+    }
 };
 
 void addEdgeBalance(std::int8_t& balance, int contribution) {
     balance = static_cast<std::int8_t>(static_cast<int>(balance) + contribution);
 }
+
+void countPlyGridFaces(
+    PlyGridTopology& topology,
+    bool includeBoundary,
+    const std::function<void(const std::string&)>& progress);
 
 PlyGridTopology buildPlyGridTopology(
     const cv::Mat& height,
@@ -964,6 +977,34 @@ PlyGridTopology buildPlyGridTopology(
         }
     }
 
+    topology.cellFaces.assign(
+        static_cast<size_t>(topology.sampleRows - 1) * static_cast<size_t>(topology.sampleCols - 1), 0);
+    for (int row = 0; row + 1 < topology.sampleRows; ++row) {
+        for (int col = 0; col + 1 < topology.sampleCols; ++col) {
+            auto& faces = topology.cellFaces[static_cast<size_t>(row) *
+                static_cast<size_t>(topology.sampleCols - 1) + static_cast<size_t>(col)];
+            const auto a = topology.index(row, col);
+            const auto b = topology.index(row, col + 1);
+            const auto c = topology.index(row + 1, col);
+            const auto d = topology.index(row + 1, col + 1);
+            if (a >= 0 && b >= 0 && c >= 0) {
+                faces |= 1;
+            }
+            if (b >= 0 && c >= 0 && d >= 0) {
+                faces |= 2;
+            }
+        }
+    }
+    countPlyGridFaces(topology, includeBoundary, progress);
+    return topology;
+}
+
+void countPlyGridFaces(
+    PlyGridTopology& topology,
+    bool includeBoundary,
+    const std::function<void(const std::string&)>& progress) {
+    topology.topFaceCount = 0;
+    topology.boundaryFaceCount = 0;
     if (includeBoundary) {
         topology.horizontalEdgeBalance.assign(
             static_cast<size_t>(topology.sampleRows) *
@@ -979,15 +1020,11 @@ PlyGridTopology buildPlyGridTopology(
             0);
     }
 
-    reportProgress(progress, includeBoundary ? "PLY: building shared faces and printable boundary..." : "PLY: counting faces...");
+    reportProgress(progress, includeBoundary ? "PLY: building printable boundary..." : "PLY: counting faces...");
     const int cellCols = std::max(0, topology.sampleCols - 1);
     for (int row = 0; row + 1 < topology.sampleRows; ++row) {
         for (int col = 0; col + 1 < topology.sampleCols; ++col) {
-            const std::int32_t a = topology.index(row, col);
-            const std::int32_t b = topology.index(row, col + 1);
-            const std::int32_t c = topology.index(row + 1, col);
-            const std::int32_t d = topology.index(row + 1, col + 1);
-            if (a >= 0 && b >= 0 && c >= 0) {
+            if (topology.hasFace(row, col, 0)) {
                 ++topology.topFaceCount;
                 if (includeBoundary) {
                     addEdgeBalance(topology.verticalEdgeBalance[
@@ -1001,7 +1038,7 @@ PlyGridTopology buildPlyGridTopology(
                         static_cast<size_t>(col)], -1);
                 }
             }
-            if (b >= 0 && d >= 0 && c >= 0) {
+            if (topology.hasFace(row, col, 1)) {
                 ++topology.topFaceCount;
                 if (includeBoundary) {
                     addEdgeBalance(topology.diagonalEdgeBalance[
@@ -1027,7 +1064,169 @@ PlyGridTopology buildPlyGridTopology(
             countBoundary(topology.verticalEdgeBalance) +
             countBoundary(topology.diagonalEdgeBalance);
     }
-    return topology;
+}
+
+size_t keepLargestPlyFaceComponent(PlyGridTopology& topology) {
+    const size_t cellCols = static_cast<size_t>(topology.sampleCols - 1);
+    const size_t cellRows = static_cast<size_t>(topology.sampleRows - 1);
+    std::deque<size_t> pending;
+    // Two presence bits and two pairs of flood marks fit in one byte per grid cell.
+    const auto flood = [&](size_t seed, unsigned mark) {
+        const auto enqueue = [&](size_t cell, unsigned triangle) {
+            auto& flags = topology.cellFaces[cell];
+            if ((flags & (1u << triangle)) != 0 && (flags & (mark << triangle)) == 0) {
+                flags |= static_cast<std::uint8_t>(mark << triangle);
+                pending.push_back(2 * cell + triangle);
+            }
+        };
+        enqueue(seed / 2, static_cast<unsigned>(seed % 2));
+        size_t count = 0;
+        while (!pending.empty()) {
+            const size_t face = pending.front();
+            pending.pop_front();
+            ++count;
+            const size_t cell = face / 2;
+            const size_t row = cell / cellCols;
+            const size_t col = cell % cellCols;
+            if (face % 2 == 0) {
+                enqueue(cell, 1);
+                if (row > 0) enqueue(cell - cellCols, 1);
+                if (col > 0) enqueue(cell - 1, 1);
+            } else {
+                enqueue(cell, 0);
+                if (row + 1 < cellRows) enqueue(cell + cellCols, 0);
+                if (col + 1 < cellCols) enqueue(cell + 1, 0);
+            }
+        }
+        return count;
+    };
+    size_t components = 0;
+    size_t largestSeed = 0;
+    size_t largestCount = 0;
+    for (size_t cell = 0; cell < topology.cellFaces.size(); ++cell) {
+        for (unsigned triangle = 0; triangle < 2; ++triangle) {
+            const auto flags = topology.cellFaces[cell];
+            if ((flags & (1u << triangle)) == 0 || (flags & (4u << triangle)) != 0) {
+                continue;
+            }
+            ++components;
+            const size_t count = flood(2 * cell + triangle, 4);
+            // Uniform XY triangles: face count measures projected area, not noisy slope magnitude.
+            if (count > largestCount) {
+                largestCount = count;
+                largestSeed = 2 * cell + triangle;
+            }
+        }
+    }
+    if (largestCount > 0) {
+        flood(largestSeed, 16);
+    }
+    for (auto& flags : topology.cellFaces) {
+        flags = static_cast<std::uint8_t>((flags >> 4) & 3u);
+    }
+    return components;
+}
+
+std::array<size_t, 3> plyFaceSamples(const PlyGridTopology& topology, size_t face) {
+    const size_t cell = face / 2;
+    const size_t cols = static_cast<size_t>(topology.sampleCols);
+    const size_t a = (cell / (cols - 1)) * cols + cell % (cols - 1);
+    return face % 2 == 0 ? std::array<size_t, 3>{a, a + cols, a + 1}
+                         : std::array<size_t, 3>{a + 1, a + cols, a + cols + 1};
+}
+
+size_t trimPlyPointContacts(PlyGridTopology& topology) {
+    const size_t noFace = std::numeric_limits<size_t>::max();
+    const auto faceAt = [&](int row, int col, unsigned triangle) {
+        if (row < 0 || col < 0 || row + 1 >= topology.sampleRows || col + 1 >= topology.sampleCols) {
+            return noFace;
+        }
+        const size_t cell = static_cast<size_t>(row) * static_cast<size_t>(topology.sampleCols - 1) +
+            static_cast<size_t>(col);
+        return (topology.cellFaces[cell] & (1u << triangle)) != 0 ? 2 * cell + triangle : noFace;
+    };
+    size_t removed = 0;
+    std::deque<size_t> pending;
+    for (size_t sample = 0; sample < topology.indices.size(); ++sample) {
+        pending.push_back(sample);
+        while (!pending.empty()) {
+            const size_t vertex = pending.front();
+            pending.pop_front();
+            const int row = static_cast<int>(vertex / static_cast<size_t>(topology.sampleCols));
+            const int col = static_cast<int>(vertex % static_cast<size_t>(topology.sampleCols));
+            // Six incident triangles in circular order. A manifold vertex has one contiguous fan.
+            const std::array<size_t, 6> ring = {faceAt(row, col, 0), faceAt(row, col - 1, 1),
+                faceAt(row, col - 1, 0), faceAt(row - 1, col - 1, 1),
+                faceAt(row - 1, col, 0), faceAt(row - 1, col, 1)};
+            int fans = 0;
+            int bestStart = 0;
+            int bestLength = 0;
+            for (int i = 0; i < 6; ++i) {
+                if (ring[i] == noFace || ring[(i + 5) % 6] != noFace) continue;
+                ++fans;
+                int length = 1;
+                while (length < 6 && ring[(i + length) % 6] != noFace) ++length;
+                if (length > bestLength) {
+                    bestStart = i;
+                    bestLength = length;
+                }
+            }
+            if (fans <= 1) continue;
+            for (int i = 0; i < 6; ++i) {
+                if (ring[i] == noFace || (i - bestStart + 6) % 6 < bestLength) continue;
+                const size_t face = ring[i];
+                topology.cellFaces[face / 2] &= static_cast<std::uint8_t>(~(1u << (face % 2)));
+                ++removed;
+                for (size_t affected : plyFaceSamples(topology, face)) pending.push_back(affected);
+            }
+        }
+    }
+    return removed;
+}
+
+void preparePrintablePlyTopology(
+    PlyGridTopology& topology,
+    const cv::Mat& height,
+    const std::function<void(const std::string&)>& progress) {
+    if (topology.topFaceCount == 0) {
+        die("Printable PLY has no surface faces. Use a smaller mesh step or a larger height mask.");
+    }
+    reportProgress(progress, "Printable PLY: retaining the largest connected sampled surface...");
+    const auto originalVertices = topology.vertexCount;
+    const auto originalFaces = topology.topFaceCount;
+    keepLargestPlyFaceComponent(topology);
+    reportProgress(progress, "Printable PLY: checking point contacts...");
+    if (trimPlyPointContacts(topology) > 0) {
+        keepLargestPlyFaceComponent(topology);
+    }
+    // Compact only referenced vertices, then derive the base from the retained surface alone.
+    std::fill(topology.indices.begin(), topology.indices.end(), -1);
+    for (size_t cell = 0; cell < topology.cellFaces.size(); ++cell) {
+        for (unsigned triangle = 0; triangle < 2; ++triangle) {
+            if ((topology.cellFaces[cell] & (1u << triangle)) != 0) {
+                for (size_t sample : plyFaceSamples(topology, 2 * cell + triangle)) topology.indices[sample] = 0;
+            }
+        }
+    }
+    topology.vertexCount = 0;
+    topology.minimumHeight = std::numeric_limits<double>::infinity();
+    topology.maximumHeight = -std::numeric_limits<double>::infinity();
+    for (int row = 0; row < topology.sampleRows; ++row) {
+        const float* heights = height.ptr<float>(row * topology.step);
+        for (int col = 0; col < topology.sampleCols; ++col) {
+            auto& index = topology.indices[static_cast<size_t>(row) *
+                static_cast<size_t>(topology.sampleCols) + static_cast<size_t>(col)];
+            if (index >= 0) {
+                index = topology.vertexCount++;
+                topology.minimumHeight = std::min(topology.minimumHeight, static_cast<double>(heights[col * topology.step]));
+                topology.maximumHeight = std::max(topology.maximumHeight, static_cast<double>(heights[col * topology.step]));
+            }
+        }
+    }
+    countPlyGridFaces(topology, true, progress);
+    reportProgress(progress, "Printable PLY: removed " + std::to_string(originalFaces - topology.topFaceCount) +
+        " top triangles and " + std::to_string(originalVertices - topology.vertexCount) +
+        " unused/disconnected samples; retained one connected surface.");
 }
 
 struct PrintableSurfaceFill {
@@ -1564,6 +1763,7 @@ void writePrintablePlyMesh(
     out << "ply\n";
     out << "format binary_little_endian 1.0\n";
     out << "comment generated by what-a-relief printable solid export\n";
+    out << "comment largest edge-connected sampled surface; point contacts trimmed\n";
     out << "comment units " << (pixelScaleMm > 0.0 ? "millimeters" : "input_pixels") << "\n";
     out << "element vertex " << vertexCount << "\n";
     out << "property float x\n";
@@ -1605,11 +1805,11 @@ void writePrintablePlyMesh(
             const std::int32_t b = topology.index(row, col + 1);
             const std::int32_t c = topology.index(row + 1, col);
             const std::int32_t d = topology.index(row + 1, col + 1);
-            if (a >= 0 && b >= 0 && c >= 0) {
+            if (topology.hasFace(row, col, 0)) {
                 binary.writeTriangle(a, c, b);
                 binary.writeTriangle(b + topVertexCount, c + topVertexCount, a + topVertexCount);
             }
-            if (b >= 0 && d >= 0 && c >= 0) {
+            if (topology.hasFace(row, col, 1)) {
                 binary.writeTriangle(b, c, d);
                 binary.writeTriangle(d + topVertexCount, c + topVertexCount, b + topVertexCount);
             }
@@ -1988,12 +2188,13 @@ void saveOutputs(
                     opt.heightSlopeCap,
                     progress);
                 writeImageChecked(outDir / "printable_fill_mask.png", printable.fillMask);
-                const PlyGridTopology printableTopology = buildPlyGridTopology(
+                PlyGridTopology printableTopology = buildPlyGridTopology(
                     printable.height,
                     printable.mask,
                     opt.meshStep,
-                    true,
+                    false,
                     progress);
+                preparePrintablePlyTopology(printableTopology, printable.height, progress);
                 writePrintablePlyMesh(
                     opt.printableMeshPath,
                     printable.height,
@@ -2004,11 +2205,11 @@ void saveOutputs(
                     printableTopology,
                     progress);
             } else {
-                const PlyGridTopology topology = buildPlyGridTopology(
+                PlyGridTopology topology = buildPlyGridTopology(
                     height,
                     geometryMask,
                     opt.meshStep,
-                    !opt.printableMeshPath.empty(),
+                    false,
                     progress);
                 if (!opt.meshPath.empty()) {
                     writePlyMesh(
@@ -2020,6 +2221,7 @@ void saveOutputs(
                         progress);
                 }
                 if (!opt.printableMeshPath.empty()) {
+                    preparePrintablePlyTopology(topology, height, progress);
                     writePrintablePlyMesh(
                         opt.printableMeshPath,
                         height,

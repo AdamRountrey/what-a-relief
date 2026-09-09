@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -988,6 +989,156 @@ void testPrintableMeshTopology(TestContext& context) {
     fs::remove_all(root);
 }
 
+void checkSinglePrintableSolid(TestContext& context, const PlyData& mesh, const std::string& name) {
+    std::vector<std::vector<size_t>> neighbors(mesh.vertices.size());
+    std::map<std::pair<int, int>, std::pair<int, int>> edges;
+    bool valid = !mesh.faces.empty() && !mesh.vertices.empty();
+    for (const auto& face : mesh.faces) {
+        for (size_t i = 0; i < face.size(); ++i) {
+            const int a = face[i];
+            const int b = face[(i + 1) % face.size()];
+            if (a < 0 || b < 0 || a == b || static_cast<size_t>(a) >= neighbors.size() ||
+                static_cast<size_t>(b) >= neighbors.size()) {
+                valid = false;
+                continue;
+            }
+            neighbors[a].push_back(b);
+            neighbors[b].push_back(a);
+            auto& edge = edges[{std::min(a, b), std::max(a, b)}];
+            ++edge.first;
+            edge.second += a < b ? 1 : -1;
+        }
+    }
+    context.check(valid, name + ": valid nonempty mesh required");
+    context.check(std::all_of(edges.begin(), edges.end(), [](const auto& edge) {
+        return edge.second.first == 2 && edge.second.second == 0;
+    }), name + ": each edge must have exactly two oppositely oriented incident faces");
+    context.check(std::all_of(neighbors.begin(), neighbors.end(), [](const auto& adjacent) {
+        return !adjacent.empty();
+    }), name + ": unused vertices must be removed");
+    size_t components = 0;
+    std::vector<bool> visited(neighbors.size(), false);
+    for (size_t seed = 0; seed < neighbors.size(); ++seed) {
+        if (visited[seed]) {
+            continue;
+        }
+        ++components;
+        std::queue<size_t> pending;
+        pending.push(seed);
+        visited[seed] = true;
+        while (!pending.empty()) {
+            const size_t v = pending.front();
+            pending.pop();
+            for (size_t next : neighbors[v]) {
+                if (!visited[next]) {
+                    visited[next] = true;
+                    pending.push(next);
+                }
+            }
+        }
+    }
+    context.check(components == 1, name + ": printable mesh must contain exactly one connected component");
+}
+
+void testPrintableSingleComponent(TestContext& context) {
+    const fs::path root = "io_mesh_component_test";
+    fs::remove_all(root);
+    const auto run = [&](const std::string& name, const std::vector<std::string>& pattern,
+                         int step, bool fill, int expectedTopVertices,
+                         int expectedTopFaces = -1, bool checkFlatHeights = true) {
+        const int rows = static_cast<int>(pattern.size());
+        const int cols = static_cast<int>(pattern.front().size());
+        cv::Mat mask(rows, cols, CV_8U, cv::Scalar(0));
+        cv::Mat height(rows, cols, CV_32F, cv::Scalar(2.0f));
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < cols; ++x) {
+                mask.at<uchar>(y, x) = pattern[y][x] == '1' ? 255 : 0;
+            }
+        }
+        // An isolated low outlier must not determine the retained solid's base elevation.
+        height.at<float>(0, cols - 1) = -100.0f;
+        const cv::Mat originalHeight = height.clone();
+        const cv::Mat originalMask = mask.clone();
+        const cv::Mat normals(rows, cols, CV_32FC3, cv::Scalar(0, 0, 1));
+        const cv::Mat albedo(rows, cols, CV_32F, cv::Scalar(0.55f));
+        const cv::Mat residual(rows, cols, CV_32F, cv::Scalar(0));
+        Options opt;
+        opt.outputDir = (root / name).string();
+        opt.calculateHeight = true;
+        opt.solverMode = NormalSolverMode::Standard;
+        opt.meshStep = step;
+        opt.pixelScaleMm = 0.2;
+        opt.printableThicknessMm = 1.5;
+        const auto lights = makeLights();
+        for (size_t i = 0; i < lights.size(); ++i) {
+            opt.imagePaths.push_back("synthetic_component_" + std::to_string(i) + ".png");
+        }
+        opt.meshPath = (root / name / "surface.ply").string();
+        saveOutputs(opt, lights, {}, normals, albedo, residual, mask, {}, height, mask);
+        const std::string openBefore = readText(opt.meshPath);
+        const std::string heightBefore = readText(root / name / "height.pfm");
+        const std::string normalBefore = readText(root / name / "normal_rgb.png");
+        opt.printableMeshPath = (root / name / "printable_surface.ply").string();
+        opt.printableFillHoles = fill;
+        saveOutputs(opt, lights, {}, normals, albedo, residual, mask, {}, height, mask);
+        const PlyData solid = readBinaryPly(opt.printableMeshPath);
+        checkSinglePrintableSolid(context, solid, name);
+        if (expectedTopVertices > 0) {
+            context.check(solid.vertices.size() == 2 * static_cast<size_t>(expectedTopVertices),
+                name + ": retain the largest sampled patch (first in image order on ties)");
+        }
+        if (expectedTopFaces >= 0) {
+            const auto topFaces = std::count_if(solid.faces.begin(), solid.faces.end(), [&](const auto& face) {
+                return face.size() == 3 && std::all_of(face.begin(), face.end(), [&](int index) {
+                    return index >= 0 && static_cast<size_t>(index) < solid.vertices.size() / 2;
+                });
+            });
+            context.check(topFaces == expectedTopFaces,
+                name + ": local contact trimming must not discard excessive surface area");
+        }
+        if (expectedTopVertices > 0 && checkFlatHeights) {
+            const size_t topCount = solid.vertices.size() / 2;
+            for (size_t i = 0; i < topCount; ++i) {
+                context.check(std::abs(solid.vertices[i][2] - 0.4f) < 1.0e-6f &&
+                    std::abs(solid.vertices[i + topCount][2] + 1.1f) < 1.0e-6f,
+                    name + ": discarded heights must not affect the top or base");
+            }
+        }
+        context.check(openBefore == readText(opt.meshPath) &&
+            heightBefore == readText(root / name / "height.pfm") &&
+            !normalBefore.empty() && normalBefore == readText(root / name / "normal_rgb.png"),
+            name + ": printable filtering must not change scientific or open-mesh exports");
+        context.check(cv::norm(height, originalHeight, cv::NORM_INF) == 0.0 &&
+            cv::norm(mask, originalMask, cv::NORM_INF) == 0.0,
+            name + ": printable filtering must not mutate caller height or mask");
+    };
+    for (bool fill : {false, true}) {
+        const std::string suffix = fill ? "_filled" : "_unfilled";
+        run("islands" + suffix, {"111011", "111011", "111000"}, 1, fill, 9);
+        run("unused" + suffix, {"1101", "1100"}, 1, fill, 4);
+        run("point_contact" + suffix, {"110", "111", "011"}, 1, fill, 4);
+        run("downsampled_bridge" + suffix,
+            {"1111000001111", "1111111111111", "1111111111111", "1111000001111",
+             "1111000001111", "1111000001111", "1111000001111"}, 3, fill, 6);
+    }
+    run("pinched_boundary", {"1111111", "1111111", "1110111", "1111111",
+        "1110111", "1111111", "1111111"}, 1, false, 47, 59, false);
+    run("wraparound_fan", {"111", "011", "111"}, 1, false, 7, 5, false);
+    std::uint32_t randomState = 0x65b772a1u;
+    for (int trial = 0; trial < 24; ++trial) {
+        std::vector<std::string> pattern(8, std::string(9, '0'));
+        for (auto& row : pattern) {
+            for (auto& pixel : row) {
+                randomState = 1664525u * randomState + 1013904223u;
+                pixel = (randomState >> 24) < 170u ? '1' : '0';
+            }
+        }
+        pattern[0][0] = pattern[0][1] = pattern[1][0] = pattern[1][1] = '1';
+        run("irregular_" + std::to_string(trial), pattern, 1, trial % 2 == 0, -1);
+    }
+    fs::remove_all(root);
+}
+
 void testPrintableHoleFillSurface(TestContext& context) {
     const fs::path root = "io_mesh_fill_test";
     fs::remove_all(root);
@@ -1101,6 +1252,7 @@ int main() {
     testNearFieldCalibrationMetadataRoundTrip(context);
     testDefiniteSaturationLoading(context);
     testPrintableMeshTopology(context);
+    testPrintableSingleComponent(context);
     testPrintableHoleFillSurface(context);
     if (context.failures != 0) {
         std::cerr << context.failures << " I/O/export regression check(s) failed.\n";

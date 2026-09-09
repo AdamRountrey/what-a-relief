@@ -20,7 +20,7 @@
 namespace fs = std::filesystem;
 
 #ifndef WHAT_A_RELIEF_VERSION
-#define WHAT_A_RELIEF_VERSION "0.2.3"
+#define WHAT_A_RELIEF_VERSION "0.2.4"
 #endif
 
 namespace {

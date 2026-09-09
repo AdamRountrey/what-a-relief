@@ -29,7 +29,7 @@
 namespace fs = std::filesystem;
 
 #ifndef WHAT_A_RELIEF_VERSION
-#define WHAT_A_RELIEF_VERSION "0.2.3"
+#define WHAT_A_RELIEF_VERSION "0.2.4"
 #endif
 
 namespace {
@@ -1449,7 +1449,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     setButtonChecked(state.meshCheck, !state.opt->meshPath.empty());
 
     y += 32;
-    state.printableMeshCheck = makeControl(geometryPage, "BUTTON", "Export watertight printable PLY solid", BS_AUTOCHECKBOX, kIdPrintableMesh, kControlX, y, kControlWidth, 24);
+    state.printableMeshCheck = makeControl(geometryPage, "BUTTON", "Export printable PLY solid (largest component only)", BS_AUTOCHECKBOX, kIdPrintableMesh, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.printableMeshCheck, !state.opt->printableMeshPath.empty());
 
     y += 32;
