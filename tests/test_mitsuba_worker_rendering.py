@@ -117,19 +117,28 @@ class RenderingTests(unittest.TestCase):
             normal_paths = [inputs / f'normal_{axis}.pfm' for axis in range(3)]
             for axis, path in enumerate(normal_paths):
                 w.write_pfm(path, w.surface_normals(truth, mask)[..., axis])
+            w.save_gray(mi, inputs / 'clipped.png', np.ones_like(truth))
+            w.save_gray(mi, inputs / 'invalid.png', np.zeros_like(truth))
             try:
-                for name, baseline in [('tilted', np.full_like(truth, 7)), ('truth', truth)]:
+                for name, baseline in [('tilted', np.full_like(truth, 7)),
+                                       ('tilted_clipped_views', np.full_like(truth, 7)), ('truth', truth)]:
                     with self.subTest(start=name):
                         output = root / name
                         output.mkdir()
                         w.write_pfm(inputs / 'height.pfm', baseline)
-                        if name == 'tilted':
+                        if name.startswith('tilted'):
                             job['inputs']['normal_prior_pfm'] = list(map(str, normal_paths))
                         else:
                             job['inputs'].pop('normal_prior_pfm', None)
                         job['outputs']['directory'] = str(output)
                         job_path = output / 'job.json'
-                        job_path.write_text(json.dumps(job), encoding='utf-8')
+                        run_job = json.loads(json.dumps(job))
+                        if name == 'tilted_clipped_views':
+                            for index in (1, 4):
+                                run_job['inputs']['images'].insert(index, str(inputs / 'clipped.png'))
+                                run_job['inputs']['observation_validity'].insert(index, str(inputs / 'invalid.png'))
+                                run_job['inputs']['lights'].insert(index, lights[0].tolist())
+                        job_path.write_text(json.dumps(run_job), encoding='utf-8')
                         self.assertEqual(w.run_job(job_path), 0)
                         result = json.loads((output / 'result.json').read_text())
                         reconstructed = w.read_pfm(output / 'inverse_height.pfm')
@@ -142,7 +151,7 @@ class RenderingTests(unittest.TestCase):
                         print('INVERSE_GEOMETRY', name, result['decision'], mean_error,
                               result['train_relative_improvement'], result['holdout_relative_improvement'],
                               'height_rmse_pixels', height_rmse, flush=True)
-                        if name == 'tilted':
+                        if name.startswith('tilted'):
                             baseline_error = np.degrees(np.arctan(np.hypot(0.15, 0.06)))
                             self.assertTrue(result['accepted'])
                             self.assertFalse(result['candidate_saved'])
@@ -152,6 +161,12 @@ class RenderingTests(unittest.TestCase):
                             self.assertLess(height_rmse, float(np.std(initial_delta)))
                             self.assertTrue(result['normal_prior_enabled'])
                             self.assertLess(result['normal_prior_loss_after'], result['normal_prior_loss_before'])
+                            if name == 'tilted_clipped_views':
+                                selection = result['light_selection']
+                                self.assertEqual(selection['used_light_count'], 8)
+                                self.assertEqual(selection['excluded_light_indices'], [1, 4])
+                                self.assertTrue(result['holdout_light_indices'])
+                                self.assertFalse({1, 4} & set(result['training_light_indices'] + result['holdout_light_indices']))
                         else:
                             self.assertLess(mean_error, 1.0)
                             self.assertLess(height_rmse, 0.05)

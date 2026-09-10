@@ -19,6 +19,64 @@ spec.loader.exec_module(w)
 
 
 class NumericalTests(unittest.TestCase):
+    @staticmethod
+    def light_support_fixture(count=8):
+        angle = 2 * np.pi * np.arange(count) / count
+        lights = np.column_stack((0.6 * np.cos(angle), 0.6 * np.sin(angle), np.full(count, 0.8)))
+        return dict(lights=lights.astype(np.float32), weights=np.ones((count, 10, 10), np.float32),
+                    images_small=np.arange(count * 100, dtype=np.float32).reshape(count, 10, 10))
+
+    def test_inverse_selects_supported_lights_before_splitting(self):
+        prepared = self.light_support_fixture(10)
+        prepared['weights'][1] = 0
+        prepared['weights'][4].flat[63:] = 0
+        prepared['weights'][7].flat[64:] = 0
+        original = {key: value.copy() for key, value in prepared.items()}
+        result = {}
+        selected, train, holdout = w.select_supported_lights(prepared, result)
+        used = [0, 2, 3, 5, 6, 7, 8, 9]
+        self.assertEqual(result['light_selection']['excluded_light_indices'], [1, 4])
+        self.assertEqual(result['light_selection']['supported_pixels_per_light'][4], 63)
+        self.assertEqual(result['light_selection']['supported_pixels_per_light'][7], 64)
+        self.assertEqual(selected['light_indices'], used)
+        self.assertEqual(selected['input_light_count'], 10)
+        self.assertEqual(result['training_light_indices'], [used[i] for i in train])
+        self.assertEqual(result['holdout_light_indices'], [used[i] for i in holdout])
+        self.assertTrue(holdout)
+        self.assertFalse(set(train) & set(holdout))
+        self.assertEqual(sorted(train + holdout), list(range(len(used))))
+        for key in original:
+            np.testing.assert_array_equal(prepared[key], original[key])
+            np.testing.assert_array_equal(selected[key], original[key][used])
+        # Selection cannot inspect image brightness, residuals, or validation scores.
+        prepared['images_small'] *= -100
+        second = {}
+        w.select_supported_lights(prepared, second)
+        self.assertEqual(second, result)
+
+    def test_inverse_support_selection_keeps_guards_and_failure_audit(self):
+        prepared = self.light_support_fixture()
+        unchanged, train, holdout = w.select_supported_lights(prepared, {})
+        self.assertEqual((train, holdout), w.split_lights(8))
+        np.testing.assert_array_equal(unchanged['lights'], prepared['lights'])
+        for count in (0, 5):
+            with self.subTest(usable=count):
+                prepared = self.light_support_fixture()
+                prepared['weights'][count:] = 0
+                result = {}
+                with self.assertRaisesRegex(ValueError, f'Only {count} of 8 lights'):
+                    w.select_supported_lights(prepared, result)
+                self.assertEqual(result['light_selection']['used_light_count'], count)
+                self.assertNotIn('accepted', result)
+        prepared = self.light_support_fixture()
+        prepared['lights'][:] = [0, 0, 1]
+        with self.assertRaisesRegex(ValueError, 'poorly conditioned'):
+            w.select_supported_lights(prepared, {})
+        prepared = self.light_support_fixture()
+        prepared['weights'][0, 0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, 'finite and nonnegative'):
+            w.select_supported_lights(prepared, {})
+
     def test_rejected_candidate_is_retained_without_promoting_geometry(self):
         yy, xx = np.mgrid[:9, :11].astype(np.float32)
         baseline = 7 + 0.1 * xx - 0.2 * yy

@@ -3,8 +3,15 @@
 #include <opencv2/core.hpp>
 
 #include <cmath>
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <map>
+#include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,6 +24,80 @@ void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+std::string fileText(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input), {});
+}
+
+void checkInverseSolid(const fs::path& path, bool accepted) {
+    std::ifstream input(path, std::ios::binary);
+    std::string line, header;
+    size_t vertexCount = 0, faceCount = 0;
+    while (std::getline(input, line)) {
+        header += line + "\n";
+        if (line.rfind("element vertex ", 0) == 0) vertexCount = std::stoul(line.substr(15));
+        if (line.rfind("element face ", 0) == 0) faceCount = std::stoul(line.substr(13));
+        if (line == "end_header") break;
+    }
+    require(vertexCount > 0 && vertexCount % 2 == 0 && faceCount > 0, "Inverse solid has no topology");
+    require(header.find("units millimeters") != std::string::npos, "Inverse printable units are not mm");
+    require(header.find(accepted ? "accepted inverse" : "inverse refinement rejected") != std::string::npos,
+            "Printable source/acceptance annotation missing");
+    const size_t topCount = vertexCount / 2;
+    for (size_t index = 0; index < vertexCount; ++index) {
+        std::array<float, 3> point{};
+        std::array<unsigned char, 3> color{};
+        input.read(reinterpret_cast<char*>(point.data()), sizeof(point));
+        input.read(reinterpret_cast<char*>(color.data()), sizeof(color));
+        require(input.good(), "Truncated inverse printable vertex");
+        // Scale 0.25 mm/pixel, mesh step 2, height exaggeration 3, base 1.5 mm.
+        require(std::abs(point[0] / 0.5f - std::round(point[0] / 0.5f)) < 1e-5f &&
+                std::abs(point[1] / 0.5f - std::round(point[1] / 0.5f)) < 1e-5f,
+                "Inverse mesh did not inherit mm scale and sampling step");
+        const float expected = index >= topCount ? -1.5f :
+            accepted ? 3.0f * (0.1f * point[0] - 0.2f * point[1]) : 0.0f;
+        require(std::abs(point[2] - expected) < 1e-5f, "Inverse solid used wrong height, PFM row order, Z scale, or base");
+        require(color[0] > 0 && color[0] == color[1] && color[1] == color[2], "Inverse albedo colors missing");
+    }
+    std::map<std::pair<int, int>, std::pair<int, int>> edges;
+    std::vector<std::vector<int>> neighbors(vertexCount);
+    for (size_t face = 0; face < faceCount; ++face) {
+        unsigned char count = 0;
+        input.read(reinterpret_cast<char*>(&count), 1);
+        require(input.good() && (count == 3 || count == 4), "Inverse solid face is invalid");
+        std::vector<std::int32_t> faceVertices(count);
+        input.read(reinterpret_cast<char*>(faceVertices.data()), count * sizeof(std::int32_t));
+        require(input.good(), "Truncated inverse solid face");
+        for (size_t edge = 0; edge < count; ++edge) {
+            const int a = faceVertices[edge], b = faceVertices[(edge + 1) % count];
+            require(a >= 0 && b >= 0 && a != b && static_cast<size_t>(a) < vertexCount &&
+                    static_cast<size_t>(b) < vertexCount, "Inverse solid index out of range");
+            auto& incidence = edges[{std::min(a, b), std::max(a, b)}];
+            ++incidence.first;
+            incidence.second += a < b ? 1 : -1;
+            neighbors[a].push_back(b);
+            neighbors[b].push_back(a);
+        }
+    }
+    for (const auto& edge : edges) {
+        require(edge.second.first == 2 && edge.second.second == 0, "Inverse printable mesh is not closed and oriented");
+    }
+    std::vector<bool> visited(vertexCount, false);
+    std::queue<int> queue;
+    queue.push(0);
+    visited[0] = true;
+    size_t reached = 0;
+    while (!queue.empty()) {
+        const int current = queue.front();
+        queue.pop();
+        ++reached;
+        for (int next : neighbors[current]) {
+            if (!visited[next]) { visited[next] = true; queue.push(next); }
+        }
+    }
+    require(reached == vertexCount, "Inverse printable mesh has disconnected components");
 }
 
 } // namespace
@@ -44,6 +125,7 @@ int main(int argc, char** argv) {
             options.imagePaths.push_back("nonexistent_contract_image_" + std::to_string(i) + ".tif");
         }
         fs::create_directories(output);
+        const fs::path printable = output / "inverse" / "inverse_printable_surface.ply";
 
         const cv::Mat albedo(8, 8, CV_32F, cv::Scalar(0.5f));
         const cv::Mat height(8, 8, CV_32F, cv::Scalar(0.0f));
@@ -97,6 +179,23 @@ int main(int argc, char** argv) {
             !fs::exists(output / "inverse" / "input_observations"),
             "Temporary linear observation handoff was retained in completed outputs");
         require(!fs::exists(output / "inverse.part"), "A partial inverse directory was left behind");
+        require(!fs::exists(printable), "Inverse solid exported without printable option");
+
+        options.printableMeshPath = (output / "printable_surface.ply").string();
+        options.pixelScaleMm = 0.25;
+        options.printableThicknessMm = 1.5;
+        options.meshStep = 2;
+        options.heightScale = 3;
+        options.printableFillHoles = true;
+        { std::ofstream original(options.printableMeshPath); original << "baseline printable sentinel\n"; }
+        const std::string baselinePrintable = fileText(options.printableMeshPath);
+        run();
+        checkInverseSolid(printable, false);
+        require(fs::is_regular_file(output / "inverse" / "printable_fill_mask.png"), "Inverse fill audit missing");
+        require(!fs::exists(output / "inverse" / "unvalidated_candidate" / "inverse_printable_surface.ply"),
+                "Rejected candidate was silently made printable");
+        require(fileText(output / "inverse" / "inverse_printable_surface.json").find("retained_baseline") != std::string::npos,
+                "Rejected inverse solid provenance lost");
 
         // The fake worker uses Standard to return an accepted result on the next run.
         options.mitsubaQualityMode = MitsubaQualityMode::Standard;
@@ -106,6 +205,23 @@ int main(int argc, char** argv) {
                 "Accepted rerun advertised a stale candidate");
         require(!fs::exists(output / "inverse" / "unvalidated_candidate"),
                 "Accepted rerun retained stale rejected candidate files");
+        checkInverseSolid(printable, true);
+        require(fileText(options.printableMeshPath) == baselinePrintable, "Baseline printable was overwritten");
+        require(cv::norm(height, cv::NORM_INF) == 0, "Inverse export mutated baseline heights");
+        const std::string previousSolid = fileText(printable);
+        options.mitsubaQualityMode = MitsubaQualityMode::Research;
+        bool rejectedMalformed = false;
+        try { run(); } catch (const std::exception& exception) {
+            rejectedMalformed = std::string(exception.what()).find("full-resolution float height") != std::string::npos;
+        }
+        require(rejectedMalformed, "Malformed inverse PFM was allowed into printable export");
+        require(fileText(printable) == previousSolid, "Failed printable export replaced previous inverse results");
+
+        options.mitsubaQualityMode = MitsubaQualityMode::Standard;
+        options.printableMeshPath.clear();
+        run();
+        require(!fs::exists(printable) && !fs::exists(output / "inverse" / "printable_fill_mask.png"),
+                "Disabled printable option retained stale inverse solid products");
 
         fs::remove_all(output, error);
         std::cout << "Mitsuba process and output contract passed.\n";

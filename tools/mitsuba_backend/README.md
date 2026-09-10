@@ -27,6 +27,24 @@ saturation mask. Definite container clipping does not identify every sensor's
 ADC limit. The temporary observation directory, including validity masks, is
 removed after the backend exits.
 
+Before rendering or selecting withheld lights, the worker omits observations
+with fewer than 64 positively weighted pixels in the reduced fitting domain.
+It still requires at least six usable lights, retains the existing conservative
+clipping/mask reduction, and checks that the normalized training-direction
+matrix has condition number at most 100. These are engineering eligibility
+checks, not accuracy guarantees. The training/holdout split is deterministic
+within the retained input order; no fitted error or validation outcome enters
+selection. Only retained lights are rendered and optimized. Validation applies
+to that subset, not to excluded photographs.
+
+`result.json` records per-light supported-pixel counts, used/excluded indices,
+and training-direction conditioning under `light_selection`, even when too few
+lights remain. All recorded light indices are zero-based indices into the
+original job; progress messages use one-based light numbers. Partial support
+cannot turn clipped source samples into valid evidence. Higher inverse quality
+may retain more fully valid reduced pixels, but costs more computation and is
+not enabled automatically. Baseline outputs remain untouched on failure.
+
 Supported execution paths are:
 
 - `cuda_ad_rgb` with Mitsuba's `direct_projective` integrator and Adam;
@@ -84,12 +102,23 @@ use their own material maps, and rejection restores baseline material maps
 alongside baseline height. Coefficients and the weighted roughness
 preview are appearance surrogates, not calibrated BRDF measurements.
 
-Preview/standard/high-sampling budgets are 12/24/50 Adam steps, with material
+Preview/standard/high-detail budgets are 12/24/50 Adam steps, with material
 refits every 4/4/5 steps and at the final step. Control spacing is two reduced
 pixels. Optimization sampling is 16/16/32 spp; validation sampling and maximum
 render sides remain 64/128/256. Checkpoint selection uses seed 20000; final
 checks use 10000 and 71000. This application-specific alternating schedule is
 not a published complete reconstruction method or a convergence guarantee.
+
+The GUI reports each preset's longest-side grid limit: 64, 128, or 256 pixels.
+Standard remains 128. Doubling each grid dimension gives about four times as
+many render pixels and height controls; the high-detail preset also doubles
+optimization spp and increases iterations from 24 to 50. Its nominal per-step
+pixel/sample budget is therefore eight times standard, before iteration and
+checkpoint costs. This is workload arithmetic, not a measured timing or accuracy
+gain. All presets preserve the full-resolution baseline height and add an
+upsampled correction; printable mesh sampling is controlled separately by
+`--mesh-step`. Finer grids may retain more fully unclipped cells but still must
+pass the same eligibility and validation checks.
 
 The independent fixture currently shows better height recovery and better
 height-derived normals, but worse normals than the original photometric normal
@@ -116,6 +145,28 @@ Monte Carlo seed checking withheld-view loss for provisionally accepted
 candidates. These lights still influenced the classical initialization;
 neither withholding nor a new render seed provides independent physical
 accuracy calibration. Rejection leaves the inverse height at the baseline.
+
+## Printable Inverse Output
+
+The C++ application creates `inverse_printable_surface.ply` after a successful
+worker return when printable export is selected. It reuses the regular closed
+solid exporter, including the largest edge-connected component, optional
+enclosed-hole filling, physical XY scale, mesh step, Z exaggeration, and flat
+base thickness. Accepted geometry comes from the full-resolution float PFM,
+not an 8-bit height PNG or the coarse optimization mesh. On validation rejection,
+the solid uses the baseline; the unvalidated candidate is never promoted to it.
+
+The original specimen/height mask limits the surface. Accepted-height filling
+uses height-derived slopes, not the original photometric normals. Baseline
+relative albedo supplies grayscale vertex colors. `printable_fill_mask.png`
+records synthesized pixels when filling is enabled, and
+`inverse_printable_surface.json` records height source and printing settings.
+This metadata is distinct from the renderer's `result.json` validation report.
+All files are staged before replacement of the inverse output directory; a
+mesh-export failure cannot publish a partial inverse package. Standalone Python
+worker runs do not create these C++ printable products. Physical XY dimensions
+do not establish calibrated Z accuracy, and watertightness is not a guarantee
+of printer-specific manufacturability.
 
 ## Rejected candidate outputs and review
 

@@ -1469,7 +1469,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     setButtonChecked(state.meshCheck, !state.opt->meshPath.empty());
 
     y += 32;
-    state.printableMeshCheck = makeControl(geometryPage, "BUTTON", "Export printable PLY solid (largest component only)", BS_AUTOCHECKBOX, kIdPrintableMesh, kControlX, y, kControlWidth, 24);
+    state.printableMeshCheck = makeControl(geometryPage, "BUTTON", "Export printable solids (also inverse, when enabled)", BS_AUTOCHECKBOX, kIdPrintableMesh, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.printableMeshCheck, !state.opt->printableMeshPath.empty());
 
     y += 32;
@@ -1611,9 +1611,9 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     y += 38;
     makeLabel(advancedPage, "Quality", kMargin, y, kLabelWidth, kRowHeight);
     state.mitsubaQualityCombo = makeCombo(advancedPage, kIdMitsubaQuality, kControlX, y, kControlWidth);
-    addComboItem(state.mitsubaQualityCombo, "Preview (fast setup check)");
-    addComboItem(state.mitsubaQualityCombo, "Standard");
-    addComboItem(state.mitsubaQualityCombo, "High sampling (slowest; experimental)");
+    addComboItem(state.mitsubaQualityCombo, "Preview (64 px grid limit, 12 iterations)");
+    addComboItem(state.mitsubaQualityCombo, "Standard (128 px grid limit, 24 iterations)");
+    addComboItem(state.mitsubaQualityCombo, "High detail (256 px grid limit, 50 iterations)");
     int mitsubaQualityIndex = 1;
     if (state.opt->mitsubaQualityMode == MitsubaQualityMode::Preview) {
         mitsubaQualityIndex = 0;

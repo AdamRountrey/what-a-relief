@@ -30,6 +30,7 @@ import numpy as np
 JOB_SCHEMA_VERSION = 2
 METHOD_ID = "mitsuba_heightfield_inverse_v2"
 NORMAL_PRIOR_STRENGTH = 0.25
+MIN_LIGHT_SUPPORT = 64
 METHOD_REFERENCES = (
     {"id": "zhang2023projective", "doi": "10.1145/3618385"},
     {"id": "jakob2022drjit", "doi": "10.1145/3528223.3530099"},
@@ -1251,7 +1252,9 @@ def make_scenes(mi, prepared, backend: str, spp: int):
         records = []
         for index, light in enumerate(prepared["lights"]):
             geometry = dict(prepared["geometry"])
-            geometry["fallback_azimuth"] = 2.0 * math.pi * index / len(prepared["lights"])
+            original_index = prepared.get("light_indices", range(len(prepared["lights"])))[index]
+            original_count = prepared.get("input_light_count", len(prepared["lights"]))
+            geometry["fallback_azimuth"] = 2.0 * math.pi * original_index / original_count
             records.append((params, keys[0], finite_emitter(mi, light, geometry)))
         # Lights are evaluated serially, so each basis needs only one scene.
         scenes_by_basis.append([scene] * len(prepared["lights"]))
@@ -1281,6 +1284,55 @@ def split_lights(count: int) -> tuple[list[int], list[int]]:
     if len(train) < 4:
         raise ValueError("Inverse-rendering holdout requires at least four training lights")
     return train, sorted(holdout)
+
+
+def select_supported_lights(prepared, result):
+    """Select from input validity only, before rendering or fitting any losses."""
+    weights = prepared["weights"]
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError("Inverse observation weights must be finite and nonnegative")
+    support = np.count_nonzero(weights > 0, axis=(1, 2))
+    used = np.flatnonzero(support >= MIN_LIGHT_SUPPORT).tolist()
+    excluded = np.flatnonzero(support < MIN_LIGHT_SUPPORT).tolist()
+    result["light_selection"] = {
+        "basis": "pre_fit_geometric_support_and_unclipped_observation_validity",
+        "index_base": 0,
+        "input_light_count": len(support),
+        "used_light_count": len(used),
+        "minimum_supported_pixels": MIN_LIGHT_SUPPORT,
+        "supported_pixels_per_light": support.tolist(),
+        "used_light_indices": used,
+        "excluded_light_indices": excluded,
+    }
+    if len(used) < 6:
+        counts = ", ".join(f"{index + 1}: {count}" for index, count in enumerate(support))
+        raise ValueError(
+            f"Only {len(used)} of {len(support)} lights have at least {MIN_LIGHT_SUPPORT} "
+            "supported, unclipped reduced pixels; inverse refinement needs at least six "
+            "usable lights, including withheld validation lights. "
+            f"Supported pixels by light (1-based): {counts}. "
+            "Try higher inverse quality for less aggressive downsampling, or less-clipped "
+            "input images. Baseline outputs are unchanged."
+        )
+    train, holdout = split_lights(len(used))
+    result["training_light_indices"] = [used[index] for index in train]
+    result["holdout_light_indices"] = [used[index] for index in holdout]
+    selected = dict(prepared)
+    for key in ("lights", "weights", "images_small"):
+        selected[key] = prepared[key][used]
+    selected["light_indices"] = used
+    selected["input_light_count"] = len(support)
+    # Omitting unusable views must not leave a rank-deficient lighting subset.
+    directions = selected["lights"][train].astype(np.float64)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    singular = np.linalg.svd(directions, compute_uv=False)
+    condition = float(singular[0] / singular[-1]) if singular[-1] > 1e-12 else None
+    result["light_selection"]["training_direction_condition"] = condition
+    if condition is None or condition > 100:
+        raise ValueError("Usable inverse training light directions are poorly conditioned "
+                         "(condition limit 100). More varied, adequately exposed lighting "
+                         "is needed. Baseline outputs are unchanged.")
+    return selected, train, holdout
 
 
 def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients, mapping, settings, train, progress):
@@ -1453,16 +1505,17 @@ def run_job(job_path: Path) -> int:
         render_height, render_width = prepared["height_small"].shape
         result["render_width"] = render_width
         result["render_height"] = render_height
+        prepared, train, holdout = select_supported_lights(prepared, result)
+        selection = result["light_selection"]
+        if selection["excluded_light_indices"]:
+            omitted = ", ".join(str(index + 1) for index in selection["excluded_light_indices"])
+            progress(9, f"Using {selection['used_light_count']}/{selection['input_light_count']} "
+                     f"inverse lights; insufficient reduced support in lights {omitted}. "
+                     "Clipping exclusions and withheld-light validation remain enabled.")
         progress(10, "Building diffuse and spatially varying glossy material bases")
         scenes_by_basis, parameters_by_basis = make_scenes(
             mi, prepared, selected_backend, int(settings["spp"])
         )
-        train, holdout = split_lights(len(prepared["lights"]))
-        support = np.count_nonzero(prepared["weights"] > 0, axis=(1, 2))
-        if any(support[index] < 64 for index in train + holdout):
-            raise ValueError("Each training and withheld light needs at least 64 supported, unclipped reduced pixels")
-        result["training_light_indices"] = train
-        result["holdout_light_indices"] = holdout
         progress(15, "Rendering baseline material and visibility bases")
         baseline_basis = render_basis_numpy(
             mi,

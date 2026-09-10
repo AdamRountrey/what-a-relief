@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
         }
         const fs::path output = fs::path(jobPath).parent_path();
         const std::string job = readFile(jobPath);
-        const bool accepted = job.find("\"quality\": \"standard\"") != std::string::npos;
+        const bool malformedHeight = job.find("\"quality\": \"research\"") != std::string::npos;
+        const bool accepted = malformedHeight || job.find("\"quality\": \"standard\"") != std::string::npos;
         if (job.find("\"encoding\": \"png16\"") == std::string::npos ||
             job.find("\"photometry\": \"linear_luminance\"") == std::string::npos ||
             job.find("\"srgb_decode\": false") == std::string::npos ||
@@ -110,6 +111,17 @@ int main(int argc, char** argv) {
             "material_diffuse.png", "material_specular.png", "material_roughness.png"};
         for (const std::string& name : required) {
             writeFile(output / name, "fake-contract-output\n");
+        }
+        if (!malformedHeight) {
+            std::ofstream heightOut(output / "inverse_height.pfm", std::ios::binary);
+            heightOut << "Pf\n8 8\n-1.0\n";
+            for (int y = 7; y >= 0; --y) {
+                for (int x = 0; x < 8; ++x) {
+                    const float z = accepted ? 0.1f * x + 0.2f * y : 0.0f;
+                    heightOut.write(reinterpret_cast<const char*>(&z), sizeof(z));
+                }
+            }
+            if (!heightOut) throw std::runtime_error("Could not write fake inverse height");
         }
         const fs::path candidate = output / "unvalidated_candidate";
         if (!accepted) {

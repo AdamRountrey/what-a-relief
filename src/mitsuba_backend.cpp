@@ -1,6 +1,7 @@
 #include "mitsuba_backend.hpp"
 
 #include "checked_io.hpp"
+#include "image_io.hpp"
 #include "shadow_refinement.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -840,6 +841,57 @@ void runMitsubaInverseRefinement(
                      "review_baseline_height.png", "review_candidate_height.png"}) {
                 requireNonempty(staging / "unvalidated_candidate" / name);
             }
+        }
+        if (!opt.printableMeshPath.empty()) {
+            if (cancellationRequested && cancellationRequested()) {
+                throw std::runtime_error("Processing canceled by user.");
+            }
+            const cv::Mat inverseHeight = result.accepted
+                ? cv::imread((staging / "inverse_height.pfm").string(), cv::IMREAD_UNCHANGED)
+                : height;
+            if (inverseHeight.type() != CV_32F || inverseHeight.size() != height.size()) {
+                throw std::runtime_error("Inverse printable export requires a full-resolution float height field.");
+            }
+            for (int y = 0; y < inverseHeight.rows; ++y) {
+                const float* values = inverseHeight.ptr<float>(y);
+                const uchar* mask = heightMask.ptr<uchar>(y);
+                for (int x = 0; x < inverseHeight.cols; ++x) {
+                    if (mask[x] && !std::isfinite(values[x])) {
+                        throw std::runtime_error("Inverse printable height contains nonfinite supported values.");
+                    }
+                }
+            }
+            Options meshOptions = opt;
+            meshOptions.outputDir = staging.string();
+            meshOptions.meshPath.clear();
+            meshOptions.printableMeshPath = (staging / "inverse_printable_surface.ply").string();
+            const std::string source = result.accepted
+                ? "inverse_height.pfm; accepted inverse refinement; see result.json"
+                : "baseline height; inverse refinement rejected; see result.json";
+            // Refined heights guide filling; never substitute unmodified normal
+            // slopes for an accepted inverse surface or promote a rejected candidate.
+            saveGeometryMeshes(meshOptions, inverseHeight, heightMask,
+                result.accepted ? cv::Mat() : normalMap, albedoPreview8U(albedo, heightMask),
+                [&](const std::string& message) {
+                    if (progress) progress("Inverse " + message, 100);
+                    if (cancellationRequested && cancellationRequested()) {
+                        throw std::runtime_error("Processing canceled by user.");
+                    }
+                }, source);
+            CheckedOutputFile metadata(staging / "inverse_printable_surface.json");
+            metadata.stream() << std::setprecision(17)
+                << "{\n  \"schema_version\": 1,\n"
+                << "  \"height_source\": \"" << (result.accepted ? "accepted_inverse" : "retained_baseline") << "\",\n"
+                << "  \"validation_report\": \"result.json\",\n"
+                << "  \"units\": \"millimeters\",\n"
+                << "  \"pixel_scale_mm\": " << opt.pixelScaleMm << ",\n"
+                << "  \"height_scale\": " << opt.heightScale << ",\n"
+                << "  \"base_thickness_mm\": " << opt.printableThicknessMm << ",\n"
+                << "  \"mesh_step\": " << opt.meshStep << ",\n"
+                << "  \"fill_enclosed_holes\": " << (opt.printableFillHoles ? "true" : "false") << ",\n"
+                << "  \"component_policy\": \"largest_edge_connected\",\n"
+                << "  \"vertex_color_source\": \"baseline_relative_albedo\"\n}\n";
+            metadata.commit();
         }
         std::error_code observationCleanupError;
         fs::remove_all(observationDirectory, observationCleanupError);

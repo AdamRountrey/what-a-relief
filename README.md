@@ -68,7 +68,7 @@ cmake -S . -B build -DOpenCV_DIR=C:/opencv/build/x64/vc16/lib
 cmake --build build --config Release
 ```
 
-The executable target is `what-a-relief`; on Windows the direct build writes `build-vcpkg-direct\what-a-relief.exe`. The direct build and installer accept `-Version` (currently `0.2.5`); CMake accepts `-DWHAT_A_RELIEF_VERSION_STRING=0.2.5`. This version is recorded in run manifests. When packaging with `-SkipBuild`, use the same version as the already-built executable.
+The executable target is `what-a-relief`; on Windows the direct build writes `build-vcpkg-direct\what-a-relief.exe`. The direct build and installer accept `-Version` (currently `0.2.6`); CMake accepts `-DWHAT_A_RELIEF_VERSION_STRING=0.2.6`. This version is recorded in run manifests. When packaging with `-SkipBuild`, use the same version as the already-built executable.
 
 ### Scientific regression tests
 
@@ -94,7 +94,7 @@ To rebuild the app, package the OpenCV DLLs, and create the installer in one ste
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
 ```
 
-The installer is written to `dist\what-a-relief-0.2.5-setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\what-a-relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
+The installer is written to `dist\what-a-relief-0.2.6-setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\what-a-relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 
@@ -106,11 +106,11 @@ The standard installer remains self-contained and does not include the larger in
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-mitsuba-backend-installer.ps1
 ```
 
-The optional `dist\what-a-relief-0.2.5-mitsuba-backend-setup.exe` bundles private CPython 3.13.13, Mitsuba 3.8.0, Dr.Jit 1.3.1, NumPy 2.3.3, and official LLVM 15.0.7. Run it separately after installing the main application to place the backend under `%LOCALAPPDATA%\Programs\what-a-relief-mitsuba`; users do not install Python, pip, Conda, Anaconda, or LLVM separately. Packaging requires staged numerical and real CPU rendering tests to pass. The [earlier package record](docs/review-fixes-2026-09.md#backend-package) documents the runtime compatibility investigation; those historical hashes are not hashes of the current package. Extraction tests do not install or modify the user's existing application.
+The optional `dist\what-a-relief-0.2.6-mitsuba-backend-setup.exe` bundles private CPython 3.13.13, Mitsuba 3.8.0, Dr.Jit 1.3.1, NumPy 2.3.3, and official LLVM 15.0.7. Run it separately after installing the main application to place the backend under `%LOCALAPPDATA%\Programs\what-a-relief-mitsuba`; users do not install Python, pip, Conda, Anaconda, or LLVM separately. Packaging requires staged numerical and real CPU rendering tests to pass. The [earlier package record](docs/review-fixes-2026-09.md#backend-package) documents the runtime compatibility investigation; those historical hashes are not hashes of the current package. Extraction tests do not install or modify the user's existing application.
 
 Official LLVM 15.0.7 is the empirically tested Windows CPU compatibility pin, with at most eight workers and both primary and indirect silhouette sampling enabled. The Windows guard requires LLVM major version 15 and directs incompatible installations to reinstall the backend. CUDA's moving-shadow probe passed, but GPU reconstruction remains unqualified. See the [backend README](tools/mitsuba_backend/README.md).
 
-GitHub Actions can also build the Windows application installer, portable ZIP, and self-contained Mitsuba backend installer. Run the **Windows Build** workflow manually to download them as workflow artifacts, or push a version tag such as `v0.2.5` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installers with the same tag-derived version. The package builders verify required models, backend components, and license files; the portable ZIP is assembled from an explicit runtime whitelist, so old smoke runs or input data in the build folder cannot enter the artifact.
+GitHub Actions can also build the Windows application installer, portable ZIP, and self-contained Mitsuba backend installer. Run the **Windows Build** workflow manually to download them as workflow artifacts, or push a version tag such as `v0.2.6` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installers with the same tag-derived version. The package builders verify required models, backend components, and license files; the portable ZIP is assembled from an explicit runtime whitelist, so old smoke runs or input data in the build folder cannot enter the artifact.
 
 ## Run
 
@@ -238,7 +238,7 @@ When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `no
 - `--mitsuba-inverse`: experimental separate inverse geometry outputs; requires at least 6 calibrated robust images, height calculation, and the optional backend. Mutually exclusive with `--shadow-height-refinement` in both CLI and GUI.
 - `--mitsuba-light-angle-deg value`: full angular diameter of the approximate distant disk used for directional inverse refinement, from `0.1` through `10` degrees inclusive. Default: `1`. Not estimated from the sphere highlight; check sensitivity to this assumption. Inactive for near-field inverse and for shadow-only refinement.
 - `--mitsuba-backend auto|cuda|cpu`: compute device. Default: `auto`, which tries CUDA then LLVM CPU after live probes.
-- `--mitsuba-quality preview|standard|research`: work budget, not an accuracy rating. Default: `standard`; see the [preset table](tools/mitsuba_backend/README.md#quality-presets). The GUI calls `research` "High sampling (slowest; experimental)".
+- `--mitsuba-quality preview|standard|research`: work budget, not an accuracy rating. Default: `standard`; see the [preset table](tools/mitsuba_backend/README.md#quality-presets). The GUI displays the 64/128/256-pixel longest-side grid limits and 12/24/50 iterations; `research` is labeled "High detail". Final heights retain the full-resolution baseline plus the upsampled correction. A finer inverse grid does not by itself validate finer reconstructed detail.
 - `--mitsuba-python path`: Python executable in a compatible isolated Mitsuba backend.
 - `--mitsuba-worker path`: override the worker script; the current application and worker must agree on job schema `2` and method `mitsuba_heightfield_inverse_v2`.
 - `--neural-fusion`: run bundled PS-FCN neural inference and slope-domain fusion after the classical calibrated solve. Supports 3 to 25 calibrated images.
@@ -255,7 +255,7 @@ When neural fusion is enabled, the default `normal_rgb.png`, `normal_x.png`, `no
 - `--height-slope-cap value`: clamp extreme normal-derived slopes before height integration. Default: `3.0`; use `0` to disable. This affects only `height.png`, `height.pfm`, and PLY export.
 - `--no-height`: skip `height.png` and `height.pfm`. `liquid_metal.png` does not require height.
 - `--mesh path.ply`: export a PLY mesh from the height preview. This forces height calculation.
-- `--printable-mesh path.ply`: export a watertight solid PLY for 3D printing. This forces height calculation and requires `--pixel-scale-mm`, TIFF scale metadata, or a GUI scale line.
+- `--printable-mesh path.ply`: export a watertight solid PLY for 3D printing. This forces height calculation and requires `--pixel-scale-mm`, TIFF scale metadata, or a GUI scale line. With Mitsuba enabled it also writes `inverse/inverse_printable_surface.ply` from the full-resolution guarded height, using the same scale, base, mesh step, component selection, and hole-fill settings. Rejected inverse runs use the retained baseline, never the unvalidated candidate. The PLY header and `inverse_printable_surface.json` record the source and settings; inverse fill auditing is in `inverse/printable_fill_mask.png`. Scientific height/normal products and open meshes are unchanged.
 - `--printable-fill-holes`: reconstruct enclosed missing surface pixels in `--printable-mesh`; boundary-connected gaps remain open in the top outline and are closed by the normal printable side walls.
 - `--mesh-step n`: export every nth pixel to reduce PLY size. Default: `1`.
 - `--height-scale value`: multiply mesh z coordinates. Default: `1.0`.

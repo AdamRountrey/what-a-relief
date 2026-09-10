@@ -1,5 +1,80 @@
 # Validation and Release Gates
 
+## v0.2.6 Release Qualification
+
+The September 10 local non-dev `0.2.6` Release build passed all seven CTest
+suites (21.88 seconds on the development host). The extracted application
+installer passed classical and bundled-neural end-to-end workflows with only
+its own runtime DLLs plus Windows on PATH; both manifests reported `0.2.6`.
+Installer and portable-archive executable/worker hashes matched. Extraction
+and smoke tests did not replace the installed application or user datasets.
+
+The optional backend package passed 16 numerical tests and three isolated
+real CPU renderer tests: normal-prior AD versus finite differences, finite
+source shadow derivatives, and tilt-recovery/truth-start reconstruction.
+The latter includes the additional clipped-view case. All three non-dev
+packages were built locally. The CUDA startup probe passed, but this is not
+GPU reconstruction qualification. Published downloads are independently built
+and tested by the tagged GitHub Actions workflow; local binary hashes are not
+asserted to match those separately built assets.
+
+## Inverse Printable Export
+
+The C++ backend contract now exercises printable export after both accepted
+and rejected worker results. A known float PFM ramp tests row orientation,
+full-resolution height consumption, millimeter XY/Z scaling, mesh-step spacing,
+base thickness, and albedo vertex colors. Every edge must have two oppositely
+oriented incident faces, all indices must be valid, and all vertices must
+belong to one connected component. Height-source provenance, optional fill
+audit, no automatic candidate solid, and disabling export on a later run are
+also checked. A malformed accepted height must fail without replacing the
+previous inverse output directory. Original baseline heights and printable
+file bytes must remain unchanged.
+
+These are deterministic fake-worker export tests, not inverse-reconstruction
+accuracy evidence. Existing `io-exports` cases separately exercise the shared
+exporter's holes, islands, point contacts, irregular masks, and sampling.
+All seven CTest suites pass on the local `0.2.6-dev` Release build (17.35 s on
+the development host; this is an observation, not a timing gate).
+
+## Inverse Light-Support Eligibility
+
+The post-v0.2.5 fix selects adequately supported inverse observations before
+the training/holdout split and rendering. It does not change the baseline
+photometric solve, clipping rules, or inverse acceptance thresholds. See the
+[backend contract](../tools/mitsuba_backend/README.md) for eligibility and audit
+fields. Validation applies to retained lights only, not to omitted images.
+
+Two numerical gates cover the 63/64-pixel boundary, original-index mapping,
+unchanged all-usable selection, disjoint validation lights, independence from
+observed brightness, insufficient-light failure, and ill-conditioned lighting.
+The 16-test numerical suite passes. The real CPU renderer tilt-recovery gate
+now also inserts two fully clipped observations among eight usable views.
+The candidate still passes training and holdout checks: normal error is about
+4.391 degrees and relative-height RMSE 0.3925 pixels, effectively unchanged
+from the original eight-view fixture and improved over the flat baseline.
+The already-correct surface still rejects the unnecessary correction and
+retains its baseline height exactly. This controlled same-renderer regression
+does not establish general accuracy on arbitrary glossy specimens.
+
+For the reported 6144 x 4080, 40-photo fish run, a read-only OpenCV check of
+source RGB clipping and the saved geometry mask reproduces 1236 fitting pixels
+at the 128 x 85 inverse resolution. Twenty lights retain 92-337 valid fitting
+pixels each; the remaining twenty have only 4-22. The new selector retains
+17 training and three withheld lights, with normalized training-direction
+condition number 1.367. This verifies eligibility, not a complete inverse solve
+or improved fish geometry. The original outputs were not modified. All seven
+C++ CTest suites also pass in the local `0.2.6-dev` build.
+
+Repeating the same read-only clipping/support calculation at 256 x 170 retains
+all forty fish lights, with 180-2141 usable fitting pixels per light. The actual
+selector accepts 37 training and three withheld lights; training-direction
+condition number is 1.307. This supports trying the optional 256-pixel preset
+on this stack, but is not a completed inverse optimization, runtime benchmark,
+or proof of improved geometry. Standard remains 128 pixels. The high-detail
+preset also increases samples and iterations, so its cost is not just the
+change in grid dimensions.
+
 ## Exposure-Threshold Stability
 
 The September 10 update keeps the same robust workflow, adding a narrow
