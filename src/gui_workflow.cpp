@@ -2,6 +2,7 @@
 
 #include "crop_ui.hpp"
 #include "image_io.hpp"
+#include "input_response.hpp"
 #include "mask_ui.hpp"
 #include "mitsuba_backend.hpp"
 #include "photometric.hpp"
@@ -138,7 +139,8 @@ struct SetupDialogState {
     HWND ringHeightEdit = nullptr;
     HWND pixelScaleEdit = nullptr;
     HWND scaleButton = nullptr;
-    HWND srgbCheck = nullptr;
+    HWND responseCombo = nullptr;
+    HWND responseStatus = nullptr;
     HWND heightCheck = nullptr;
     HWND meshCheck = nullptr;
     HWND printableMeshCheck = nullptr;
@@ -901,6 +903,17 @@ void scrollSetupWindow(SetupDialogState& state, int targetY) {
     updateSetupScrollInfo(state);
 }
 
+void refreshInputResponse(SetupDialogState& state) {
+    if (state.responseStatus == nullptr) return;
+    state.opt->inputResponseMode = static_cast<InputResponseMode>(comboSelection(state.responseCombo));
+    try {
+        resolveInputResponses(*state.opt);
+        SetWindowTextA(state.responseStatus, inputResponseSummary(*state.opt).c_str());
+    } catch (const std::exception& e) {
+        SetWindowTextA(state.responseStatus, e.what());
+    }
+}
+
 void selectImages(SetupDialogState& state) {
     try {
         state.opt->imagePaths = chooseImageFiles(state.hwnd);
@@ -919,6 +932,7 @@ void selectImages(SetupDialogState& state) {
             state.opt->pixelScaleMm = tagScale;
             setEditDouble(state.pixelScaleEdit, tagScale);
         }
+        refreshInputResponse(state);
         updateSetupControls(state);
     } catch (const std::exception& e) {
         showOwnerMessage(state.hwnd, "Image Selection", e.what(), MB_ICONINFORMATION);
@@ -1194,7 +1208,13 @@ bool validateAndAccept(SetupDialogState& state) {
         opt.flattenMode = FlattenMode::None;
         break;
     }
-    opt.srgb = buttonChecked(state.srgbCheck);
+    opt.inputResponseMode = static_cast<InputResponseMode>(comboSelection(state.responseCombo));
+    try {
+        resolveInputResponses(opt);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Input Response (Processing tab)", e.what(), MB_ICONWARNING);
+        return false;
+    }
     opt.calculateHeight = buttonChecked(state.heightCheck);
     opt.meshStep = editInt(state.meshStepEdit, "mesh step");
     opt.printableThicknessMm = editDouble(state.printableThicknessEdit, "printable base thickness");
@@ -1494,8 +1514,15 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     SendMessageA(state.flattenCombo, CB_SETCURSEL, flattenIndex, 0);
 
     y += 42;
-    state.srgbCheck = makeControl(processingPage, "BUTTON", "Treat JPEG/PNG input as sRGB", BS_AUTOCHECKBOX, kIdSrgb, kControlX, y, kControlWidth, 24);
-    setButtonChecked(state.srgbCheck, state.opt->srgb);
+    makeLabel(processingPage, "Input Response", kMargin, y, kLabelWidth, kRowHeight);
+    state.responseCombo = makeCombo(processingPage, kIdSrgb, kControlX, y, kControlWidth);
+    addComboItem(state.responseCombo, "Auto (color metadata; report untagged assumptions)");
+    addComboItem(state.responseCombo, "Linear (ignore color metadata; do not decode)");
+    addComboItem(state.responseCombo, "sRGB (ignore color metadata; decode once)");
+    SendMessageA(state.responseCombo, CB_SETCURSEL, static_cast<int>(state.opt->inputResponseMode), 0);
+    y += 30;
+    state.responseStatus = makeLabel(processingPage, "", kControlX, y, kControlWidth, 64);
+    refreshInputResponse(state);
 
     HWND outputsPage = makeTabPage(hwnd, state, "Outputs");
     y = 16;
@@ -1641,6 +1668,9 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 updateSetupControls(*state);
             }
+            return 0;
+        case kIdSrgb:
+            if (HIWORD(wParam) == CBN_SELCHANGE) refreshInputResponse(*state);
             return 0;
         case kIdNearField:
             updateSetupControls(*state);

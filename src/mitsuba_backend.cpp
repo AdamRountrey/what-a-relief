@@ -341,7 +341,6 @@ void writeJob(
     out << "    \"backend_selected\": \"" << selectedBackend << "\",\n";
     out << "    \"quality\": \"" << qualityModeName(opt.mitsubaQualityMode) << "\",\n";
     out << "    \"srgb_decode\": false,\n";
-    out << "    \"source_srgb_decode\": " << (opt.srgb ? "true" : "false") << ",\n";
     out << "    \"height_scale\": " << opt.heightScale << ",\n";
     out << "    \"seed\": 1592607270\n";
     out << "  },\n";

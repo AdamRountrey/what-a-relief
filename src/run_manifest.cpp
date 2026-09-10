@@ -1,6 +1,7 @@
 #include "run_manifest.hpp"
 
 #include "checked_io.hpp"
+#include "input_response.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -636,7 +637,20 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"view_direction\": [" << opt.viewDir[0] << ", " << opt.viewDir[1]
         << ", " << opt.viewDir[2] << "],\n";
     out << "    \"normal_solver\": \"" << solverName(opt.solverMode) << "\",\n";
-    out << "    \"srgb_decode\": " << (opt.srgb ? "true" : "false") << ",\n";
+    out << "    \"input_response_mode\": \"" << inputResponseModeName(opt.inputResponseMode) << "\",\n";
+    out << "    \"input_responses\": [";
+    size_t srgbInputs = 0;
+    for (size_t i = 0; i < opt.imagePaths.size(); ++i) {
+        const auto response = inputResponseForImage(opt, i);
+        srgbInputs += response.srgb ? 1 : 0;
+        if (i) out << ", ";
+        out << "{\"srgb_decode\": " << (response.srgb ? "true" : "false")
+            << ", \"assumed\": " << (response.assumed ? "true" : "false")
+            << ", \"source\": \"" << jsonEscape(response.source) << "\"}";
+    }
+    out << "],\n";
+    out << "    \"srgb_decode\": " << (srgbInputs == 0 ? "false" :
+        (srgbInputs == opt.imagePaths.size() ? "true" : "null")) << ",\n";
     out << "    \"highlight_percentile\": " << opt.highlightPercentile << ",\n";
     out << "    \"minimum_highlight\": " << opt.minHighlight << ",\n";
     out << "    \"shadow_threshold\": " << opt.shadowThreshold << ",\n";
@@ -752,6 +766,11 @@ void completeRunManifest(
         out << diagnostics.lightingConditionNumber;
     }
     out << ", \"solved_fraction\": " << diagnostics.solvedFraction;
+    if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust) {
+        out << ", \"robust_estimator\": \"adaptive_pseudo_huber_cauchy_v2\""
+            << ", \"robust_mean_iterations\": " << diagnostics.robustMeanIterations
+            << ", \"robust_nonconverged_fraction\": " << diagnostics.robustNonconvergedFraction;
+    }
     if (opt.shadowHeightRefinement) {
         out << ", \"shadow_height_refinement\": {"
             << "\"applied\": " << (diagnostics.shadowHeightRefinementApplied ? "true" : "false")

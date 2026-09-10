@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhatARelief
-    VERSION 0.2.4
+    VERSION 0.2.5
     DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED COMPONENTS core dnn imgcodecs imgproc highgui)
+find_package(ZLIB REQUIRED)
 
 if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
     message(FATAL_ERROR
@@ -23,6 +24,7 @@ endif()
 add_library(what-a-relief-core STATIC
     src/checked_io.cpp
     src/image_io.cpp
+    src/input_response.cpp
     src/mitsuba_backend.cpp
     src/photometric.cpp
     src/radiometry.cpp
@@ -31,7 +33,7 @@ add_library(what-a-relief-core STATIC
     src/shadow_refinement.cpp)
 target_include_directories(what-a-relief-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(what-a-relief-core PUBLIC ${OpenCV_LIBS})
+target_link_libraries(what-a-relief-core PUBLIC ${OpenCV_LIBS} ZLIB::ZLIB)
 target_compile_features(what-a-relief-core PUBLIC cxx_std_17)
 target_compile_definitions(what-a-relief-core PUBLIC
     WHAT_A_RELIEF_VERSION="${WHAT_A_RELIEF_VERSION_STRING}")
@@ -93,6 +95,8 @@ if(BUILD_TESTING)
     endif()
     add_executable(what-a-relief-tests
         tests/test_photometric.cpp)
+    add_executable(what-a-relief-response-tests tests/test_input_response.cpp src/args.cpp)
+    target_link_libraries(what-a-relief-response-tests PRIVATE what-a-relief-core)
     target_link_libraries(what-a-relief-tests PRIVATE what-a-relief-core)
     target_compile_features(what-a-relief-tests PRIVATE cxx_std_17)
     target_compile_definitions(what-a-relief-tests PRIVATE
@@ -121,6 +125,11 @@ if(BUILD_TESTING)
     target_link_libraries(what-a-relief-output-benchmark PRIVATE what-a-relief-core)
     target_compile_features(what-a-relief-output-benchmark PRIVATE cxx_std_17)
     if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR)
+        add_test(NAME input-response
+            COMMAND ${CMAKE_COMMAND}
+                "-DTEST_EXECUTABLE=$<TARGET_FILE:what-a-relief-response-tests>"
+                "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_with_runtime.cmake")
         add_test(
             NAME photometric-core
             COMMAND ${CMAKE_COMMAND}
@@ -172,6 +181,7 @@ if(BUILD_TESTING)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_workflow.cmake")
     else()
         add_test(NAME photometric-core COMMAND what-a-relief-tests)
+        add_test(NAME input-response COMMAND what-a-relief-response-tests)
         add_test(NAME io-exports COMMAND what-a-relief-io-tests)
         add_test(
             NAME mitsuba-backend-contract

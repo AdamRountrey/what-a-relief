@@ -1,4 +1,5 @@
 #include "rti_export.hpp"
+#include "input_response.hpp"
 #include "checked_io.hpp"
 #include "radiometry.hpp"
 
@@ -978,8 +979,8 @@ void exportRtiPackage(
 
     std::vector<cv::Mat> images;
     images.reserve(opt.imagePaths.size());
-    for (const std::string& path : opt.imagePaths) {
-        images.push_back(loadRtiColorImage(path, expectedSize, opt.srgb));
+    for (size_t i = 0; i < opt.imagePaths.size(); ++i) {
+        images.push_back(loadRtiColorImage(opt.imagePaths[i], expectedSize, inputResponseForImage(opt, i).srgb));
     }
     normalizeRelativeIntensityStack(images, false);
 

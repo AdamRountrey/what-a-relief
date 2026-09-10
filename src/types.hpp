@@ -39,6 +39,14 @@ enum class HeightFlattenMode {
     Quadratic
 };
 
+enum class InputResponseMode { Auto, Linear, Srgb };
+
+struct InputResponse {
+    bool srgb = false;
+    bool assumed = false;
+    std::string source;
+};
+
 enum class RtiLayoutMode {
     Image,
     DeepZoom,
@@ -107,7 +115,8 @@ struct Options {
     bool hasHeightMask = false;
     bool guiMode = false;
     bool noGui = false;
-    bool srgb = false;
+    InputResponseMode inputResponseMode = InputResponseMode::Auto;
+    std::vector<InputResponse> inputResponses;
     bool keepSphere = false;
     bool uncalibratedLighting = false;
     bool lightsFileByOrder = false;
@@ -162,6 +171,8 @@ struct PhotometricDiagnostics {
     std::vector<cv::Mat> packedObservationMaps;
     double lightingConditionNumber = 0.0;
     double solvedFraction = 0.0;
+    double robustMeanIterations = 0.0;
+    double robustNonconvergedFraction = 0.0;
     cv::Mat robustWeight;
     cv::Mat robustFallbackMask;
     cv::Mat unsupportedMask;

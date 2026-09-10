@@ -168,9 +168,11 @@ void printUsage() {
         << "  --sphere cx cy radius        Reuse a known sphere circle without the GUI.\n"
         << "  --lights-file path           CSV/text file with one x,y,z light vector per image.\n"
         << "  --no-gui                     Disable interactive selection. Requires --sphere, --lights-file, or --uncalibrated.\n"
-        << "  --srgb                       Linearize sRGB image intensities.\n"
+        << "  --input-response auto|linear|srgb  Input response (default: auto metadata).\n"
+        << "  --srgb                       Force sRGB decoding (override metadata).\n"
+        << "  --linear                     Force linear input (override metadata).\n"
         << "  --solver standard|robust     Calibrated normal solve. Default: robust\n"
-        << "  --high-outlier-threshold v   Robust solve probable-clipping/bright-candidate cutoff. Default: 0.98\n"
+        << "  --high-outlier-threshold v   Legacy cutoff without raw headroom metadata. Default: 0.98\n"
         << "  --near-field-ring r h        Use point lights on a ring with radius r and height h, in mm.\n"
         << "  --pixel-scale-mm s           Image pixel size in mm/pixel; 0 auto-reads TIFF tags when needed.\n"
         << "  --specular-diagnostics       Write optional robust summary and per-light diagnostic images.\n"
@@ -270,7 +272,16 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--no-gui") {
             opt.noGui = true;
         } else if (arg == "--srgb") {
-            opt.srgb = true;
+            opt.inputResponseMode = InputResponseMode::Srgb;
+        } else if (arg == "--linear") {
+            opt.inputResponseMode = InputResponseMode::Linear;
+        } else if (arg == "--input-response") {
+            if (i + 1 >= argc) throw std::runtime_error("--input-response requires auto, linear, or srgb");
+            const std::string value = argv[++i];
+            if (value == "auto") opt.inputResponseMode = InputResponseMode::Auto;
+            else if (value == "linear") opt.inputResponseMode = InputResponseMode::Linear;
+            else if (value == "srgb") opt.inputResponseMode = InputResponseMode::Srgb;
+            else throw std::runtime_error("--input-response requires auto, linear, or srgb");
         } else if (arg == "--solver") {
             need(1);
             opt.solverMode = parseSolverMode(argv[++i]);

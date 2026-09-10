@@ -396,7 +396,7 @@ void testPtmReconstruction(TestContext& context) {
 
     Options opt;
     opt.exportRti = true;
-    opt.srgb = false;
+    opt.inputResponseMode = InputResponseMode::Linear;
     opt.rtiLayoutMode = RtiLayoutMode::Image;
     opt.outputDir = (root / "output").string();
     opt.rtiPath = (root / "output" / "rti").string();
@@ -431,7 +431,7 @@ void testPtmReconstruction(TestContext& context) {
     for (size_t i = 0; i < srgbSources.size(); ++i) {
         writeImageChecked(opt.imagePaths[i], srgbSources[i]);
     }
-    opt.srgb = true;
+    opt.inputResponseMode = InputResponseMode::Srgb;
     opt.rtiColorMode = RtiColorMode::Rgb;
     exportRtiPackage(opt, lights, cv::Size(cols, rows));
     const double srgbError = rgbRtiReconstructionError(opt.rtiPath, srgbSources, lights, true);
@@ -450,7 +450,7 @@ void testDeepZoomLayout(TestContext& context) {
     constexpr int cols = 513;
     Options opt;
     opt.exportRti = true;
-    opt.srgb = false;
+    opt.inputResponseMode = InputResponseMode::Linear;
     opt.rtiColorMode = RtiColorMode::Rgb;
     opt.rtiLayoutMode = RtiLayoutMode::DeepZoom;
     opt.outputDir = (root / "output").string();
@@ -630,6 +630,8 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
     PhotometricDiagnostics diagnostics;
     diagnostics.lightingConditionNumber = 1.7;
     diagnostics.solvedFraction = 1.0;
+    diagnostics.robustMeanIterations = 12.5;
+    diagnostics.robustNonconvergedFraction = 0.125;
     saveOutputs(
         opt,
         lights,
@@ -650,6 +652,17 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
         complete.find("normal_rgb.png") != std::string::npos &&
             complete.find("\"solved_fraction\": 1") != std::string::npos,
         "complete run manifest must enumerate outputs and scientific diagnostics");
+    context.check(complete.find("robust_estimator") == std::string::npos,
+        "standard manifest must not claim robust fitting diagnostics");
+    Options robustOpt = opt;
+    robustOpt.solverMode = NormalSolverMode::Robust;
+    completeRunManifest(robustOpt, run, lights, diagnostics);
+    const std::string robustManifest = readText(root / "output" / "run_manifest.json");
+    context.check(
+        robustManifest.find("\"robust_estimator\": \"adaptive_pseudo_huber_cauchy_v2\"") != std::string::npos &&
+            robustManifest.find("\"robust_mean_iterations\": 12.5") != std::string::npos &&
+            robustManifest.find("\"robust_nonconverged_fraction\": 0.125") != std::string::npos,
+        "robust manifest must identify the estimator and retain convergence diagnostics");
     context.check(
         complete.find("\"integration_iterations\": 800") != std::string::npos &&
             complete.find("\"printable_base_thickness_mm\": 2") != std::string::npos &&
@@ -762,10 +775,11 @@ void testDefiniteSaturationLoading(TestContext& context) {
     writeImageChecked(path16, image16);
 
     std::vector<cv::Mat> saturationMasks;
-    const std::vector<cv::Mat> loaded = loadLuminanceImages(
-        {path8.string(), path16.string()},
-        false,
-        &saturationMasks);
+    std::vector<cv::Mat> headroom;
+    Options opt;
+    opt.imagePaths = {path8.string(), path16.string()};
+    opt.inputResponseMode = InputResponseMode::Linear;
+    const std::vector<cv::Mat> loaded = loadLuminanceImages(opt, &saturationMasks, &headroom);
     context.check(loaded.size() == 2 && saturationMasks.size() == 2,
         "luminance loading must return one definite-clipping mask per image");
     context.check(
@@ -775,6 +789,19 @@ void testDefiniteSaturationLoading(TestContext& context) {
         cv::countNonZero(saturationMasks[1]) == 1 && saturationMasks[1].at<uchar>(1, 2) == 255 &&
             saturationMasks[1].at<uchar>(0, 1) == 0,
         "16-bit loading must flag 65535 but not a 12-bit ADC maximum stored in a wider container");
+    context.check(headroom.size() == 2 && headroom[0].type() == CV_8U &&
+        headroom[0].at<uchar>(0, 1) > 0 && headroom[0].at<uchar>(0, 1) < 64 &&
+        headroom[0].at<uchar>(0, 2) == 0 && headroom[0].at<uchar>(1, 2) == 255,
+        "sensor reliability must taper before clipping without changing definite-clipping labels");
+    context.check(headroom[1].at<uchar>(0, 1) == 255,
+        "headroom must use the integer container range, not infer a 12-bit white level");
+    cv::Mat rgba(2, 3, CV_8UC4, cv::Scalar(100, 120, 130, 255));
+    context.check(photometricHeadroomWeights(rgba).empty(), "alpha opacity must not reduce sensor reliability");
+    rgba.at<cv::Vec4b>(0, 0)[2] = 255;
+    context.check(photometricHeadroomWeights(rgba).at<uchar>(0, 0) == 0,
+        "RGB clipping still reduces reliability when alpha is present");
+    context.check(photometricHeadroomWeights(cv::Mat(2, 3, CV_32F, cv::Scalar(4))).empty(),
+        "floating-point scene intensity must not be mistaken for integer clipping");
     fs::remove_all(root);
 }
 

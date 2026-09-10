@@ -20,6 +20,34 @@
   doi = {10.1007/s11263-006-8815-7}
 }
 
+@inproceedings{chum2003locally,
+  author = {Ondrej Chum and Jiri Matas and Josef Kittler},
+  title = {Locally Optimized {RANSAC}},
+  booktitle = {Pattern Recognition, DAGM 2003},
+  series = {Lecture Notes in Computer Science},
+  volume = {2781},
+  pages = {236--243},
+  year = {2003},
+  doi = {10.1007/978-3-540-45243-0_31},
+  url = {https://cmp.felk.cvut.cz/~matas/papers/chum-dagm03.pdf},
+  note = {Informed an earlier, now replaced hypothesis-selection implementation; not reproduced unchanged}
+}
+
+@misc{w3c2025png,
+  author = {{World Wide Web Consortium}},
+  title = {Portable Network Graphics ({PNG}) Specification (Third Edition)},
+  year = {2025},
+  url = {https://www.w3.org/TR/2025/REC-png-3-20250624/},
+  note = {Color-space chunks, precedence, and integrity checks}
+}
+
+@misc{iccSrgbRegistry,
+  author = {{International Color Consortium}},
+  title = {{sRGB}: Three Component Color Encoding Registry},
+  url = {https://registry.color.org/rgb-registry/srgb},
+  note = {Reference primaries and transfer response; accessed 2026-09-09}
+}
+
 @article{huber1964robust,
   author = {Huber, Peter J.},
   title = {Robust Estimation of a Location Parameter},
@@ -51,6 +79,57 @@
   pages = {813--827},
   year = {1977},
   doi = {10.1080/03610927708827533}
+}
+
+@inproceedings{queau2017nonconvex,
+  author = {Queau, Yvain and Wu, Tao and Lauze, Francois and Durou, Jean-Denis and Cremers, Daniel},
+  title = {A Non-Convex Variational Approach to Photometric Stereo Under Inaccurate Lighting},
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition},
+  year = {2017},
+  url = {https://openaccess.thecvf.com/content_cvpr_2017/html/Queau_A_Non-Convex_Variational_CVPR_2017_paper.html},
+  note = {Informs redescending robust-loss fitting; the full joint depth/lighting method is not implemented}
+}
+
+@inproceedings{verbiest2008coherent,
+  author = {Verbiest, Frank and Van Gool, Luc},
+  title = {Photometric Stereo with Coherent Outlier Handling and Confidence Estimation},
+  booktitle = {2008 IEEE Conference on Computer Vision and Pattern Recognition},
+  year = {2008},
+  doi = {10.1109/CVPR.2008.4587712},
+  note = {Research reference for spatial outlier fields; not implemented in the normal solver}
+}
+
+@inproceedings{debevec1997hdr,
+  author = {Debevec, Paul E. and Malik, Jitendra},
+  title = {Recovering High Dynamic Range Radiance Maps from Photographs},
+  booktitle = {Proceedings of SIGGRAPH 97},
+  year = {1997},
+  url = {https://www.pauldebevec.com/Research/HDR/},
+  note = {Informs downweighting sensor-code extremes; our upper-headroom smoothstep is an application choice, not HDR merging}
+}
+
+@article{yohai1987mm,
+  author = {Yohai, Victor J.},
+  title = {High Breakdown-Point and High Efficiency Robust Estimates for Regression},
+  journal = {The Annals of Statistics},
+  volume = {15},
+  number = {2},
+  pages = {642--656},
+  year = {1987},
+  doi = {10.1214/aos/1176350366},
+  note = {M-scale framework reference; our weighted rational scale score is an application choice, not the complete MM estimator}
+}
+
+@article{foi2008noise,
+  author = {Foi, Alessandro and Trimeche, Mejdi and Katkovnik, Vladimir and Egiazarian, Karen},
+  title = {Practical Poissonian-Gaussian Noise Modeling and Fitting for Single-Image Raw-Data},
+  journal = {IEEE Transactions on Image Processing},
+  volume = {17},
+  number = {10},
+  pages = {1737--1754},
+  year = {2008},
+  doi = {10.1109/TIP.2008.2001399},
+  note = {Motivates signal-dependent shot/read-noise and clipping tests; the paper's automatic noise estimator is not implemented}
 }
 
 @article{torrance1967offspecular,

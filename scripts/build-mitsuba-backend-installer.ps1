@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.4",
+    [string]$Version = "0.2.5",
     [string]$CacheDirectory = "",
     [ValidateRange(1, 5)]
     [int]$BackendProbeAttempts = 2

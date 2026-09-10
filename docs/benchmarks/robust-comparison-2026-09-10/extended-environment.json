@@ -1,0 +1,26 @@
+{
+  "primary_environment": {
+    "reference_commit": "f03aa95b57e746a7d31df76b1c0fa0a83584a3c1",
+    "reference_sha256": "69f3476ef7f22b366e587ecfcc079f9ea75bfe3e111c667cb7cc9b7d7198a2c4",
+    "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+    "numpy": "2.3.5",
+    "platform": "Windows-11-10.0.26100-SP0",
+    "native_sha256": "27a96a72ab9f086363d86e4054dfaac4098294430bffc1f2fdd1b6417bdf16a0",
+    "harness_sha256": "64f0ad6f52343b570c8044a22b1dd45d0c0798f0c70fc650bd6332f3f5890827",
+    "production_source_sha256": {
+      "src\\robust_fit.hpp": "9e5dd253ea522f060cfbfff654ab2ac4f2053640a7ebe7be4a687d19f29ff8b2",
+      "src\\photometric.cpp": "2c4eb2f28a7aff57037123edc50a75eced9ef02683075ec490f7feca4b71e47d"
+    }
+  },
+  "script_sha256": "64379704d3020abd73043b7764f98f218bbc2c98a410d292afabefe27c590441",
+  "tolerance": 1e-08,
+  "budget": 10000,
+  "sample_count_per_case": 32,
+  "cases": [
+    "clean_noise_8_binary",
+    "gain_mismatch_irregular_8_binary",
+    "robust_v1_binary",
+    "holdout_relief_v1_binary",
+    "fish_dynamic_headroom"
+  ]
+}

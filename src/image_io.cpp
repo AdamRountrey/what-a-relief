@@ -1,4 +1,5 @@
 #include "image_io.hpp"
+#include "input_response.hpp"
 #include "checked_io.hpp"
 #include "radiometry.hpp"
 
@@ -95,9 +96,11 @@ cv::Mat definiteSaturationMask(const cv::Mat& raw) {
     std::vector<cv::Mat> channels;
     cv::split(raw, channels);
     cv::Mat saturated(raw.size(), CV_8U, cv::Scalar(0));
-    for (const cv::Mat& channel : channels) {
+    // Alpha is opacity, not sensor intensity; fully opaque RGBA is not clipped.
+    const size_t intensityChannels = channels.size() == 4 ? 3 : channels.size();
+    for (size_t c = 0; c < intensityChannels; ++c) {
         cv::Mat channelSaturated;
-        cv::compare(channel, whiteLevel, channelSaturated, cv::CMP_GE);
+        cv::compare(channels[c], whiteLevel, channelSaturated, cv::CMP_GE);
         cv::bitwise_or(saturated, channelSaturated, saturated);
     }
     return saturated;
@@ -1879,19 +1882,58 @@ std::vector<cv::Mat> loadLuminanceImages(
     const std::vector<std::string>& paths,
     bool srgb,
     std::vector<cv::Mat>* saturationMasks) {
+    Options opt;
+    opt.imagePaths = paths;
+    opt.inputResponseMode = srgb ? InputResponseMode::Srgb : InputResponseMode::Linear;
+    return loadLuminanceImages(opt, saturationMasks);
+}
+
+cv::Mat photometricHeadroomWeights(const cv::Mat& raw) {
+    if (raw.depth() != CV_8U && raw.depth() != CV_16U) return {};
+    const double white = raw.depth() == CV_8U ? 255.0 : 65535.0;
+    const int channels = raw.channels();
+    const int intensityChannels = channels == 4 ? 3 : channels;
+    cv::Mat weights(raw.size(), CV_8U);
+    cv::parallel_for_(cv::Range(0, raw.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            auto* dst = weights.ptr<uchar>(y);
+            for (int x = 0; x < raw.cols; ++x) {
+                double brightest = 0;
+                for (int c = 0; c < intensityChannels; ++c) {
+                    const size_t offset = static_cast<size_t>(x) * channels + c;
+                    const double value = raw.depth() == CV_8U ? raw.ptr<uchar>(y)[offset] : raw.ptr<unsigned short>(y)[offset];
+                    brightest = std::max(brightest, value);
+                }
+                const double t = std::clamp((white - brightest) / (0.02 * white), 0.0, 1.0);
+                dst[x] = cv::saturate_cast<uchar>(255.0 * t * t * (3.0 - 2.0 * t));
+            }
+        }
+    });
+    // Empty entries encode unit reliability without retaining another full image.
+    return cv::countNonZero(weights != 255) == 0 ? cv::Mat() : weights;
+}
+
+std::vector<cv::Mat> loadLuminanceImages(const Options& opt, std::vector<cv::Mat>* saturationMasks,
+    std::vector<cv::Mat>* headroomWeights) {
+    const auto& paths = opt.imagePaths;
     std::vector<cv::Mat> images;
     images.reserve(paths.size());
+    if (headroomWeights) {
+        headroomWeights->clear();
+        headroomWeights->reserve(paths.size());
+    }
     if (saturationMasks != nullptr) {
         saturationMasks->clear();
         saturationMasks->reserve(paths.size());
     }
     cv::Size expected;
-    for (const std::string& path : paths) {
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const auto& path = paths[i];
         cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
         if (raw.empty()) {
             die("Failed to read image: " + path);
         }
-        cv::Mat gray = convertToLinearLuminance(raw, srgb);
+        cv::Mat gray = convertToLinearLuminance(raw, inputResponseForImage(opt, i).srgb);
         if (expected.empty()) {
             expected = gray.size();
         } else if (gray.size() != expected) {
@@ -1900,6 +1942,7 @@ std::vector<cv::Mat> loadLuminanceImages(
         if (saturationMasks != nullptr) {
             saturationMasks->push_back(definiteSaturationMask(raw));
         }
+        if (headroomWeights) headroomWeights->push_back(photometricHeadroomWeights(raw));
         images.push_back(gray);
     }
     normalizeRelativeIntensityStack(images);

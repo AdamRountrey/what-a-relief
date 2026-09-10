@@ -1,0 +1,21 @@
+dark_boundary_8_diffuse_max_jump=0.830591
+dark_boundary_8_diffuse_mean_error=0.258013
+FAIL: dark_boundary_8_diffuse infinitesimal cutoff crossing must not change the normal abruptly
+FAIL: dark_boundary_8_diffuse stability must preserve known-normal accuracy
+dark_boundary_8_glossy_max_jump=5.14842
+dark_boundary_8_glossy_mean_error=3.04214
+FAIL: dark_boundary_8_glossy infinitesimal cutoff crossing must not change the normal abruptly
+dark_boundary_16_diffuse_max_jump=0.305542
+dark_boundary_16_diffuse_mean_error=0.0936018
+FAIL: dark_boundary_16_diffuse infinitesimal cutoff crossing must not change the normal abruptly
+dark_boundary_16_glossy_max_jump=1.68748
+dark_boundary_16_glossy_mean_error=2.71904
+FAIL: dark_boundary_16_glossy infinitesimal cutoff crossing must not change the normal abruptly
+dark_boundary_40_diffuse_max_jump=0.102929
+dark_boundary_40_diffuse_mean_error=0.0377289
+FAIL: dark_boundary_40_diffuse infinitesimal cutoff crossing must not change the normal abruptly
+dark_boundary_40_glossy_max_jump=0.466218
+dark_boundary_40_glossy_mean_error=2.66337
+FAIL: dark_boundary_40_glossy infinitesimal cutoff crossing must not change the normal abruptly
+clipping_boundary_p99_degrees=0.929297
+clipping_boundary_mean_error=0.409517

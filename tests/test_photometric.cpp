@@ -1,5 +1,7 @@
 #include "photometric.hpp"
+#include "image_io.hpp"
 #include "radiometry.hpp"
+#include "robust_fit.hpp"
 #include "shadow_refinement.hpp"
 
 #include <opencv2/core.hpp>
@@ -126,7 +128,8 @@ SolveResult solve(
     const std::vector<cv::Mat>& saturationMasks = {},
     bool collectObservationMasks = false,
     const cv::Mat& inputMask = cv::Mat(),
-    bool compactObservationMasks = false) {
+    bool compactObservationMasks = false,
+    const std::vector<cv::Mat>& headroomWeights = {}) {
     SolveResult result;
     result.diagnostics.collectObservationMasks = collectObservationMasks;
     result.diagnostics.compactObservationMasks = compactObservationMasks;
@@ -153,7 +156,8 @@ SolveResult solve(
         result.residual,
         result.validMask,
         result.diagnostics,
-        saturationMasks);
+        saturationMasks,
+        headroomWeights);
     return result;
 }
 
@@ -1142,9 +1146,12 @@ void testBroadGlossRobustness(TestContext& context) {
     context.check(
         robustError < standardError,
         "broad-gloss robust solve must improve on ordinary least squares");
-    context.check(
-        cueRate > 0.35,
-        "broad-gloss half-vector diagnostic cue rate was " + std::to_string(cueRate));
+    // A diffuse-model residual cue cannot identify all broad gloss: a constant
+    // specular term under an equal-elevation ring is indistinguishable from
+    // diffuse amplitude on a front-facing plane. Do not require arbitrary cue
+    // coverage here; rendered fixtures gate actual classification precision/recall.
+    context.check(robust.diagnostics.solvedFraction > 0.99,
+        "broad-gloss error must not be improved by discarding difficult pixels");
 }
 
 void testBrightDiffuseObservationIsRetained(TestContext& context) {
@@ -1160,6 +1167,429 @@ void testBrightDiffuseObservationIsRetained(TestContext& context) {
     context.check(
         highCount < 0.01,
         "a model-consistent diffuse value at normalized intensity 1 must not be labeled a highlight");
+}
+
+void testNoisyClippedColorRelief(TestContext& context) {
+    constexpr int rows = 24;
+    constexpr int cols = 96;
+    for (int count : {8, 16, 40, 64}) {
+        std::vector<cv::Vec3f> lights;
+        for (int i = 0; i < count; ++i) {
+            const double azimuth = i * kPi * (3.0 - std::sqrt(5.0));
+            const double z = 0.20 + 0.70 * (i + 0.5) / count;
+            const double radial = std::sqrt(1.0 - z * z);
+            lights.emplace_back(static_cast<float>(radial * std::cos(azimuth)),
+                static_cast<float>(radial * std::sin(azimuth)), static_cast<float>(z));
+        }
+        for (int encoding = 0; encoding < 4; ++encoding) {
+            const bool srgb = encoding == 1 || encoding == 2;
+            cv::RNG random(0x4319 + count);
+            cv::Mat truth(rows, cols, CV_32FC3);
+            cv::Mat ridgeMask(rows, cols, CV_8U, cv::Scalar(0));
+            std::vector<cv::Mat> images(count), saturation(count);
+            for (int i = 0; i < count; ++i) {
+                cv::Mat sensor(rows, cols, CV_8UC3);
+                saturation[i] = cv::Mat(rows, cols, CV_8U, cv::Scalar(0));
+                for (int y = 0; y < rows; ++y) {
+                    for (int x = 0; x < cols; ++x) {
+                        // Each adjacent pair repeats the same surface sample with
+                        // independent sensor noise, so its true angular jump is zero.
+                        const double u = static_cast<double>(x / 2) - 23.5;
+                        const double v = static_cast<double>(y) - 11.5;
+                        const double offset = u - 0.35 * v;
+                        const double ridge = std::exp(-0.5 * offset * offset / (1.5 * 1.5));
+                        const double du = 0.08 + 0.004 * u - 0.9 * offset * ridge / (1.5 * 1.5);
+                        const double dv = -0.04 + 0.003 * v + 0.35 * 0.9 * offset * ridge / (1.5 * 1.5);
+                        const auto normal = normalized(cv::Vec3f(static_cast<float>(-du), static_cast<float>(dv), 1.0f));
+                        truth.at<cv::Vec3f>(y, x) = normal;
+                        if (std::abs(offset) < 4.0) ridgeMask.at<uchar>(y, x) = 255;
+                        const double texture = 0.8 + 0.16 * std::sin(0.31 * u) * std::cos(0.27 * v);
+                        const cv::Vec3d reflectance = x < cols / 2
+                            ? cv::Vec3d(0.12, 0.45, 0.95) : cv::Vec3d(0.85, 0.38, 0.16);
+                        // Lambertian direct light plus weak unoccluded diffuse
+                        // environment illumination; 1.8 is the common exposure.
+                        const double irradiance = 1.8 * texture *
+                            (std::max(0.0f, normal.dot(lights[i])) + (encoding == 3 ? 0.20 : 0.04));
+                        auto& code = sensor.at<cv::Vec3b>(y, x);
+                        for (int c = 0; c < 3; ++c) {
+                            const double signal = irradiance * reflectance[c];
+                            // High-count Gaussian approximation to shot noise
+                            // (20,000 electrons at unit signal), plus read noise.
+                            const double noisy = std::max(0.0, signal + random.gaussian(
+                                std::sqrt(signal / 20000.0 + 0.001 * 0.001)));
+                            double encoded = std::min(1.0, noisy);
+                            if (srgb) encoded = encoded <= 0.0031308 ? 12.92 * encoded :
+                                1.055 * std::pow(encoded, 1.0 / 2.4) - 0.055;
+                            code[c] = cv::saturate_cast<uchar>(encoded * 255.0);
+                            if (code[c] == 255) saturation[i].at<uchar>(y, x) = 255;
+                        }
+                    }
+                }
+                images[i] = convertToLinearLuminance(sensor, encoding == 1);
+            }
+            cv::Mat supported(rows, cols, CV_8U, cv::Scalar(0));
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                int usable = 0;
+                for (int i = 0; i < count; ++i) {
+                    if (!saturation[i].at<uchar>(y, x) && images[i].at<float>(y, x) > 0.02f) ++usable;
+                }
+                if (usable >= 5) supported.at<uchar>(y, x) = 255;
+            }
+            const auto robust = solve(images, lights, NormalSolverMode::Robust,
+                LightingModel::Directional, 10.0, 10.0, 0.01, saturation, false, supported);
+            const auto standard = solve(images, lights, NormalSolverMode::Standard,
+                LightingModel::Directional, 10.0, 10.0, 0.01, {}, false, supported);
+            std::vector<cv::Mat> unclipped;
+            for (int i = 0; i < count; ++i) {
+                unclipped.push_back(images[i].clone());
+                unclipped.back().setTo(0, saturation[i]);
+            }
+            const auto clippedLeastSquares = solve(unclipped, lights, NormalSolverMode::Standard,
+                LightingModel::Directional, 10.0, 10.0, 0.01, {}, false, supported);
+            const double error = meanAngularErrorDegrees(robust.normals, robust.validMask, truth);
+            const double lsError = meanAngularErrorDegrees(standard.normals, standard.validMask, truth);
+            const double clippedLsError = meanAngularErrorDegrees(clippedLeastSquares.normals, clippedLeastSquares.validMask, truth);
+            cv::bitwise_and(ridgeMask, robust.validMask, ridgeMask);
+            const double ridgeError = meanAngularErrorDegrees(robust.normals, ridgeMask, truth);
+            std::vector<double> jumps;
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; x += 2) {
+                if (!robust.validMask.at<uchar>(y, x) || !robust.validMask.at<uchar>(y, x + 1)) continue;
+                const auto a = robust.normals.at<cv::Vec3f>(y, x);
+                const auto b = robust.normals.at<cv::Vec3f>(y, x + 1);
+                jumps.push_back(kRadiansToDegrees * std::acos(std::clamp(static_cast<double>(a.dot(b)), -1.0, 1.0)));
+            }
+            std::sort(jumps.begin(), jumps.end());
+            const double p99 = jumps.empty() ? 180.0 : jumps[static_cast<size_t>(0.99 * (jumps.size() - 1))];
+            const std::string prefix = "noisy_color_" + std::to_string(count) +
+                (encoding == 3 ? "_fill" : (encoding == 2 ? "_undecoded" : (srgb ? "_srgb" : "_linear")));
+            std::cout << prefix << "_mean_degrees=" << error << '\n'
+                      << prefix << "_ls_degrees=" << lsError << '\n'
+                      << prefix << "_clipped_ls_degrees=" << clippedLsError << '\n'
+                      << prefix << "_ridge_degrees=" << ridgeError << '\n'
+                      << prefix << "_pair_p99_degrees=" << p99 << '\n'
+                      << prefix << "_coverage=" << robust.diagnostics.solvedFraction << '\n';
+            context.check(robust.diagnostics.solvedFraction > 0.99, prefix + " must retain supported surface pixels");
+            if (encoding < 2) {
+                context.check(error < 2.0 && ridgeError < 2.0, prefix + " must recover normals including narrow relief");
+                context.check(error < lsError, prefix + " must improve on ordinary least squares with clipping");
+                context.check(error <= 1.25 * clippedLsError + 0.15,
+                    prefix + " must remain competitive with clipping-aware least squares on diffuse observations");
+            }
+            if (encoding < 2) context.check(p99 < 1.5, prefix + " independent sensor noise must not create large normal jumps");
+            if (encoding == 3) {
+                // Strong unmodeled fill is a separate model-mismatch stress
+                // regime, not the calibrated direct-light accuracy condition.
+                context.check(error < clippedLsError && error < lsError,
+                    prefix + " must improve known-normal accuracy over both least-squares baselines");
+                context.check(p99 < 4.5, prefix + " clipping/model mismatch must have bounded pair variation");
+            }
+            if (count == 16 && encoding == 1) {
+                std::vector<cv::Mat> mirroredImages, mirroredSaturation;
+                for (int i = 0; i < count; ++i) {
+                    cv::Mat a, b;
+                    cv::flip(images[i], a, 1); cv::flip(saturation[i], b, 1);
+                    mirroredImages.push_back(a); mirroredSaturation.push_back(b);
+                }
+                cv::Mat mirroredMask;
+                cv::flip(supported, mirroredMask, 1);
+                auto mirrored = solve(mirroredImages, lights, NormalSolverMode::Robust,
+                    LightingModel::Directional, 10.0, 10.0, 0.01, mirroredSaturation, false, mirroredMask);
+                cv::flip(mirrored.normals, mirrored.normals, 1);
+                checkSameMap(context, mirrored.normals, robust.normals,
+                    "robust normals must not depend on spatial order", 1.0e-6);
+            }
+        }
+    }
+}
+
+void testRobustClippingBoundaryStabilityCase(TestContext& context, int count) {
+    constexpr int rows = 16, cols = 64;
+    auto lights = makeRingLights(count, 0.75f);
+    std::vector<cv::Mat> images, changed, clipped, changedClipped, weights, changedWeights;
+    cv::Mat truth(rows, cols, CV_32FC3);
+    cv::RNG rng(8977251);
+    for (int i = 0; i < count; ++i) {
+        cv::Mat raw(rows, cols, CV_8UC3), perturbed(rows, cols, CV_8UC3);
+        cv::Mat clip(rows, cols, CV_8U, cv::Scalar(0)), changedClip = clip.clone();
+        for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+            const auto normal = normalized(cv::Vec3f(0.12f + 0.18f * std::sin(x * 0.2f),
+                0.06f * std::cos(y * 0.4f), 1));
+            truth.at<cv::Vec3f>(y, x) = normal;
+            const double illumination = 1.4 * std::max(0.0f, normal.dot(lights[i]));
+            const cv::Vec3d color(0.12, 0.30, 0.94);
+            for (int c = 0; c < 3; ++c) {
+                const double signal = std::clamp(color[c] * illumination, 0.0, 1.0);
+                const double srgb = signal <= 0.0031308 ? 12.92 * signal :
+                    1.055 * std::pow(signal, 1.0 / 2.4) - 0.055;
+                raw.at<cv::Vec3b>(y, x)[c] = cv::saturate_cast<uchar>(255.0 * srgb);
+                perturbed.at<cv::Vec3b>(y, x)[c] = cv::saturate_cast<uchar>(
+                    static_cast<int>(raw.at<cv::Vec3b>(y, x)[c]) + rng.uniform(-1, 2));
+                if (raw.at<cv::Vec3b>(y, x)[c] == 255) clip.at<uchar>(y, x) = 255;
+                if (perturbed.at<cv::Vec3b>(y, x)[c] == 255) changedClip.at<uchar>(y, x) = 255;
+            }
+        }
+        images.push_back(convertToLinearLuminance(raw, true));
+        changed.push_back(convertToLinearLuminance(perturbed, true));
+        clipped.push_back(clip); changedClipped.push_back(changedClip);
+        weights.push_back(photometricHeadroomWeights(raw));
+        changedWeights.push_back(photometricHeadroomWeights(perturbed));
+    }
+    const auto base = solve(images, lights, NormalSolverMode::Robust,
+        LightingModel::Directional, 10, 10, 0.01, clipped, false, {}, false, weights);
+    const auto perturbed = solve(changed, lights, NormalSolverMode::Robust,
+        LightingModel::Directional, 10, 10, 0.01, changedClipped, false, {}, false, changedWeights);
+    std::vector<double> changes;
+    for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+        if (!base.validMask.at<uchar>(y, x) || !perturbed.validMask.at<uchar>(y, x)) continue;
+        const cv::Vec3d a(base.normals.at<cv::Vec3f>(y, x)), b(perturbed.normals.at<cv::Vec3f>(y, x));
+        changes.push_back(kRadiansToDegrees * std::acos(std::clamp(
+            a.dot(b) / (cv::norm(a) * cv::norm(b)), -1.0, 1.0)));
+    }
+    std::sort(changes.begin(), changes.end());
+    const double p99 = changes.empty() ? 180.0 : changes[(changes.size() - 1) * 99 / 100];
+    const double error = meanAngularErrorDegrees(perturbed.normals, perturbed.validMask, truth);
+    const std::string label = "clipping_boundary_" + std::to_string(count);
+    std::cout << label << "_p99_degrees=" << p99 << '\n'
+              << label << "_mean_error=" << error << '\n';
+    context.check(changes.size() == rows * cols, "clipping stability must retain the supported surface");
+    context.check(p99 < (count == 8 ? 2.5 : 1.5) && error < 1.0,
+        label + " transitions must preserve stability and known normals");
+}
+
+void testRobustClippingBoundaryStability(TestContext& context) {
+    for (int count : {8, 16, 40, 64}) testRobustClippingBoundaryStabilityCase(context, count);
+}
+
+void testRobustMeasurementStability(TestContext& context) {
+    // Bounded quantization sensitivity, not a substitute for the rendered
+    // camera-noise/visibility fixtures. No real-data intensities are embedded.
+    constexpr int rows = 16;
+    constexpr int cols = 64;
+    for (const int count : {8, 16, 40, 64}) {
+        auto lights = makeRingLights(count, 0.6f);
+        for (int layout = 0; layout < 2; ++layout) {
+            if (layout == 1) {
+                for (int i = 0; i < count; ++i) {
+                    const double a = i * kPi * (3.0 - std::sqrt(5.0));
+                    const double z = 0.25 + 0.6 * (i + 0.5) / count;
+                    const double radius = std::sqrt(1.0 - z * z);
+                    lights[i] = cv::Vec3f(static_cast<float>(radius * std::cos(a)),
+                        static_cast<float>(radius * std::sin(a)), static_cast<float>(z));
+                }
+            }
+            cv::RNG rng(781322 + 7 * count + layout);
+            std::vector<cv::Mat> base, changed, saturation;
+            cv::Mat truth(rows, cols, CV_32FC3);
+            for (int i = 0; i < count; ++i) {
+                cv::Mat encoded(rows, cols, CV_8U), perturbed(rows, cols, CV_8U);
+                for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                    const double u = (x - 31.5) / 32.0, v = (y - 7.5) / 8.0;
+                    const auto normal = normalized(cv::Vec3f(
+                        static_cast<float>(0.28 * std::sin(4.0 * u) + 0.10 * v),
+                        static_cast<float>(0.18 * std::cos(3.0 * v) + 0.10 * u), 1));
+                    truth.at<cv::Vec3f>(y, x) = normal;
+                    const double a = 2.0 * kPi * i / count;
+                    const double gain = 1.0 + 0.2 * std::cos(a - 0.4) + 0.12 * std::sin(2.0 * a);
+                    const double albedo = 0.2 + 0.25 * (0.5 + 0.5 * std::sin(11.0 * u) * std::cos(7.0 * v));
+                    const auto half = normalized(lights[i] + cv::Vec3f(0, 0, 1));
+                    const double direct = albedo * std::max(0.0f, normal.dot(lights[i]));
+                    const double gloss = 0.08 * (1.0 + u) * std::pow(std::max(0.0f, normal.dot(half)), 24);
+                    const double linear = std::clamp(gain * (direct + gloss) + 0.08 * albedo, 0.0, 1.0);
+                    const double srgb = linear <= 0.0031308 ? 12.92 * linear :
+                        1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+                    encoded.at<uchar>(y, x) = cv::saturate_cast<uchar>(255.0 * srgb);
+                    perturbed.at<uchar>(y, x) = cv::saturate_cast<uchar>(
+                        static_cast<int>(encoded.at<uchar>(y, x)) + rng.uniform(-1, 2));
+                }
+                base.push_back(convertToLinearLuminance(encoded, true));
+                changed.push_back(convertToLinearLuminance(perturbed, true));
+                saturation.emplace_back(rows, cols, CV_8U, cv::Scalar(0));
+            }
+            const auto original = solve(base, lights, NormalSolverMode::Robust,
+                LightingModel::Directional, 10, 10, 0.01, saturation);
+            const auto perturbed = solve(changed, lights, NormalSolverMode::Robust,
+                LightingModel::Directional, 10, 10, 0.01, saturation);
+            std::vector<double> changes;
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                if (!original.validMask.at<uchar>(y, x) || !perturbed.validMask.at<uchar>(y, x)) continue;
+                const cv::Vec3d a(original.normals.at<cv::Vec3f>(y, x));
+                const cv::Vec3d b(perturbed.normals.at<cv::Vec3f>(y, x));
+                changes.push_back(kRadiansToDegrees * std::acos(std::clamp(
+                    a.dot(b) / (cv::norm(a) * cv::norm(b)), -1.0, 1.0)));
+            }
+            std::sort(changes.begin(), changes.end());
+            const double p99 = changes.empty() ? 180.0 : changes[(changes.size() - 1) * 99 / 100];
+            const double maximum = changes.empty() ? 180.0 : changes.back();
+            const auto ls = solve(base, lights, NormalSolverMode::Standard);
+            const double error = meanAngularErrorDegrees(original.normals, original.validMask, truth);
+            const double lsError = meanAngularErrorDegrees(ls.normals, original.validMask, truth);
+            const std::string label = "measurement_stability_" + std::to_string(count) +
+                (layout == 0 ? "_ring" : "_irregular");
+            std::cout << label << "_p99=" << p99 << '\n'
+                      << label << "_max=" << maximum << '\n'
+                      << label << "_mean_error=" << error << '\n'
+                      << label << "_ls_mean_error=" << lsError << '\n';
+            context.check(changes.size() == rows * cols, label + " must not conceal instability with exclusions");
+            context.check(p99 < 2.0 && maximum < 5.0, label + " one-code changes must not switch normal hypotheses");
+            // Gains are intentionally wrong in this stress case. Report its
+            // bias; calibrated clean/noisy fixtures separately gate accuracy
+            // against LS. Stability alone does not establish correct geometry.
+            std::reverse(base.begin(), base.end());
+            std::reverse(lights.begin(), lights.end());
+            const auto reordered = solve(base, lights, NormalSolverMode::Robust);
+            checkSameMap(context, original.normals, reordered.normals,
+                label + " light permutation must preserve the estimate", 1.0e-5);
+        }
+    }
+}
+
+void testRobustDarkBoundaryStability(TestContext& context) {
+    constexpr int rows = 12, cols = 48;
+    for (int count : {8, 16, 40}) {
+        const auto lights = makeRingLights(count, 0.6f);
+        for (bool glossy : {false, true}) {
+            std::vector<cv::Mat> before(count), after(count), heads(count);
+            cv::Mat truth(rows, cols, CV_32FC3);
+            for (int i = 0; i < count; ++i) {
+                before[i] = cv::Mat(rows, cols, CV_32F);
+                after[i] = cv::Mat(rows, cols, CV_32F);
+                for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                    const auto normal = normalized(cv::Vec3f(0.25f * std::sin(x * 0.17f),
+                        0.18f * std::cos(y * 0.3f), 1));
+                    truth.at<cv::Vec3f>(y, x) = normal;
+                    const double albedo = 0.12 + 0.15 * (0.5 + 0.5 * std::sin(x * 0.31));
+                    const auto half = normalized(lights[i] + cv::Vec3f(0, 0, 1));
+                    const double diffuse = albedo * std::max(0.0f, normal.dot(lights[i]));
+                    const double specular = glossy ? 0.12 * std::pow(std::max(0.0f, normal.dot(half)), 40) : 0;
+                    before[i].at<float>(y, x) = after[i].at<float>(y, x) = static_cast<float>(diffuse + specular);
+                    // A partially occluded light has visibility chosen to put
+                    // its signal at the cutoff. Only measurement noise changes;
+                    // the surface, BRDF, and visibility are identical in the pair.
+                    if (i == (x + y) % count) {
+                        before[i].at<float>(y, x) = 0.02f - 1.0e-6f;
+                        after[i].at<float>(y, x) = 0.02f + 1.0e-6f;
+                    }
+                }
+            }
+            const auto a = solve(before, lights, NormalSolverMode::Robust,
+                LightingModel::Directional, 10, 10, 0.01, {}, false, {}, false, heads);
+            const auto b = solve(after, lights, NormalSolverMode::Robust,
+                LightingModel::Directional, 10, 10, 0.01, {}, false, {}, false, heads);
+            double maximum = 0;
+            int common = 0;
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                if (!a.validMask.at<uchar>(y, x) || !b.validMask.at<uchar>(y, x)) continue;
+                const cv::Vec3d na(a.normals.at<cv::Vec3f>(y, x)), nb(b.normals.at<cv::Vec3f>(y, x));
+                maximum = std::max(maximum, kRadiansToDegrees * std::acos(std::clamp(
+                    na.dot(nb) / (cv::norm(na) * cv::norm(nb)), -1.0, 1.0)));
+                ++common;
+            }
+            const double error = meanAngularErrorDegrees(b.normals, b.validMask, truth);
+            const std::string label = "dark_boundary_" + std::to_string(count) + (glossy ? "_glossy" : "_diffuse");
+            std::cout << label << "_max_jump=" << maximum << '\n'
+                      << label << "_mean_error=" << error << '\n';
+            context.check(common == rows * cols, label + " must keep all supported surface pixels");
+            context.check(maximum < 0.02, label + " infinitesimal cutoff crossing must not change the normal abruptly");
+            context.check(error < (glossy ? 8.0 : 0.1), label + " stability must preserve known-normal accuracy");
+        }
+    }
+}
+
+void testReliabilityScaleContinuity(TestContext& context) {
+    constexpr double floor = 0.001, sigma = 0.017;
+    std::vector<double> residuals, weights;
+    for (int i = -800; i <= 800; ++i) {
+        const double z = i * 0.01;
+        residuals.push_back(sigma * sigma * z * z);
+        weights.push_back(std::exp(-0.5 * z * z));
+    }
+    const double gaussian = robust_fit::residualMScale(residuals, weights, floor);
+    context.check(std::abs(gaussian / sigma - 1.0) < 1.0e-5,
+        "M-scale must have its documented Gaussian population calibration");
+    residuals.push_back(1.0e12);
+    weights.push_back(0.0);
+    const double ignored = robust_fit::residualMScale(residuals, weights, floor);
+    weights.back() = 1.0e-8;
+    const double tinyWeight = robust_fit::residualMScale(residuals, weights, floor);
+    context.check(std::abs(ignored - gaussian) < 1.0e-10 && std::abs(tinyWeight - gaussian) < 1.0e-7,
+        "zero or vanishing reliability must not give an extreme residual a full scale vote");
+    std::reverse(residuals.begin(), residuals.end());
+    std::reverse(weights.begin(), weights.end());
+    context.check(std::abs(robust_fit::residualMScale(residuals, weights, floor) - tinyWeight) < 1.0e-9,
+        "M-scale must be independent of observation order");
+    for (double& r : residuals) r *= 49.0;
+    context.check(std::abs(robust_fit::residualMScale(residuals, weights, 7.0 * floor) / (7.0 * tinyWeight) - 1.0) < 1.0e-5,
+        "M-scale must scale with radiometric units when its floor scales too");
+    context.check(robust_fit::residualMScale(std::vector<double>(8, 0.0), std::vector<double>(8, 1.0), floor) == floor,
+        "perfect fits must retain a nonzero noise floor");
+    for (double threshold : {0.0, 0.02, 0.10}) {
+        double previous = 0.0;
+        for (int i = 0; i <= 100; ++i) {
+            const double value = threshold + i * 0.0001;
+            const double w = robust_fit::lowSignalWeight(value, threshold);
+            context.check(w >= previous && w >= 0.0 && w <= 1.0, "dark reliability must increase monotonically");
+            previous = w;
+        }
+        context.check(robust_fit::lowSignalWeight(threshold, threshold) == 0.0 &&
+            robust_fit::lowSignalWeight(threshold + 1.0e-7, threshold) < 1.0e-7,
+            "dark reliability must start continuously at the cutoff");
+    }
+}
+
+void testLowExposureSensorNoise(TestContext& context) {
+    constexpr int rows = 12, cols = 80;
+    for (int count : {8, 16, 40}) for (int encoding = 0; encoding < 3; ++encoding) {
+        const auto lights = makeRingLights(count, 0.6f);
+        const bool srgb = encoding == 1;
+        const double white = encoding == 2 ? 65535.0 : 255.0;
+        cv::RNG rng(0x45175 + count + encoding);
+        cv::Mat truth(rows, cols, CV_32FC3);
+        std::vector<cv::Mat> images(count), heads(count);
+        int crossings = 0;
+        for (int i = 0; i < count; ++i) {
+            cv::Mat raw(rows, cols, encoding == 2 ? CV_16U : CV_8U);
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+                const double u = (x / 2 - 19.5) / 20.0, v = (y - 5.5) / 6.0;
+                const auto n = normalized(cv::Vec3f(static_cast<float>(0.35 * std::sin(2.0 * u)),
+                    static_cast<float>(0.25 * std::cos(2.0 * v)), 1));
+                truth.at<cv::Vec3f>(y, x) = n;
+                const double albedo = 0.075 + 0.025 * std::sin(5.0 * u) * std::cos(3.0 * v);
+                const double signal = albedo * std::max(0.0f, n.dot(lights[i]));
+                // Matched-view diffuse surface, high-count shot-noise
+                // approximation plus 0.0005 read noise, then encoding and ADC.
+                double measured = std::clamp(signal + rng.gaussian(std::sqrt(signal / 50000.0 + 0.0005 * 0.0005)), 0.0, 1.0);
+                if (srgb) measured = measured <= 0.0031308 ? 12.92 * measured :
+                    1.055 * std::pow(measured, 1.0 / 2.4) - 0.055;
+                if (encoding == 2) raw.at<unsigned short>(y, x) = cv::saturate_cast<unsigned short>(white * measured);
+                else raw.at<uchar>(y, x) = cv::saturate_cast<uchar>(white * measured);
+            }
+            images[i] = convertToLinearLuminance(raw, srgb);
+            for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; x += 2) {
+                crossings += (images[i].at<float>(y, x) > 0.02f) != (images[i].at<float>(y, x + 1) > 0.02f);
+            }
+        }
+        const auto robust = solve(images, lights, NormalSolverMode::Robust,
+            LightingModel::Directional, 10, 10, 0.01, {}, false, {}, false, heads);
+        const auto ls = solve(images, lights, NormalSolverMode::Standard);
+        const double error = meanAngularErrorDegrees(robust.normals, robust.validMask, truth);
+        const double lsError = meanAngularErrorDegrees(ls.normals, ls.validMask, truth);
+        std::vector<double> jumps;
+        for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; x += 2) {
+            if (!robust.validMask.at<uchar>(y, x) || !robust.validMask.at<uchar>(y, x + 1)) continue;
+            const cv::Vec3d a(robust.normals.at<cv::Vec3f>(y, x)), b(robust.normals.at<cv::Vec3f>(y, x + 1));
+            jumps.push_back(kRadiansToDegrees * std::acos(std::clamp(a.dot(b) / (cv::norm(a) * cv::norm(b)), -1.0, 1.0)));
+        }
+        std::sort(jumps.begin(), jumps.end());
+        const double p99 = jumps.empty() ? 180.0 : jumps[(jumps.size() - 1) * 99 / 100];
+        const std::string label = "low_exposure_" + std::to_string(count) + (encoding == 2 ? "_linear16" : (srgb ? "_srgb8" : "_linear8"));
+        std::cout << label << "_mean_error=" << error << '\n' << label << "_ls_error=" << lsError << '\n'
+                  << label << "_pair_p99=" << p99 << '\n' << label << "_crossings=" << crossings << '\n';
+        context.check(crossings > 0, label + " must exercise noisy cutoff crossings");
+        context.check(jumps.size() == rows * cols / 2, label + " must keep the full low-exposure surface");
+        context.check(error < 3.0 && error < 1.25 * lsError + 0.25,
+            label + " must preserve angular accuracy relative to least squares");
+        context.check(p99 < 8.0, label + " must bound independent low-signal noise variation");
+    }
 }
 
 void testUnsupportedPixelsAreNotForceFit(TestContext& context) {
@@ -2789,6 +3219,19 @@ void testHeightFlatteningSemantics(TestContext& context) {
 
 int main(int argc, char** argv) {
     TestContext context;
+    if (argc == 2 && std::string(argv[1]) == "--exposure-boundaries") {
+        testRobustDarkBoundaryStability(context);
+        testRobustClippingBoundaryStability(context);
+        testReliabilityScaleContinuity(context);
+        testLowExposureSensorNoise(context);
+        return context.failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--robust-stability") {
+        testNoisyClippedColorRelief(context);
+        testRobustMeasurementStability(context);
+        testRobustClippingBoundaryStability(context);
+        return context.failures == 0 ? 0 : 1;
+    }
     testCompactRobustObservationStorage(context);
     testStreamedShadowDiagnosticStorage(context);
     testStreamedShadowNoEvidenceStorage(context);
@@ -2809,6 +3252,12 @@ int main(int argc, char** argv) {
     testRobustHighlightCounts(context);
     testBroadGlossRobustness(context);
     testBrightDiffuseObservationIsRetained(context);
+    testNoisyClippedColorRelief(context);
+    testRobustMeasurementStability(context);
+    testRobustClippingBoundaryStability(context);
+    testRobustDarkBoundaryStability(context);
+    testReliabilityScaleContinuity(context);
+    testLowExposureSensorNoise(context);
     testUnsupportedPixelsAreNotForceFit(context);
     testMitsubaMixedMaterialRecovery(context);
     testAdditionalMitsubaFixtures(context);

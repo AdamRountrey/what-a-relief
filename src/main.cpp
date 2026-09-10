@@ -1,6 +1,7 @@
 #include "args.hpp"
 #include "gui_workflow.hpp"
 #include "image_io.hpp"
+#include "input_response.hpp"
 #include "mitsuba_backend.hpp"
 #include "neural_fusion.hpp"
 #include "photometric.hpp"
@@ -110,11 +111,15 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
                   << " radius=" << opt.sphere.radius << '\n';
     }
 
+    resolveInputResponses(opt);
+    std::cout << "Input response: " << inputResponseSummary(opt) << std::endl;
     const RunManifestContext runManifest = beginRunManifest(opt);
 
     reportStage(progress, "[1/6] Loading images...", 5);
     std::vector<cv::Mat> saturationMasks;
-    const std::vector<cv::Mat> images = loadLuminanceImages(opt.imagePaths, opt.srgb, &saturationMasks);
+    std::vector<cv::Mat> headroomWeights;
+    const std::vector<cv::Mat> images = loadLuminanceImages(opt, &saturationMasks,
+        !opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust ? &headroomWeights : nullptr);
     reportStage(progress, "[2/6] Loading mask...", 15);
     cv::Mat mask = loadMask(opt.maskPath, images[0].size());
     if (opt.hasCrop) {
@@ -240,9 +245,15 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
             residual,
             validMask,
             diagnostics,
-            saturationMasks);
+            saturationMasks,
+            headroomWeights);
         std::cout << "      light geometry condition number: "
                   << diagnostics.lightingConditionNumber << std::endl;
+        if (opt.solverMode == NormalSolverMode::Robust && diagnostics.robustNonconvergedFraction > 0.0) {
+            std::cout << "      robust fitting: " << (100.0 * diagnostics.robustNonconvergedFraction)
+                      << "% of solved pixels did not establish convergence within the solver safeguards"
+                      << std::endl;
+        }
         std::cout << "      solved mask coverage: "
                   << (100.0 * diagnostics.solvedFraction) << "%" << std::endl;
         if (diagnostics.solvedFraction < 0.10) {
@@ -253,8 +264,8 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
         if (opt.solverMode == NormalSolverMode::Robust && !diagnostics.robustFallbackMask.empty()) {
             const int fallbackPixels = cv::countNonZero(diagnostics.robustFallbackMask);
             if (fallbackPixels > 0) {
-                std::cout << "      robust fallback: " << fallbackPixels
-                          << " pixels had only three usable observations and used least squares" << std::endl;
+                std::cout << "      low redundancy: " << fallbackPixels
+                          << " pixels had only three effective observations; outlier separation is uncertain" << std::endl;
             }
         }
         geometryNormalMap = normalMap.clone();

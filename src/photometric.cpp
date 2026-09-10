@@ -1,4 +1,5 @@
 #include "photometric.hpp"
+#include "robust_fit.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -13,7 +14,6 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -561,17 +561,6 @@ void solveUncalibratedPcaFallback(
     reportProgress(progress, "Unknown lighting: done.");
 }
 
-struct RobustTriple {
-    std::array<int, 3> indices{};
-    double condition = std::numeric_limits<double>::infinity();
-};
-
-struct RobustCandidateScore {
-    int inliers = 0;
-    int tested = 0;
-    double loss = std::numeric_limits<double>::infinity();
-    bool valid = false;
-};
 
 struct RobustPixelResult {
     cv::Vec3d solution = cv::Vec3d(0.0, 0.0, 0.0);
@@ -587,85 +576,13 @@ struct RobustPixelResult {
 };
 
 struct RobustScratch {
-    std::vector<int> candidateIndices;
-    std::vector<unsigned char> candidateMask;
+    robust_fit::Workspace fit;
+    std::vector<float> headroom;
     std::vector<double> weights;
     std::vector<double> standardizedResiduals;
-    std::vector<double> absoluteResiduals;
-    std::vector<double> sortValues;
     std::vector<RobustObservationClass> classes;
 };
 
-bool solvePhotometricIndices(
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const int* indices,
-    size_t indexCount,
-    cv::Vec3d& solution) {
-    double a00 = 0.0;
-    double a01 = 0.0;
-    double a02 = 0.0;
-    double a11 = 0.0;
-    double a12 = 0.0;
-    double a22 = 0.0;
-    cv::Vec3d b(0.0, 0.0, 0.0);
-    for (size_t k = 0; k < indexCount; ++k) {
-        const int index = indices[k];
-        const cv::Vec3f light = lights[static_cast<size_t>(index)];
-        const double intensity = intensities[static_cast<size_t>(index)];
-        a00 += static_cast<double>(light[0]) * light[0];
-        a01 += static_cast<double>(light[0]) * light[1];
-        a02 += static_cast<double>(light[0]) * light[2];
-        a11 += static_cast<double>(light[1]) * light[1];
-        a12 += static_cast<double>(light[1]) * light[2];
-        a22 += static_cast<double>(light[2]) * light[2];
-        b[0] += static_cast<double>(light[0]) * intensity;
-        b[1] += static_cast<double>(light[1]) * intensity;
-        b[2] += static_cast<double>(light[2]) * intensity;
-    }
-    return solveSymmetric3x3(a00, a01, a02, a11, a12, a22, b, solution);
-}
-
-bool solvePhotometricSubset(
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const std::vector<int>& indices,
-    cv::Vec3d& solution) {
-    return solvePhotometricIndices(lights, intensities, indices.data(), indices.size(), solution);
-}
-
-bool solvePhotometricWeighted(
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const std::vector<double>& weights,
-    cv::Vec3d& solution) {
-    double a00 = 0.0;
-    double a01 = 0.0;
-    double a02 = 0.0;
-    double a11 = 0.0;
-    double a12 = 0.0;
-    double a22 = 0.0;
-    cv::Vec3d b(0.0, 0.0, 0.0);
-    int used = 0;
-    for (size_t i = 0; i < lights.size(); ++i) {
-        const double weight = weights[i];
-        if (!std::isfinite(intensities[i]) || weight <= 1.0e-8) {
-            continue;
-        }
-        const cv::Vec3f light = lights[i];
-        a00 += weight * static_cast<double>(light[0]) * light[0];
-        a01 += weight * static_cast<double>(light[0]) * light[1];
-        a02 += weight * static_cast<double>(light[0]) * light[2];
-        a11 += weight * static_cast<double>(light[1]) * light[1];
-        a12 += weight * static_cast<double>(light[1]) * light[2];
-        a22 += weight * static_cast<double>(light[2]) * light[2];
-        b[0] += weight * static_cast<double>(light[0]) * intensities[i];
-        b[1] += weight * static_cast<double>(light[1]) * intensities[i];
-        b[2] += weight * static_cast<double>(light[2]) * intensities[i];
-        ++used;
-    }
-    return used >= 3 && solveSymmetric3x3(a00, a01, a02, a11, a12, a22, b, solution);
-}
 
 double weightedLightConditionNumber(
     const std::vector<cv::Vec3f>& lights,
@@ -673,17 +590,15 @@ double weightedLightConditionNumber(
     cv::Matx33d gram = cv::Matx33d::zeros();
     int used = 0;
     for (size_t i = 0; i < lights.size(); ++i) {
-        if (weights[i] <= 0.05) {
+        if (weights[i] <= 0.0) {
             continue;
         }
         const double length = std::sqrt(static_cast<double>(lights[i].dot(lights[i])));
         if (!std::isfinite(length) || length <= 1.0e-8) {
             continue;
         }
-        const cv::Vec3d direction(
-            lights[i][0] / length,
-            lights[i][1] / length,
-            lights[i][2] / length);
+        // Preserve near-field attenuation: condition the same rows as the fit.
+        const cv::Vec3d direction(lights[i]);
         for (int row = 0; row < 3; ++row) {
             for (int col = 0; col < 3; ++col) {
                 gram(row, col) += weights[i] * direction[row] * direction[col];
@@ -710,242 +625,6 @@ double observationNoiseSigma(double observed, double predicted, double intensity
     return 0.0025 + 0.008 * std::sqrt(signal) + 0.003 * std::max(0.05, intensityScale);
 }
 
-RobustCandidateScore scoreRobustCandidate(
-    const cv::Vec3d& solution,
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const std::vector<unsigned char>& definiteSaturation,
-    double shadowThreshold,
-    double intensityScale) {
-    RobustCandidateScore score;
-    const double rho = std::sqrt(solution.dot(solution));
-    if (!std::isfinite(rho) || rho <= 1.0e-8 || solution[2] <= 0.0) {
-        return score;
-    }
-
-    score.loss = 0.0;
-    for (size_t i = 0; i < lights.size(); ++i) {
-        const double observed = intensities[i];
-        if (!std::isfinite(observed)) {
-            continue;
-        }
-        const double linearPrediction = cv::Vec3d(lights[i][0], lights[i][1], lights[i][2]).dot(solution);
-        const double predicted = std::max(0.0, linearPrediction);
-        const double sigma = observationNoiseSigma(observed, predicted, intensityScale);
-        if (definiteSaturation[i] != 0) {
-            if (predicted + 3.5 * sigma < observed) {
-                const double z = (observed - predicted) / sigma;
-                score.loss += std::log1p(std::min(100.0, z * z));
-            }
-            continue;
-        }
-        if (observed <= shadowThreshold) {
-            continue;
-        }
-
-        ++score.tested;
-        const double z = (observed - predicted) / sigma;
-        if (std::abs(z) <= 3.5) {
-            ++score.inliers;
-        }
-        score.loss += std::log1p(std::min(100.0, z * z));
-    }
-    score.valid = score.tested >= 3;
-    return score;
-}
-
-bool betterRobustCandidate(
-    const RobustCandidateScore& candidate,
-    const RobustCandidateScore& current) {
-    if (!candidate.valid) {
-        return false;
-    }
-    if (!current.valid || candidate.inliers != current.inliers) {
-        return candidate.inliers > current.inliers;
-    }
-    return candidate.loss < current.loss;
-}
-
-std::vector<RobustTriple> buildRobustTriples(const std::vector<cv::Vec3f>& lights) {
-    constexpr size_t kMaximumHypotheses = 64;
-    constexpr double kMaximumTripleCondition = 80.0;
-    const int count = static_cast<int>(lights.size());
-    std::vector<RobustTriple> candidates;
-    std::set<std::array<int, 3>> unique;
-
-    auto addCandidate = [&](int a, int b, int c) {
-        std::array<int, 3> indices{a, b, c};
-        std::sort(indices.begin(), indices.end());
-        if (indices[0] == indices[1] || indices[1] == indices[2] || !unique.insert(indices).second) {
-            return;
-        }
-        const std::vector<cv::Vec3f> tripleLights{
-            lights[static_cast<size_t>(indices[0])],
-            lights[static_cast<size_t>(indices[1])],
-            lights[static_cast<size_t>(indices[2])]};
-        const double condition = lightConditionNumber(tripleLights);
-        if (std::isfinite(condition) && condition <= kMaximumTripleCondition) {
-            candidates.push_back({indices, condition});
-        }
-    };
-
-    if (count <= 25) {
-        for (int a = 0; a < count - 2; ++a) {
-            for (int b = a + 1; b < count - 1; ++b) {
-                for (int c = b + 1; c < count; ++c) {
-                    addCandidate(a, b, c);
-                }
-            }
-        }
-    } else {
-        std::vector<int> azimuthOrder(static_cast<size_t>(count));
-        std::iota(azimuthOrder.begin(), azimuthOrder.end(), 0);
-        std::sort(azimuthOrder.begin(), azimuthOrder.end(), [&](int a, int b) {
-            return std::atan2(lights[static_cast<size_t>(a)][1], lights[static_cast<size_t>(a)][0]) <
-                std::atan2(lights[static_cast<size_t>(b)][1], lights[static_cast<size_t>(b)][0]);
-        });
-        const int anchors = std::min(count, 48);
-        for (int i = 0; i < anchors; ++i) {
-            const int p = (i * count) / anchors;
-            for (int jitter = -2; jitter <= 2; ++jitter) {
-                const int q = (p + count / 3 + jitter + count) % count;
-                const int r = (p + (2 * count) / 3 - jitter + count) % count;
-                addCandidate(
-                    azimuthOrder[static_cast<size_t>(p)],
-                    azimuthOrder[static_cast<size_t>(q)],
-                    azimuthOrder[static_cast<size_t>(r)]);
-            }
-        }
-
-        std::uint32_t state = 0x9e3779b9U ^ static_cast<std::uint32_t>(count);
-        for (int attempt = 0; attempt < 4096 && candidates.size() < 4 * kMaximumHypotheses; ++attempt) {
-            state = 1664525U * state + 1013904223U;
-            const int a = static_cast<int>(state % static_cast<std::uint32_t>(count));
-            state = 1664525U * state + 1013904223U;
-            const int b = static_cast<int>(state % static_cast<std::uint32_t>(count));
-            state = 1664525U * state + 1013904223U;
-            const int c = static_cast<int>(state % static_cast<std::uint32_t>(count));
-            addCandidate(a, b, c);
-        }
-    }
-
-    if (candidates.size() <= kMaximumHypotheses) {
-        return candidates;
-    }
-
-    std::vector<RobustTriple> selected;
-    selected.reserve(kMaximumHypotheses);
-    std::vector<int> useCount(static_cast<size_t>(count), 0);
-    std::vector<unsigned char> used(candidates.size(), 0);
-    while (selected.size() < kMaximumHypotheses) {
-        size_t best = candidates.size();
-        double bestScore = std::numeric_limits<double>::infinity();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            if (used[i] != 0) {
-                continue;
-            }
-            const auto& indices = candidates[i].indices;
-            const double balancePenalty = 0.18 * static_cast<double>(
-                useCount[static_cast<size_t>(indices[0])] +
-                useCount[static_cast<size_t>(indices[1])] +
-                useCount[static_cast<size_t>(indices[2])]);
-            const double candidateScore = std::log(candidates[i].condition) + balancePenalty;
-            if (candidateScore < bestScore) {
-                bestScore = candidateScore;
-                best = i;
-            }
-        }
-        if (best == candidates.size()) {
-            break;
-        }
-        used[best] = 1;
-        selected.push_back(candidates[best]);
-        for (const int index : candidates[best].indices) {
-            ++useCount[static_cast<size_t>(index)];
-        }
-    }
-    return selected;
-}
-
-bool chooseInitialRobustSolution(
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const std::vector<unsigned char>& definiteSaturation,
-    const std::vector<RobustTriple>& triples,
-    double shadowThreshold,
-    double probableSaturationThreshold,
-    double intensityScale,
-    RobustScratch& scratch,
-    cv::Vec3d& solution) {
-    scratch.candidateIndices.clear();
-    int belowProbableSaturation = 0;
-    for (size_t i = 0; i < intensities.size(); ++i) {
-        if (std::isfinite(intensities[i]) && intensities[i] > shadowThreshold && definiteSaturation[i] == 0 &&
-            intensities[i] < probableSaturationThreshold) {
-            ++belowProbableSaturation;
-        }
-    }
-    const bool omitProbableSaturation = belowProbableSaturation >= 3;
-    for (size_t i = 0; i < intensities.size(); ++i) {
-        if (!std::isfinite(intensities[i]) || intensities[i] <= shadowThreshold || definiteSaturation[i] != 0) {
-            continue;
-        }
-        if (omitProbableSaturation && intensities[i] >= probableSaturationThreshold) {
-            continue;
-        }
-        scratch.candidateIndices.push_back(static_cast<int>(i));
-    }
-    if (scratch.candidateIndices.size() < 3) {
-        return false;
-    }
-
-    RobustCandidateScore bestScore;
-    if (solvePhotometricSubset(lights, intensities, scratch.candidateIndices, solution)) {
-        bestScore = scoreRobustCandidate(
-            solution,
-            lights,
-            intensities,
-            definiteSaturation,
-            shadowThreshold,
-            intensityScale);
-        if (bestScore.valid && bestScore.inliers == bestScore.tested) {
-            return true;
-        }
-    }
-
-    scratch.candidateMask.assign(intensities.size(), 0);
-    for (const int index : scratch.candidateIndices) {
-        scratch.candidateMask[static_cast<size_t>(index)] = 1;
-    }
-    for (const RobustTriple& triple : triples) {
-        if (scratch.candidateMask[static_cast<size_t>(triple.indices[0])] == 0 ||
-            scratch.candidateMask[static_cast<size_t>(triple.indices[1])] == 0 ||
-            scratch.candidateMask[static_cast<size_t>(triple.indices[2])] == 0) {
-            continue;
-        }
-        cv::Vec3d candidateSolution;
-        if (!solvePhotometricIndices(
-                lights,
-                intensities,
-                triple.indices.data(),
-                triple.indices.size(),
-                candidateSolution)) {
-            continue;
-        }
-        const RobustCandidateScore candidateScore = scoreRobustCandidate(
-            candidateSolution,
-            lights,
-            intensities,
-            definiteSaturation,
-            shadowThreshold,
-            intensityScale);
-        if (betterRobustCandidate(candidateScore, bestScore)) {
-            bestScore = candidateScore;
-            solution = candidateSolution;
-        }
-    }
-    return bestScore.valid;
-}
 
 double halfVectorAlignment(
     const cv::Vec3d& normal,
@@ -966,314 +645,76 @@ double halfVectorAlignment(
     return std::clamp(normal.dot(halfVector / halfLength), 0.0, 1.0);
 }
 
-bool recenterRobustAlbedo(
-    cv::Vec3d& solution,
-    const std::vector<cv::Vec3f>& lights,
-    const std::vector<float>& intensities,
-    const std::vector<unsigned char>& definiteSaturation,
-    double shadowThreshold,
-    RobustScratch& scratch) {
-    const double currentAlbedo = std::sqrt(solution.dot(solution));
-    if (!std::isfinite(currentAlbedo) || currentAlbedo <= 1.0e-8 || solution[2] <= 0.0) {
-        return false;
-    }
-    const cv::Vec3d normal = solution / currentAlbedo;
-    scratch.sortValues.clear();
-    for (size_t i = 0; i < lights.size(); ++i) {
-        if (!std::isfinite(intensities[i]) || intensities[i] <= shadowThreshold || definiteSaturation[i] != 0) {
-            continue;
-        }
-        const double cosine = cv::Vec3d(lights[i][0], lights[i][1], lights[i][2]).dot(normal);
-        if (cosine > 0.10) {
-            scratch.sortValues.push_back(intensities[i] / cosine);
-        }
-    }
-    if (scratch.sortValues.size() < 3) {
-        return false;
-    }
-    std::sort(scratch.sortValues.begin(), scratch.sortValues.end());
-    const size_t windowSize = std::max<size_t>(3, scratch.sortValues.size() / 2 + 1);
-    size_t bestFirst = 0;
-    double bestRelativeWidth = std::numeric_limits<double>::infinity();
-    for (size_t first = 0; first + windowSize <= scratch.sortValues.size(); ++first) {
-        const size_t last = first + windowSize - 1;
-        const double center = 0.5 * (scratch.sortValues[first] + scratch.sortValues[last]);
-        const double relativeWidth =
-            (scratch.sortValues[last] - scratch.sortValues[first]) / std::max(0.02, center);
-        if (relativeWidth < bestRelativeWidth) {
-            bestRelativeWidth = relativeWidth;
-            bestFirst = first;
-        }
-    }
-    const double albedo = scratch.sortValues[bestFirst + windowSize / 2];
-    if (!std::isfinite(albedo) || albedo <= 1.0e-8) {
-        return false;
-    }
-    solution = normal * albedo;
-    return true;
-}
-
-bool classifyAndWeightRobustObservations(
+void classifyRobustObservations(
     const cv::Vec3d& solution,
     const std::vector<cv::Vec3f>& lights,
     const std::vector<float>& intensities,
     const std::vector<unsigned char>& definiteSaturation,
-    const std::vector<int>& azimuthPredecessor,
-    const std::vector<int>& azimuthSuccessor,
     double shadowThreshold,
-    double probableSaturationThreshold,
     double intensityScale,
     const cv::Vec3f& viewDirection,
     RobustScratch& scratch) {
     const size_t count = intensities.size();
-    const double rho = std::sqrt(solution.dot(solution));
-    if (!std::isfinite(rho) || rho <= 1.0e-8 || solution[2] <= 0.0) {
-        return false;
-    }
-    const cv::Vec3d normal = solution / rho;
-
-    scratch.absoluteResiduals.clear();
+    const cv::Vec3d normal = solution / cv::norm(solution);
+    scratch.weights = scratch.fit.reliability;
+    scratch.classes.assign(count, RobustObservationClass::Unusable);
     scratch.standardizedResiduals.assign(count, 0.0);
     for (size_t i = 0; i < count; ++i) {
         const double observed = intensities[i];
-        if (!std::isfinite(observed) || definiteSaturation[i] != 0 || observed <= shadowThreshold) {
-            continue;
-        }
-        const double linearPrediction = cv::Vec3d(lights[i][0], lights[i][1], lights[i][2]).dot(solution);
-        if (linearPrediction <= 0.0) {
-            continue;
-        }
-        scratch.absoluteResiduals.push_back(std::abs(observed - linearPrediction));
-    }
-    scratch.sortValues = scratch.absoluteResiduals;
-    const double medianAbsoluteResidual = medianValue(scratch.sortValues);
-    const double noiseFloor = observationNoiseSigma(intensityScale, intensityScale, intensityScale);
-    const double scaleCap = std::max(0.015, 0.05 * std::max(0.1, intensityScale));
-    const double robustScale = std::clamp(
-        medianAbsoluteResidual / 0.6745,
-        noiseFloor,
-        scaleCap);
-
-    for (size_t i = 0; i < count; ++i) {
-        const double observed = intensities[i];
-        if (!std::isfinite(observed)) {
-            scratch.standardizedResiduals[i] = 0.0;
-            continue;
-        }
-        const double linearPrediction = cv::Vec3d(lights[i][0], lights[i][1], lights[i][2]).dot(solution);
+        if (!std::isfinite(observed)) continue;
+        const double linearPrediction = cv::Vec3d(lights[i]).dot(solution);
         const double predicted = std::max(0.0, linearPrediction);
-        const double observationSigma = observationNoiseSigma(observed, predicted, intensityScale);
-        const double sigma = std::sqrt(robustScale * robustScale + observationSigma * observationSigma);
-        scratch.standardizedResiduals[i] = (observed - predicted) / sigma;
-    }
-
-    scratch.weights.assign(count, 0.0);
-    scratch.classes.assign(count, RobustObservationClass::Unusable);
-    int usableWeights = 0;
-    for (size_t i = 0; i < count; ++i) {
-        const double observed = intensities[i];
-        if (!std::isfinite(observed)) {
-            continue;
-        }
-        const double linearPrediction = cv::Vec3d(lights[i][0], lights[i][1], lights[i][2]).dot(solution);
-        const double predicted = std::max(0.0, linearPrediction);
-        const double z = scratch.standardizedResiduals[i];
-        const double observationSigma = observationNoiseSigma(observed, predicted, intensityScale);
-        const double materialDeviation = std::max(0.012, 0.12 * predicted);
-        const double significantDeviation = std::max(materialDeviation, 4.0 * observationSigma);
-        const double halfAlignment = halfVectorAlignment(normal, lights[i], viewDirection);
-        if (definiteSaturation[i] != 0) {
+        const double sigma = observationNoiseSigma(observed, predicted, intensityScale);
+        const cv::Vec3d light(lights[i]);
+        const double predictionVariance = std::max(0.0, light.dot(scratch.fit.covariance * light));
+        const double shadowSigma = std::sqrt(sigma * sigma + predictionVariance);
+        const double difference = observed - predicted;
+        scratch.standardizedResiduals[i] = difference / sigma;
+        if (definiteSaturation[i]) {
             scratch.classes[i] = RobustObservationClass::Saturated;
             continue;
         }
+        const double significantDeviation = std::max({0.012, 0.12 * predicted, 3.5 * sigma});
+        const double significantShadow = std::max({0.012, 0.12 * predicted, 3.5 * shadowSigma});
         if (observed <= shadowThreshold) {
-            if (linearPrediction <= 0.0 ||
-                (predicted - observed > significantDeviation && observed < 0.55 * predicted)) {
+            if (linearPrediction < -0.5 * std::sqrt(predictionVariance) ||
+                (-difference > significantShadow && observed < 0.55 * predicted)) {
                 scratch.classes[i] = RobustObservationClass::Shadow;
             }
             continue;
         }
-        if (linearPrediction <= 0.0) {
-            scratch.classes[i] = halfAlignment > 0.95 && observed > significantDeviation
-                ? RobustObservationClass::Highlight
-                : RobustObservationClass::OtherOutlier;
-            continue;
-        }
-
-        double shadowCutoff = 4.0;
-        double highlightCutoff = 4.0;
-        if (count >= 5 && azimuthPredecessor.size() == count && azimuthSuccessor.size() == count) {
-            const double previous = scratch.standardizedResiduals[static_cast<size_t>(azimuthPredecessor[i])];
-            const double next = scratch.standardizedResiduals[static_cast<size_t>(azimuthSuccessor[i])];
-            if (z < 0.0 && (previous < -2.0 || next < -2.0)) {
-                shadowCutoff = 3.5;
-            }
-            if (z > 0.0 && (previous > 2.0 || next > 2.0)) {
-                highlightCutoff = 3.5;
-            }
-        }
-        if (z > 2.0 && halfAlignment > 0.96) {
-            highlightCutoff = std::min(highlightCutoff, 3.25);
-        }
-        if (observed >= probableSaturationThreshold && z > 2.0) {
-            highlightCutoff = std::min(highlightCutoff, 2.5);
-        }
-
-        if (z < -shadowCutoff && predicted - observed > materialDeviation) {
-            scratch.classes[i] = observed < 0.55 * predicted
-                ? RobustObservationClass::Shadow
-                : RobustObservationClass::OtherOutlier;
-            continue;
-        }
-        if (z > highlightCutoff && observed - predicted > materialDeviation) {
-            if (halfAlignment > 0.94) {
-                scratch.classes[i] = RobustObservationClass::Highlight;
-            } else {
-                scratch.classes[i] = RobustObservationClass::OtherOutlier;
-            }
-            continue;
-        }
-
-        constexpr double kCauchyTuning = 2.3849;
-        const double scaled = z / kCauchyTuning;
-        double weight = 1.0 / (1.0 + scaled * scaled);
-        if (z > 1.5 && halfAlignment > 0.92) {
-            const double cue = std::clamp((halfAlignment - 0.92) / 0.08, 0.0, 1.0);
-            weight *= 1.0 - 0.65 * cue;
-        }
-        scratch.weights[i] = weight;
-        scratch.classes[i] = RobustObservationClass::Inlier;
-        if (weight > 0.05) {
-            ++usableWeights;
+        // Labels are diagnostics only. Neither half-vector agreement nor the
+        // discontinuous label thresholds modify the fitted normal or weights.
+        if (-difference > significantShadow && observed < 0.55 * predicted) {
+            scratch.classes[i] = RobustObservationClass::Shadow;
+        } else if (difference > significantDeviation && halfVectorAlignment(normal, lights[i], viewDirection) > 0.90) {
+            scratch.classes[i] = RobustObservationClass::Highlight;
+        } else if (scratch.weights[i] < 0.25 && std::abs(difference) > significantDeviation) {
+            scratch.classes[i] = RobustObservationClass::OtherOutlier;
+        } else {
+            scratch.classes[i] = RobustObservationClass::Inlier;
         }
     }
-    return usableWeights >= 3;
 }
 
 bool solveRobustPixel(
     const std::vector<cv::Vec3f>& lights,
     const std::vector<float>& intensities,
     const std::vector<unsigned char>& definiteSaturation,
-    const std::vector<RobustTriple>& triples,
-    const std::vector<int>& azimuthPredecessor,
-    const std::vector<int>& azimuthSuccessor,
     double shadowThreshold,
     double probableSaturationThreshold,
     const cv::Vec3f& viewDirection,
     RobustScratch& scratch,
     RobustPixelResult& result) {
-    scratch.sortValues.clear();
-    for (const float intensity : intensities) {
-        if (std::isfinite(intensity) && intensity > shadowThreshold) {
-            scratch.sortValues.push_back(intensity);
-        }
-    }
-    if (scratch.sortValues.size() < 3) {
-        return false;
-    }
-    const double intensityScale = std::max(0.02, medianValue(scratch.sortValues));
-
     cv::Vec3d solution;
-    if (!chooseInitialRobustSolution(
-            lights,
-            intensities,
-            definiteSaturation,
-            triples,
-            shadowThreshold,
-            probableSaturationThreshold,
-            intensityScale,
-            scratch,
-            solution)) {
-        return false;
-    }
-    if (!recenterRobustAlbedo(
-            solution,
-            lights,
-            intensities,
-            definiteSaturation,
-            shadowThreshold,
-            scratch)) {
-        return false;
-    }
+    if (!robust_fit::fit(lights, intensities, definiteSaturation, shadowThreshold,
+            probableSaturationThreshold, scratch.fit, solution,
+            scratch.headroom.empty() ? nullptr : &scratch.headroom)) return false;
+    const double intensityScale = std::max(0.02, scratch.fit.signalReference);
+    classifyRobustObservations(solution, lights, intensities, definiteSaturation,
+        shadowThreshold, intensityScale, viewDirection, scratch);
 
-    for (int iteration = 0; iteration < 10; ++iteration) {
-        if (!classifyAndWeightRobustObservations(
-                solution,
-                lights,
-                intensities,
-                definiteSaturation,
-                azimuthPredecessor,
-                azimuthSuccessor,
-                shadowThreshold,
-                probableSaturationThreshold,
-                intensityScale,
-                viewDirection,
-                scratch)) {
-            return false;
-        }
-        cv::Vec3d next;
-        if (!solvePhotometricWeighted(lights, intensities, scratch.weights, next)) {
-            return false;
-        }
-        if (!recenterRobustAlbedo(
-                next,
-                lights,
-                intensities,
-                definiteSaturation,
-                shadowThreshold,
-                scratch)) {
-            return false;
-        }
-        const double change = std::sqrt((next - solution).dot(next - solution));
-        const double reference = std::max(1.0e-8, std::sqrt(solution.dot(solution)));
-        solution = next;
-        if (change / reference < 1.0e-4) {
-            break;
-        }
-    }
-
-    if (!classifyAndWeightRobustObservations(
-            solution,
-            lights,
-            intensities,
-            definiteSaturation,
-            azimuthPredecessor,
-            azimuthSuccessor,
-            shadowThreshold,
-            probableSaturationThreshold,
-            intensityScale,
-            viewDirection,
-            scratch)) {
-        return false;
-    }
-    if (!solvePhotometricWeighted(lights, intensities, scratch.weights, solution)) {
-        return false;
-    }
-    if (!recenterRobustAlbedo(
-            solution,
-            lights,
-            intensities,
-            definiteSaturation,
-            shadowThreshold,
-            scratch)) {
-        return false;
-    }
-    if (!classifyAndWeightRobustObservations(
-            solution,
-            lights,
-            intensities,
-            definiteSaturation,
-            azimuthPredecessor,
-            azimuthSuccessor,
-            shadowThreshold,
-            probableSaturationThreshold,
-            intensityScale,
-            viewDirection,
-            scratch)) {
-        return false;
-    }
-
-    result.localCondition = weightedLightConditionNumber(lights, scratch.weights);
+    result.localCondition = weightedLightConditionNumber(lights, scratch.fit.coefficients);
     if (!std::isfinite(result.localCondition) || result.localCondition > 100.0) {
         return false;
     }
@@ -1302,11 +743,11 @@ bool solveRobustPixel(
         squaredError += difference * difference;
         ++residualCount;
         weightSum += scratch.weights[i];
+        if (scratch.weights[i] > 0.05 && observed > shadowThreshold && predicted > 0.0) {
+            ++result.inlierCount;
+        }
         switch (scratch.classes[i]) {
         case RobustObservationClass::Inlier:
-            if (scratch.weights[i] > 0.05) {
-                ++result.inlierCount;
-            }
             break;
         case RobustObservationClass::Shadow:
             ++result.shadowCount;
@@ -1338,28 +779,6 @@ bool solveRobustPixel(
     return result.inlierCount >= 3;
 }
 
-void buildAzimuthNeighbors(
-    const std::vector<cv::Vec3f>& lights,
-    std::vector<int>& predecessor,
-    std::vector<int>& successor) {
-    const size_t count = lights.size();
-    predecessor.assign(count, 0);
-    successor.assign(count, 0);
-    if (count < 2) {
-        return;
-    }
-    std::vector<int> order(count);
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return std::atan2(lights[static_cast<size_t>(a)][1], lights[static_cast<size_t>(a)][0]) <
-            std::atan2(lights[static_cast<size_t>(b)][1], lights[static_cast<size_t>(b)][0]);
-    });
-    for (size_t i = 0; i < count; ++i) {
-        const int index = order[i];
-        predecessor[static_cast<size_t>(index)] = order[(i + count - 1) % count];
-        successor[static_cast<size_t>(index)] = order[(i + 1) % count];
-    }
-}
 
 } // namespace
 
@@ -1680,7 +1099,8 @@ void solvePhotometricStereo(
     cv::Mat& residual,
     cv::Mat& validMask,
     PhotometricDiagnostics& diagnostics,
-    const std::vector<cv::Mat>& saturationMasks) {
+    const std::vector<cv::Mat>& saturationMasks,
+    const std::vector<cv::Mat>& headroomWeights) {
     const int n = static_cast<int>(images.size());
     if (n < 3) {
         die("Photometric stereo requires at least 3 images.");
@@ -1708,6 +1128,14 @@ void solvePhotometricStereo(
         for (const cv::Mat& saturationMask : saturationMasks) {
             if (saturationMask.size() != images.front().size() || saturationMask.type() != CV_8U) {
                 die("Saturation masks must match the images and use 8-bit values.");
+            }
+        }
+    }
+    if (!headroomWeights.empty()) {
+        if (headroomWeights.size() != images.size()) die("Sensor reliability count must match image count.");
+        for (const cv::Mat& weights : headroomWeights) {
+            if (!weights.empty() && (weights.size() != images.front().size() || weights.type() != CV_8U)) {
+                die("Sensor reliability maps must be matching 8-bit images or empty (unit reliability).");
             }
         }
     }
@@ -1745,12 +1173,6 @@ void solvePhotometricStereo(
         die("Light directions are rank-deficient or too ill-conditioned for a reliable normal solve.");
     }
 
-    const std::vector<RobustTriple> robustTriples = solverMode == NormalSolverMode::Robust
-        ? buildRobustTriples(conditionLights)
-        : std::vector<RobustTriple>{};
-    std::vector<int> azimuthPredecessor;
-    std::vector<int> azimuthSuccessor;
-    buildAzimuthNeighbors(conditionLights, azimuthPredecessor, azimuthSuccessor);
 
     normalMap = cv::Mat(rows, cols, CV_32FC3, cv::Scalar(0, 0, 0));
     albedo = cv::Mat(rows, cols, CV_32F, cv::Scalar(0));
@@ -1794,7 +1216,11 @@ void solvePhotometricStereo(
         }
     }
 
+    diagnostics.robustMeanIterations = 0.0;
+    diagnostics.robustNonconvergedFraction = 0.0;
     if (solverMode == NormalSolverMode::Robust) {
+        std::vector<std::uint64_t> iterationsByRow(rows, 0);
+        std::vector<std::uint64_t> limitedByRow(rows, 0);
         cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& rowRange) {
             std::vector<const float*> imageRows(images.size());
             std::vector<const uchar*> saturationRows(images.size(), nullptr);
@@ -1804,12 +1230,9 @@ void solvePhotometricStereo(
                 ? lights
                 : std::vector<cv::Vec3f>(images.size());
             RobustScratch scratch;
-            scratch.candidateIndices.reserve(images.size());
-            scratch.candidateMask.reserve(images.size());
+            if (!headroomWeights.empty()) scratch.headroom.resize(images.size());
             scratch.weights.reserve(images.size());
             scratch.standardizedResiduals.reserve(images.size());
-            scratch.absoluteResiduals.reserve(images.size());
-            scratch.sortValues.reserve(images.size());
             scratch.classes.reserve(images.size());
 
             for (int y = rowRange.start; y < rowRange.end; ++y) {
@@ -1857,6 +1280,10 @@ void solvePhotometricStereo(
                     }
                     for (int i = 0; i < n; ++i) {
                         intensities[static_cast<size_t>(i)] = imageRows[static_cast<size_t>(i)][x];
+                        if (!headroomWeights.empty()) {
+                            scratch.headroom[i] = headroomWeights[i].empty() ? 1.0f :
+                                headroomWeights[i].ptr<uchar>(y)[x] / 255.0f;
+                        }
                         definiteSaturation[static_cast<size_t>(i)] =
                             saturationRows[static_cast<size_t>(i)] != nullptr &&
                                 saturationRows[static_cast<size_t>(i)][x] != 0
@@ -1898,9 +1325,6 @@ void solvePhotometricStereo(
                             pixelLights,
                             intensities,
                             definiteSaturation,
-                            robustTriples,
-                            azimuthPredecessor,
-                            azimuthSuccessor,
                             shadowThreshold,
                             highOutlierThreshold,
                             viewDirection,
@@ -1910,6 +1334,8 @@ void solvePhotometricStereo(
                         continue;
                     }
 
+                    iterationsByRow[y] += static_cast<std::uint64_t>(scratch.fit.iterations);
+                    limitedByRow[y] += scratch.fit.converged ? 0 : 1;
                     const float rho = static_cast<float>(std::sqrt(pixelResult.solution.dot(pixelResult.solution)));
                     normalRow[x] = cv::Vec3f(
                         static_cast<float>(pixelResult.solution[0]) / rho,
@@ -1973,6 +1399,12 @@ void solvePhotometricStereo(
 
         const int solvedPixels = cv::countNonZero(validMask);
         diagnostics.solvedFraction = static_cast<double>(solvedPixels) / static_cast<double>(maskPixels);
+        if (solvedPixels > 0) {
+            diagnostics.robustMeanIterations = static_cast<double>(
+                std::accumulate(iterationsByRow.begin(), iterationsByRow.end(), std::uint64_t(0))) / solvedPixels;
+            diagnostics.robustNonconvergedFraction = static_cast<double>(
+                std::accumulate(limitedByRow.begin(), limitedByRow.end(), std::uint64_t(0))) / solvedPixels;
+        }
         const int minimumSolvedPixels = std::min(maskPixels, 16);
         if (solvedPixels < minimumSolvedPixels || diagnostics.solvedFraction < 0.001) {
             die("Too few masked pixels had at least three reliable, well-conditioned observations for a normal solve.");
