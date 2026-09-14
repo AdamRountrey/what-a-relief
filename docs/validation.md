@@ -1,5 +1,55 @@
 # Validation and Release Gates
 
+## v0.2.7 Release Qualification
+
+The September 14 production `0.2.7` Release build passed all nine CTest
+suites in 20.51 seconds: GUI lifecycle, project IO, input response,
+photometric core, IO exports, Mitsuba backend contract, calibrated workflow,
+neural workflow, and uncalibrated workflow. The direct MSVC production
+executable was rebuilt with the same `0.2.7` version stamp and packaged with
+its vcpkg runtime DLLs and license notices.
+
+The main installer passed its built-in self-extraction checks. An independently
+extracted installer payload completed the calibrated end-to-end fixture with
+checked normal, height, mesh, RTI, and manifest products; its manifest reported
+`complete`, application version `0.2.7`, and solved fraction `1`. The portable
+archive passed its explicit runtime/model/document whitelist and contained the
+same executable bytes as the production build and installer payload.
+
+The optional backend package passed 17 worker numerical tests, the network-share
+progress fallback, remote-safe preview writing, real CPU shadow-derivative
+checks for directional and near-field emitters, the positive tilt-recovery
+test with iteration 5/final previews, the already-correct rejection guard, and
+an extracted-payload LLVM CPU probe. CUDA was available on the build machine;
+these packaging checks do not claim general reconstruction accuracy.
+
+## Persistent Project Workflow
+
+`project-io` round-trips a production manifest and original interactive specimen
+selection. It checks ordered images, calibration fallback, ring geometry,
+scale, crop/sphere, response mode, height/print/RTI/inverse options, moved folder
+layouts, explicit legacy-mask warnings, and unused output destinations.
+Incomplete, unknown-schema, malformed, duplicate-input, and missing-input
+projects must fail. Project JSON must not restore Python executable or worker
+script overrides. Loading must not create a rerun directory, modify the old
+run, or promote the height mask into the normal-solve mask.
+
+On Windows, `gui-lifecycle` drives a hidden native window with a fake processor.
+It checks completion without closing the window, a second run with preserved
+old output, recovery after a processing error, cancel without exit, new-project
+reset, and deferred exit during processing. It checks that New/Start commands
+cannot mutate inputs or reenter the live solve. It also exercises the background
+worker, post-run Advanced page visibility and stacking, a provisional preview,
+and stage ETA reset/countdown behavior. Row-progress tests check monotonic counts,
+cancellation propagation, and bit-identical normal/albedo results with monitoring
+enabled. Mitsuba numerical tests check preview normal axes and XY spacing; the
+network progress test checks optional iteration/ETA metadata. The real CPU tilt
+recovery test enables previews on one run and checks iterations 5/final while
+retaining the existing geometry-improvement and rejection gates. The real photometric algorithms
+remain covered by the existing scientific and end-to-end tests. These UI tests
+do not establish new reconstruction accuracy or constant-time cancellation;
+cancellation still occurs at processing checkpoints.
+
 ## v0.2.6 Release Qualification
 
 The September 10 local non-dev `0.2.6` Release build passed all seven CTest
@@ -296,7 +346,7 @@ every combination below has an automated gate.
 - **Rejected versus accepted outputs:** Force a finite rejected correction and require `accepted:false`, unchanged guarded inverse height, zero guarded correction, matching baseline material outputs, and a distinct candidate height equal to baseline plus correction. Accepted runs must not create an extra candidate directory. Nonfinite supported candidate geometry must not be exported.
 - **Artifact contract and provenance:** Verify every file in the [candidate file list](../tools/mitsuba_backend/README.md#rejected-candidate-outputs-and-review), conditional manifest/output checks, candidate export status, matching rejection metrics and selected iteration, `accepted:false` in `candidate.json`, and the PLY warning. Keep absent/skipped validation distinct from a passing metric.
 - **Geometry and preview semantics:** Use finite synthetic planes/bumps with a datum offset, mask holes, non-square dimensions, resampling, and nonunit `height_scale`. Check height/correction pixel units, PLY XY/Z conventions, height-derived normals, shared-range review height previews, and shared-range root renders. `render_after.png` must still represent the candidate on rejection, not the guarded baseline.
-- **Offline review and GUI consent:** Open the report without a server or network dependency; exercise baseline/candidate/both and product selectors. Candidate links must start hidden, appear after failed-validation acknowledgement, and resolve with the completed output folder relocated. Escape rejection text safely. Verify the GUI open-report prompt defaults to No and that opening, acknowledgement, and file access never change acceptance or default outputs.
+- **Offline review and GUI consent:** Open the report without a server or network dependency; exercise baseline/candidate/both and product selectors. Candidate links must start hidden, appear after failed-validation acknowledgement, and resolve with the completed output folder relocated. Escape rejection text safely. Verify File > Review Inverse Candidate is available only when a report exists and that opening, acknowledgement, and file access never change acceptance or default outputs.
 - **Reruns and partial exports:** Exercise rejected-to-accepted and repeated rejected runs in the same output folder, with no stale candidate/report advertised. Inject export failures to ensure partial candidate files are not presented as a complete result. Retention is per run, not an archive.
 
 These tests can use small arrays, mocked worker decisions, and fake-process

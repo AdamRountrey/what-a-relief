@@ -6,6 +6,7 @@ The current Windows runtime package is built from vcpkg's `x64-windows` triplet 
 
 | Component | Bundled runtime files | License or notice source |
 | --- | --- | --- |
+| JSON for Modern C++ (nlohmann/json) | Header-only code compiled into the executable; no extra DLL | MIT; `share/nlohmann-json/copyright` |
 | OpenCV 4 | `opencv_*.dll` | Apache-2.0 plus OpenCV third-party notices |
 | Abseil | `abseil_dll.dll` | Apache-2.0 |
 | Protocol Buffers | `libprotobuf*.dll`, `libprotoc.dll` | BSD-style Google license |

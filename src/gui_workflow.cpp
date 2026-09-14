@@ -6,6 +6,8 @@
 #include "mask_ui.hpp"
 #include "mitsuba_backend.hpp"
 #include "photometric.hpp"
+#include "project_io.hpp"
+#include "relight_ui.hpp"
 #include "scale_ui.hpp"
 #include "sphere_ui.hpp"
 
@@ -16,6 +18,9 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#ifdef _MSC_VER
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#endif
 #endif
 
 #include <algorithm>
@@ -26,6 +31,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <future>
+#include <iomanip>
+#include <memory>
+#include <mutex>
+#include <opencv2/imgproc.hpp>
 
 namespace fs = std::filesystem;
 
@@ -41,7 +54,7 @@ constexpr size_t kMaxNeuralImages = 25;
 #ifdef _WIN32
 
 constexpr int kWindowWidth = 740;
-constexpr int kWindowHeight = 640;
+constexpr int kWindowHeight = 780;
 constexpr int kMargin = 20;
 constexpr int kLabelWidth = 150;
 constexpr int kControlX = 180;
@@ -103,19 +116,62 @@ constexpr int kIdMitsubaBackend = 1045;
 constexpr int kIdMitsubaQuality = 1046;
 constexpr int kIdSelectMitsubaPython = 1047;
 constexpr int kIdMitsubaStatus = 1048;
-constexpr int kIdProgressCancel = 1049;
 constexpr int kIdShadowReferenceZ = 1050;
 constexpr int kIdShadowLedDiameter = 1051;
 constexpr int kIdMitsubaLightAngle = 1052;
+constexpr int kIdRunStatus = 1053;
+constexpr int kIdRunLog = 1054;
+constexpr int kIdPreview = 1055;
+constexpr int kIdPreviewCaption = 1056;
+constexpr UINT_PTR kRunTimer = 4001;
 constexpr int kIdPromptEdit = 2001;
 constexpr int kIdPromptOk = 2002;
 constexpr int kIdPromptCancel = 2003;
+constexpr int kIdNewProject = 3001;
+constexpr int kIdOpenProject = 3002;
+constexpr int kIdExit = 3003;
+constexpr int kIdOpenResults = 3004;
+constexpr int kIdOpenReview = 3005;
+constexpr UINT kRunProjectMessage = WM_APP + 1;
+
+struct ProgressChannel {
+    std::mutex mutex;
+    std::deque<ProgressUpdate> events;
+};
+
+struct CompletedRun {
+    Options options;
+    GuiRunResult result;
+    std::string error;
+};
 
 struct SetupDialogState {
     Options* opt = nullptr;
     bool running = true;
-    bool accepted = false;
+    bool busy = false;
+    bool initializing = false;
+    bool viewing = false;
+    bool selecting = false;
+    bool exitAfterRun = false;
+    int pendingAction = 0;
+    GuiProcessor processor;
+    std::shared_ptr<ProgressChannel> channel;
+    std::future<CompletedRun> job;
+    ProgressTiming timing;
+    ProgressUpdate currentProgress;
+    std::chrono::steady_clock::time_point started;
+    cv::Mat preview;
+    std::deque<std::string> logLines;
+    HWND runLog = nullptr;
+    HWND previewControl = nullptr;
+    HWND previewCaption = nullptr;
+    std::string lastOutput;
+    std::string reviewPath;
     HWND hwnd = nullptr;
+    HWND statusText = nullptr;
+    HWND progressBar = nullptr;
+    HWND startButton = nullptr;
+    HWND cancelButton = nullptr;
     HWND nextStepLabel = nullptr;
     HWND tabControl = nullptr;
     std::vector<HWND> tabPages;
@@ -182,11 +238,31 @@ struct NumberPromptState {
     HWND edit = nullptr;
 };
 
-HWND gProgressWindow = nullptr;
-HWND gProgressLabel = nullptr;
-HWND gProgressBar = nullptr;
-HWND gProgressCancelButton = nullptr;
-bool gProgressCancelRequested = false;
+class SelectionGuard {
+public:
+    explicit SelectionGuard(SetupDialogState& state) : state_(state), enabled_(IsWindowEnabled(state.hwnd)) {
+        state_.selecting = true;
+        EnableWindow(state_.hwnd, FALSE);
+    }
+    ~SelectionGuard() {
+        state_.selecting = false;
+        EnableWindow(state_.hwnd, enabled_);
+        if (state_.pendingAction == kIdExit) {
+            state_.pendingAction = 0;
+            PostMessageA(state_.hwnd, WM_COMMAND, kIdExit, 0);
+        }
+    }
+    SelectionGuard(const SelectionGuard&) = delete;
+    SelectionGuard& operator=(const SelectionGuard&) = delete;
+private:
+    SetupDialogState& state_;
+    BOOL enabled_;
+};
+
+void updateApplicationState(SetupDialogState& state);
+void layoutApplicationFooter(SetupDialogState& state);
+
+std::atomic_bool gProgressCancelRequested{false};
 
 std::vector<std::string> parseMultiSelectBuffer(const char* buffer) {
     std::vector<std::string> parts;
@@ -351,7 +427,7 @@ HWND makeControl(
         0,
         cls,
         text,
-        WS_CHILD | WS_VISIBLE | style,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
         x,
         y,
         w,
@@ -418,7 +494,7 @@ HWND makeTabPage(HWND parent, SetupDialogState& state, const char* title) {
         WS_EX_CONTROLPARENT,
         "STATIC",
         "",
-        WS_CHILD | (index == 0 ? WS_VISIBLE : 0),
+        WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | (index == 0 ? WS_VISIBLE : 0),
         kPageX,
         kPageY,
         kPageWidth,
@@ -438,6 +514,36 @@ void showSelectedTabPage(SetupDialogState& state) {
     for (size_t i = 0; i < state.tabPages.size(); ++i) {
         ShowWindow(state.tabPages[i], static_cast<int>(i) == selected ? SW_SHOW : SW_HIDE);
     }
+    HWND page = state.tabPages.at(static_cast<size_t>(selected));
+    SetWindowPos(page, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    RedrawWindow(page, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+LRESULT CALLBACK previewSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR data) {
+    if (msg != WM_PAINT && msg != WM_PRINTCLIENT) return DefSubclassProc(hwnd, msg, wParam, lParam);
+    auto& state = *reinterpret_cast<SetupDialogState*>(data);
+    PAINTSTRUCT paint = {};
+    HDC dc = msg == WM_PAINT ? BeginPaint(hwnd, &paint) : reinterpret_cast<HDC>(wParam);
+    RECT area = {};
+    GetClientRect(hwnd, &area);
+    FillRect(dc, &area, reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+    if (!state.preview.empty()) {
+        const auto& frame = state.preview;
+        const double scale = std::min(static_cast<double>(area.right) / frame.cols, static_cast<double>(area.bottom) / frame.rows);
+        const int width = static_cast<int>(frame.cols * scale), height = static_cast<int>(frame.rows * scale);
+        BITMAPINFO bitmap = {};
+        bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmap.bmiHeader.biWidth = frame.cols;
+        bitmap.bmiHeader.biHeight = -frame.rows;
+        bitmap.bmiHeader.biPlanes = 1;
+        bitmap.bmiHeader.biBitCount = 32;
+        bitmap.bmiHeader.biCompression = BI_RGB;
+        SetStretchBltMode(dc, HALFTONE);
+        StretchDIBits(dc, (area.right - width) / 2, (area.bottom - height) / 2, width, height,
+            0, 0, frame.cols, frame.rows, frame.data, &bitmap, DIB_RGB_COLORS, SRCCOPY);
+    }
+    if (msg == WM_PAINT) EndPaint(hwnd, &paint);
+    return 0;
 }
 
 void addComboItem(HWND combo, const char* text) {
@@ -553,48 +659,6 @@ LRESULT CALLBACK numberPromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         break;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
-}
-
-LRESULT CALLBACK progressWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    (void)lParam;
-    if (msg == WM_COMMAND && LOWORD(wParam) == kIdProgressCancel) {
-        gProgressCancelRequested = true;
-        if (gProgressLabel != nullptr) {
-            SetWindowTextA(gProgressLabel, "Canceling after the current processing step...");
-        }
-        if (gProgressCancelButton != nullptr) {
-            EnableWindow(gProgressCancelButton, FALSE);
-        }
-        return 0;
-    }
-    if (msg == WM_CLOSE) {
-        gProgressCancelRequested = true;
-        if (gProgressLabel != nullptr) {
-            SetWindowTextA(gProgressLabel, "Canceling after the current processing step...");
-        }
-        if (gProgressCancelButton != nullptr) {
-            EnableWindow(gProgressCancelButton, FALSE);
-        }
-        return 0;
-    }
-    if (msg == WM_DESTROY) {
-        if (gProgressWindow == hwnd) {
-            gProgressWindow = nullptr;
-            gProgressLabel = nullptr;
-            gProgressBar = nullptr;
-            gProgressCancelButton = nullptr;
-        }
-        return 0;
-    }
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
-}
-
-void pumpGuiMessages() {
-    MSG msg = {};
-    while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
-    }
 }
 
 double promptDouble(
@@ -718,7 +782,7 @@ bool isSectionHeader(const SetupDialogState& state, HWND hwnd) {
 }
 
 std::string optionalThenStart(const std::string& text) {
-    return text + " Next required (bottom right): click Start.";
+    return text + " Next required (bottom right): run the project.";
 }
 
 std::string nextStepText(const SetupDialogState& state, bool& required) {
@@ -769,7 +833,7 @@ std::string nextStepText(const SetupDialogState& state, bool& required) {
     if (calibrated && opt.imagePaths.size() >= kMinImages && !buttonChecked(state.rtiCheck)) {
         return optionalThenStart("Optional (Outputs tab): enable RTI export for Relight/OpenLIME or webRTIViewer.");
     }
-    return "Next required (bottom right): click Start when the tabs look right.";
+    return "Next required (bottom right): run the project when the tabs look right.";
 }
 
 void updateSetupControls(SetupDialogState& state) {
@@ -862,6 +926,7 @@ void updateSetupControls(SetupDialogState& state) {
     EnableWindow(state.ringHeightEdit, nearField);
     EnableWindow(state.pixelScaleEdit, TRUE);
     EnableWindow(state.scaleButton, !opt.imagePaths.empty());
+    updateApplicationState(state);
 }
 
 void updateSetupScrollInfo(SetupDialogState& state) {
@@ -1002,6 +1067,7 @@ void markSphere(SetupDialogState& state) {
         return;
     }
     try {
+        SelectionGuard selection(state);
         state.opt->sphere = chooseSphereInteractive(loadDisplayImage(state.opt->imagePaths.front()));
         state.opt->hasSphere = true;
         updateSetupControls(state);
@@ -1016,6 +1082,7 @@ void cropSurface(SetupDialogState& state) {
         return;
     }
     try {
+        SelectionGuard selection(state);
         state.opt->crop = chooseCropInteractive(loadDisplayImage(state.opt->imagePaths.front()));
         state.opt->hasCrop = true;
         updateSetupControls(state);
@@ -1030,6 +1097,7 @@ void markHeightMask(SetupDialogState& state) {
         return;
     }
     try {
+        SelectionGuard selection(state);
         state.opt->heightMask = chooseHeightMaskInteractive(loadDisplayImage(state.opt->imagePaths.front()));
         state.opt->hasHeightMask = true;
         state.opt->heightMaskPath.clear();
@@ -1045,6 +1113,7 @@ void markScaleLine(SetupDialogState& state) {
         return;
     }
     try {
+        SelectionGuard selection(state);
         const double pixels = chooseScaleLineInteractive(loadDisplayImage(state.opt->imagePaths.front()));
         std::ostringstream prompt;
         prompt << "The line is " << pixels << " pixels long.\n\n"
@@ -1359,6 +1428,7 @@ bool validateAndAccept(SetupDialogState& state) {
 }
 
 void createSetupControls(HWND hwnd, SetupDialogState& state) {
+    state.initializing = true;
     state.requiredBrush = CreateSolidBrush(RGB(255, 238, 205));
     state.optionalBrush = CreateSolidBrush(RGB(232, 244, 255));
     state.sectionBrush = CreateSolidBrush(RGB(232, 236, 242));
@@ -1564,7 +1634,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     setButtonChecked(state.shadowHeightRefinementCheck, state.opt->shadowHeightRefinement);
 
     y += 26;
-    makeLabel(advancedPage, "Requires 6+ calibrated robust images and height; sphere directions are supported.", kControlX + 20, y, kControlWidth - 20, kRowHeight);
+    makeLabel(advancedPage, "Requires 6+ calibrated robust images and height; sphere directions are supported.", kControlX + 20, y, kControlWidth - 20, 18);
 
     y += 20;
     makeLabel(advancedPage, "Z and LED size are near-field only; weak evidence is rejected unchanged.", kControlX + 20, y, kControlWidth - 20, kRowHeight);
@@ -1626,12 +1696,255 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     state.mitsubaPythonButton = makeControl(advancedPage, "BUTTON", "Locate Backend...", BS_PUSHBUTTON, kIdSelectMitsubaPython, kControlX, y, kButtonWidth, kRowHeight);
     state.mitsubaStatus = makeControl(advancedPage, "STATIC", "", SS_LEFT, kIdMitsubaStatus, kControlX + kButtonWidth + 12, y, 298, 42);
 
-    makeControl(hwnd, "BUTTON", "Start", BS_DEFPUSHBUTTON, kIdStart, kWindowWidth - 290, kTabTop + kTabHeight + 22, 110, 34);
-    makeControl(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON, kIdCancel, kWindowWidth - 165, kTabTop + kTabHeight + 22, 110, 34);
+    HWND progressPage = makeTabPage(hwnd, state, "Progress");
+    state.previewCaption = makeControl(progressPage, "STATIC", "Mitsuba previews appear every 5 iterations. Provisional geometry only.", SS_LEFT,
+        kIdPreviewCaption, 16, 4, 640, 30);
+    state.previewControl = makeControl(progressPage, "STATIC", "", SS_OWNERDRAW, kIdPreview, 16, 38, 640, 246);
+    SetWindowSubclass(state.previewControl, previewSubclass, 1, reinterpret_cast<DWORD_PTR>(&state));
+    state.runLog = makeControl(progressPage, "EDIT", "", ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+        kIdRunLog, 16, 296, 640, 106);
+
+    state.statusText = makeControl(hwnd, "EDIT", "Ready. Start a project, or use File > Open Completed Project.",
+        ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, kIdRunStatus, kMargin, 546, 684, 88);
+    state.progressBar = makeControl(hwnd, PROGRESS_CLASSA, "", 0, kIdProgressBar, kMargin, 642, 684, 18);
+    SendMessageA(state.progressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    ShowWindow(state.progressBar, SW_HIDE);
+    state.startButton = makeControl(hwnd, "BUTTON", "Start", BS_DEFPUSHBUTTON, kIdStart, kWindowWidth - 290, 674, 110, 34);
+    state.cancelButton = makeControl(hwnd, "BUTTON", "Cancel Run", BS_PUSHBUTTON, kIdCancel, kWindowWidth - 165, 674, 110, 34);
+    EnableWindow(state.cancelButton, FALSE);
 
     TabCtrl_SetCurSel(state.tabControl, 0);
     showSelectedTabPage(state);
     updateSetupControls(state);
+    state.initializing = false;
+    layoutApplicationFooter(state);
+}
+
+void layoutApplicationFooter(SetupDialogState& state) {
+    if (!state.startButton) return;
+    RECT client = {};
+    GetClientRect(state.hwnd, &client);
+    const int width = client.right - client.left;
+    const int startY = client.bottom - 49;
+    const int progressY = startY - 18;
+    MoveWindow(state.statusText, kMargin, 546, width - 2 * kMargin, std::max(24, progressY - 554), TRUE);
+    MoveWindow(state.progressBar, kMargin, progressY, width - 2 * kMargin, 10, TRUE);
+    MoveWindow(state.startButton, width - 250, startY, 110, 34, TRUE);
+    MoveWindow(state.cancelButton, width - 125, startY, 110, 34, TRUE);
+}
+
+void updateApplicationState(SetupDialogState& state) {
+    const std::string projectName = state.opt->imagePaths.empty() ? "New Project" :
+        fs::path(state.opt->imagePaths.front()).parent_path().filename().string();
+    const std::string title = "what-a-relief " WHAT_A_RELIEF_VERSION " - " + projectName +
+        (state.busy ? " (Processing)" : "");
+    SetWindowTextA(state.hwnd, title.c_str());
+    for (HWND page : state.tabPages) EnableWindow(page, !state.busy || page == GetParent(state.runLog));
+    EnableWindow(state.tabControl, TRUE);
+    EnableWindow(state.startButton, !state.busy && !state.viewing);
+    EnableWindow(state.cancelButton, state.busy && !gProgressCancelRequested);
+    const HMENU menu = GetMenu(state.hwnd);
+    for (int id : {kIdNewProject, kIdOpenProject}) {
+        EnableMenuItem(menu, id, MF_BYCOMMAND | (state.busy ? MF_GRAYED : MF_ENABLED));
+    }
+    EnableMenuItem(menu, kIdOpenResults, MF_BYCOMMAND |
+        (!state.busy && !state.lastOutput.empty() ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, kIdOpenReview, MF_BYCOMMAND |
+        (!state.busy && !state.reviewPath.empty() ? MF_ENABLED : MF_GRAYED));
+    DrawMenuBar(state.hwnd);
+}
+
+void resetProject(SetupDialogState& state, Options options) {
+    options.guiMode = true;
+    options.noGui = false;
+    options.mitsubaPythonPath = state.opt->mitsubaPythonPath;
+    options.mitsubaWorkerPath = state.opt->mitsubaWorkerPath;
+    state.initializing = true;
+    while (HWND child = GetWindow(state.hwnd, GW_CHILD)) DestroyWindow(child);
+    for (HBRUSH brush : {state.requiredBrush, state.optionalBrush, state.sectionBrush}) {
+        if (brush) DeleteObject(brush);
+    }
+    SetupDialogState fresh;
+    fresh.hwnd = state.hwnd;
+    fresh.opt = state.opt;
+    fresh.processor = state.processor;
+    *fresh.opt = std::move(options);
+    state = std::move(fresh);
+    gProgressCancelRequested = false;
+    createSetupControls(state.hwnd, state);
+    updateApplicationState(state);
+}
+
+void openProject(SetupDialogState& state) {
+    std::vector<char> filename(32768, '\0');
+    OPENFILENAMEA dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = state.hwnd;
+    dialog.lpstrFilter = "Completed project (run_manifest.json)\0run_manifest.json\0JSON files\0*.json\0";
+    dialog.lpstrFile = filename.data();
+    dialog.nMaxFile = static_cast<DWORD>(filename.size());
+    dialog.lpstrTitle = "Open a completed project's run_manifest.json";
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&dialog)) return;
+    try {
+        LoadedProject project = loadCompletedProject(filename.data());
+        std::string message = "Opened completed project: " + project.completedOutputDir +
+            "\r\nReview the tabs, then Start. Previous outputs will be preserved.";
+        for (const auto& warning : project.warnings) message += "\r\n" + warning;
+        resetProject(state, std::move(project.options));
+        state.lastOutput = project.completedOutputDir;
+        const fs::path review = fs::path(state.lastOutput) / "inverse" / "unvalidated_candidate" / "review.html";
+        if (fs::is_regular_file(review)) state.reviewPath = review.string();
+        SetWindowTextA(state.statusText, message.c_str());
+        updateApplicationState(state);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Open Project", e.what(), MB_ICONERROR);
+    }
+}
+
+void cancelRun(SetupDialogState& state, bool exitAfterRun) {
+    state.exitAfterRun = state.exitAfterRun || exitAfterRun;
+    gProgressCancelRequested = true;
+    SetWindowTextA(state.statusText, exitAfterRun
+        ? "Canceling at the next processing checkpoint, then exiting..."
+        : "Canceling at the next processing checkpoint...");
+    updateApplicationState(state);
+}
+
+std::string durationText(double seconds) {
+    const auto value = static_cast<long long>(std::max(0.0, seconds));
+    std::ostringstream text;
+    if (value >= 3600) text << value / 3600 << "h ";
+    text << (value / 60) % 60 << "m " << value % 60 << "s";
+    return text.str();
+}
+
+void refreshRunProgress(SetupDialogState& state) {
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - state.started).count();
+    std::deque<ProgressUpdate> events;
+    { std::lock_guard<std::mutex> lock(state.channel->mutex); events.swap(state.channel->events); }
+    for (const auto& event : events) {
+        if (!event.preview.empty()) {
+            cv::cvtColor(event.preview, state.preview, cv::COLOR_BGR2BGRA);
+            const std::string caption = "Iteration " + std::to_string(event.previewIteration) + "/" + std::to_string(event.previewTotal) +
+                " (not validated). RGB normals (left) / diffuse hillshade (right).";
+            SetWindowTextA(state.previewCaption, caption.c_str());
+            InvalidateRect(state.previewControl, nullptr, FALSE);
+        }
+        if (state.logLines.empty() || event.message != state.currentProgress.message) {
+            state.logLines.push_back(durationText(elapsed) + "  " + event.message);
+            while (state.logLines.size() > 200) state.logLines.pop_front();
+        }
+        state.timing.update(event, elapsed);
+        state.currentProgress = event;
+        state.currentProgress.preview.release();
+    }
+    if (!events.empty()) {
+        std::string text;
+        for (const auto& line : state.logLines) text += line + "\r\n";
+        SetWindowTextA(state.runLog, text.c_str());
+        SendMessageA(state.runLog, EM_SETSEL, text.size(), text.size());
+        SendMessageA(state.runLog, EM_SCROLLCARET, 0, 0);
+    }
+    const auto& update = state.currentProgress;
+    const bool measured = update.total > 0;
+    LONG_PTR style = GetWindowLongPtrA(state.progressBar, GWL_STYLE);
+    SetWindowLongPtrA(state.progressBar, GWL_STYLE, measured ? style & ~PBS_MARQUEE : style | PBS_MARQUEE);
+    SendMessageA(state.progressBar, PBM_SETMARQUEE, !measured, 40);
+    if (measured) SendMessageA(state.progressBar, PBM_SETPOS, static_cast<int>(100 * std::clamp(update.completed / update.total, 0.0, 1.0)), 0);
+    const double remaining = state.timing.remaining(elapsed);
+    std::string text = update.message + "\r\nElapsed " + durationText(elapsed) + " | Stage ETA: " +
+        (remaining >= 0 ? "about " + durationText(remaining) : "estimating...");
+    if (!update.estimateScope.empty()) text += " (" + update.estimateScope + ")";
+    if (gProgressCancelRequested) text = "Cancel requested; waiting for a safe checkpoint.\r\nElapsed " + durationText(elapsed);
+    SetWindowTextA(state.statusText, text.c_str());
+}
+
+void startProjectWorker(SetupDialogState& state) {
+    state.channel = std::make_shared<ProgressChannel>();
+    state.started = std::chrono::steady_clock::now();
+    TabCtrl_SetCurSel(state.tabControl, static_cast<int>(state.tabPages.size() - 1));
+    showSelectedTabPage(state);
+    state.timing = {};
+    state.currentProgress = {"Starting photometric stereo...", 0, "Starting"};
+    state.logLines.clear();
+    state.preview.release();
+    SetWindowTextA(state.runLog, "");
+    SetWindowTextA(state.previewCaption, "Mitsuba previews appear every 5 iterations. Provisional geometry only.");
+    InvalidateRect(state.previewControl, nullptr, TRUE);
+    const auto channel = state.channel;
+    Options options = *state.opt;
+    options.heightMask = options.heightMask.clone();
+    state.job = std::async(std::launch::async, [options = std::move(options), processor = state.processor, channel]() mutable {
+        CompletedRun completed;
+        try {
+            completed.result = processor(options, [channel](const ProgressUpdate& update) {
+                if (gProgressCancelRequested) throw std::runtime_error("Processing canceled by user.");
+                std::lock_guard<std::mutex> lock(channel->mutex);
+                channel->events.push_back(update);
+                while (channel->events.size() > 256) channel->events.pop_front();
+            });
+        } catch (const std::exception& error) {
+            completed.error = error.what();
+        } catch (...) {
+            completed.error = "Unexpected processing failure.";
+        }
+        completed.options = std::move(options);
+        return completed;
+    });
+    SetTimer(state.hwnd, kRunTimer, 125, nullptr);
+}
+
+void finishProject(SetupDialogState& state) {
+    CompletedRun job = state.job.get();
+    *state.opt = std::move(job.options);
+    GuiRunResult result = std::move(job.result);
+    bool completed = false;
+    try {
+        if (!job.error.empty()) throw std::runtime_error(job.error);
+        completed = true;
+        state.lastOutput = state.opt->outputDir;
+        state.reviewPath = result.inverse.candidateSaved ? result.inverse.candidateReviewPath : "";
+        std::string message = "Complete. Outputs: " + state.lastOutput +
+            "\r\nAdjust the tabs and Run Again, or use File > New Project / Open Completed Project.";
+        if (result.inverse.attempted && !result.inverse.accepted) {
+            message += "\r\nInverse refinement not accepted: " + result.inverse.decision + ". Baseline retained.";
+            if (result.inverse.candidateSaved) message += " Use File > Review Inverse Candidate to inspect the unvalidated result.";
+        }
+        SetWindowTextA(state.statusText, message.c_str());
+        SetWindowTextA(state.startButton, "Run Again");
+    } catch (const std::exception& e) {
+        const std::string message = gProgressCancelRequested ? "Run canceled. Settings retained; ready to try again." :
+            std::string("Processing failed: ") + e.what() + "\r\nSettings retained. Correct the problem and Start again, or use File > New Project.";
+        SetWindowTextA(state.statusText, message.c_str());
+    }
+    state.busy = false;
+    KillTimer(state.hwnd, kRunTimer);
+    ShowWindow(state.progressBar, SW_HIDE);
+    updateSetupControls(state);
+    updateApplicationState(state);
+    showSelectedTabPage(state);
+    if (state.exitAfterRun) {
+        PostMessageA(state.hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (completed && !result.relightNormals.empty()) {
+        state.viewing = true;
+        updateApplicationState(state);
+        try {
+            launchRelightViewer(result.relightNormals, result.relightMask, state.lastOutput,
+                [&]() { return state.pendingAction != 0; });
+        } catch (const std::exception& e) {
+            SetWindowTextA(state.statusText, ("Outputs are complete. Relighting could not open: " + std::string(e.what())).c_str());
+        }
+        state.viewing = false;
+        updateApplicationState(state);
+        if (state.pendingAction) {
+            const int action = state.pendingAction;
+            state.pendingAction = 0;
+            PostMessageA(state.hwnd, WM_COMMAND, action, 0);
+        }
+    }
 }
 
 LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1643,10 +1956,34 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     SetupDialogState* state = reinterpret_cast<SetupDialogState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
     switch (msg) {
     case WM_COMMAND:
-        if (state == nullptr) {
+        if (state == nullptr || state->initializing) {
             break;
         }
+        if (state->selecting) {
+            if (LOWORD(wParam) == kIdExit) state->pendingAction = kIdExit;
+            return 0;
+        }
+        if (state->busy && LOWORD(wParam) != kIdCancel && LOWORD(wParam) != kIdExit) return 0;
+        if (state->viewing && (LOWORD(wParam) == kIdNewProject || LOWORD(wParam) == kIdOpenProject || LOWORD(wParam) == kIdExit)) {
+            state->pendingAction = LOWORD(wParam);
+            return 0;
+        }
         switch (LOWORD(wParam)) {
+        case kIdNewProject:
+            resetProject(*state, Options{});
+            return 0;
+        case kIdOpenProject:
+            openProject(*state);
+            return 0;
+        case kIdExit:
+            SendMessageA(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        case kIdOpenResults:
+            if (!state->lastOutput.empty()) openGuiReviewFile(state->lastOutput);
+            return 0;
+        case kIdOpenReview:
+            if (!state->reviewPath.empty()) openGuiReviewFile(state->reviewPath);
+            return 0;
         case kIdSelectImages:
             selectImages(*state);
             return 0;
@@ -1757,21 +2094,54 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             markScaleLine(*state);
             return 0;
         case kIdStart:
-            if (validateAndAccept(*state)) {
-                state->accepted = true;
-                state->running = false;
-                DestroyWindow(hwnd);
+            if (state->viewing) return 0;
+            try {
+                if (validateAndAccept(*state)) {
+                    const std::string fresh = freshProjectOutputDirectory(state->opt->outputDir);
+                    if (fresh != state->opt->outputDir) {
+                        state->opt->outputDir = fresh;
+                        if (!state->opt->meshPath.empty()) state->opt->meshPath = (fs::path(fresh) / "surface.ply").string();
+                        if (!state->opt->printableMeshPath.empty()) state->opt->printableMeshPath = (fs::path(fresh) / "printable_surface.ply").string();
+                        if (state->opt->exportRti) state->opt->rtiPath = (fs::path(fresh) / "rti").string();
+                    }
+                    state->busy = true;
+                    state->exitAfterRun = false;
+                    gProgressCancelRequested = false;
+                    updateSetupControls(*state);
+                    updateApplicationState(*state);
+                    SetWindowTextA(state->statusText, "Starting photometric stereo...");
+                    SendMessageA(state->progressBar, PBM_SETPOS, 0, 0);
+                    ShowWindow(state->progressBar, SW_SHOW);
+                    PostMessageA(hwnd, kRunProjectMessage, 0, 0);
+                }
+            } catch (const std::exception& e) {
+                showOwnerMessage(hwnd, "Project Setup", e.what(), MB_ICONWARNING);
             }
             return 0;
         case kIdCancel:
-            state->accepted = false;
-            state->running = false;
-            DestroyWindow(hwnd);
+            if (state->busy) cancelRun(*state, false);
             return 0;
         default:
             break;
         }
         break;
+    case kRunProjectMessage:
+        if (state && state->busy) {
+            try { startProjectWorker(*state); }
+            catch (const std::exception& error) {
+                state->busy = false;
+                ShowWindow(state->progressBar, SW_HIDE);
+                SetWindowTextA(state->statusText, ("Could not start processing: " + std::string(error.what())).c_str());
+                updateApplicationState(*state);
+            }
+        }
+        return 0;
+    case WM_TIMER:
+        if (state && wParam == kRunTimer && state->busy) {
+            refreshRunProgress(*state);
+            if (state->job.valid() && state->job.wait_for(std::chrono::seconds(0)) == std::future_status::ready) finishProject(*state);
+        }
+        return 0;
     case WM_NOTIFY:
         if (state != nullptr) {
             const NMHDR* notify = reinterpret_cast<const NMHDR*>(lParam);
@@ -1828,11 +2198,17 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_SIZE:
         if (state != nullptr) {
+            layoutApplicationFooter(*state);
             updateSetupScrollInfo(*state);
             scrollSetupWindow(*state, state->scrollY);
             return 0;
         }
         break;
+    case WM_GETMINMAXINFO: {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        limits->ptMinTrackSize = {kWindowWidth, 724};
+        return 0;
+    }
     case WM_CTLCOLORSTATIC:
         if (state != nullptr) {
             HDC dc = reinterpret_cast<HDC>(wParam);
@@ -1852,7 +2228,18 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_CLOSE:
         if (state != nullptr) {
-            state->accepted = false;
+            if (state->selecting) {
+                state->pendingAction = kIdExit;
+                return 0;
+            }
+            if (state->busy) {
+                cancelRun(*state, true);
+                return 0;
+            }
+            if (state->viewing) {
+                state->pendingAction = kIdExit;
+                return 0;
+            }
             state->running = false;
         }
         DestroyWindow(hwnd);
@@ -1906,86 +2293,6 @@ bool askGuiYesNo(const std::string& title, const std::string& text, bool default
 #endif
 }
 
-void showGuiProgress(const std::string& title, const std::string& text) {
-#ifdef _WIN32
-    INITCOMMONCONTROLSEX controls = {};
-    controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_PROGRESS_CLASS;
-    InitCommonControlsEx(&controls);
-
-    const HINSTANCE instance = GetModuleHandleA(nullptr);
-    const char* className = "WhatAReliefProgressWindow";
-    WNDCLASSA wc = {};
-    wc.lpfnWndProc = progressWndProc;
-    wc.hInstance = instance;
-    wc.lpszClassName = className;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    RegisterClassA(&wc);
-
-    if (gProgressWindow != nullptr) {
-        gProgressCancelRequested = false;
-        if (gProgressLabel != nullptr) {
-            SetWindowTextA(gProgressLabel, text.c_str());
-        }
-        if (gProgressBar != nullptr) {
-            SendMessageA(gProgressBar, PBM_SETPOS, 0, 0);
-        }
-        pumpGuiMessages();
-        return;
-    }
-
-    gProgressCancelRequested = false;
-    gProgressWindow = CreateWindowExA(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        className,
-        title.c_str(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        520,
-        190,
-        nullptr,
-        nullptr,
-        instance,
-        nullptr);
-    if (gProgressWindow == nullptr) {
-        return;
-    }
-
-    gProgressLabel = makeControl(gProgressWindow, "STATIC", text.c_str(), SS_LEFT, 0, 20, 20, 460, 28);
-    gProgressBar = makeControl(gProgressWindow, PROGRESS_CLASSA, "", 0, kIdProgressBar, 20, 60, 460, 24);
-    gProgressCancelButton = makeControl(gProgressWindow, "BUTTON", "Cancel", BS_PUSHBUTTON, kIdProgressCancel, 390, 100, 90, 30);
-    SendMessageA(gProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-    SendMessageA(gProgressBar, PBM_SETPOS, 0, 0);
-    ShowWindow(gProgressWindow, SW_SHOW);
-    UpdateWindow(gProgressWindow);
-    pumpGuiMessages();
-#else
-    (void)title;
-    (void)text;
-#endif
-}
-
-void updateGuiProgress(const std::string& text, int percent) {
-#ifdef _WIN32
-    if (gProgressWindow == nullptr) {
-        return;
-    }
-    if (gProgressLabel != nullptr) {
-        SetWindowTextA(gProgressLabel, text.c_str());
-    }
-    if (gProgressBar != nullptr) {
-        SendMessageA(gProgressBar, PBM_SETPOS, std::clamp(percent, 0, 100), 0);
-    }
-    UpdateWindow(gProgressWindow);
-    pumpGuiMessages();
-#else
-    (void)text;
-    (void)percent;
-#endif
-}
-
 void openGuiReviewFile(const std::string& path) {
 #ifdef _WIN32
     const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
@@ -2000,29 +2307,18 @@ void openGuiReviewFile(const std::string& path) {
 
 bool guiProgressCancellationRequested() {
 #ifdef _WIN32
-    pumpGuiMessages();
-    return gProgressCancelRequested;
+    return gProgressCancelRequested.load();
 #else
     return false;
 #endif
 }
 
-void closeGuiProgress() {
-#ifdef _WIN32
-    if (gProgressWindow != nullptr) {
-        DestroyWindow(gProgressWindow);
-        pumpGuiMessages();
-    }
-    gProgressCancelRequested = false;
-#endif
-}
-
-bool launchGuiWorkflow(Options& opt) {
+void launchGuiApplication(Options& opt, const GuiProcessor& processor, bool visible) {
 #ifdef _WIN32
     const HINSTANCE instance = GetModuleHandleA(nullptr);
     INITCOMMONCONTROLSEX controls = {};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_TAB_CLASSES;
+    controls.dwICC = ICC_TAB_CLASSES | ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&controls);
 
     const char* className = "WhatAReliefSetupWindow";
@@ -2036,40 +2332,69 @@ bool launchGuiWorkflow(Options& opt) {
 
     SetupDialogState state;
     state.opt = &opt;
+    state.processor = processor;
+    gProgressCancelRequested = false;
+    HMENU menu = CreateMenu();
+    HMENU file = CreatePopupMenu();
+    AppendMenuA(file, MF_STRING, kIdNewProject, "&New Project\tCtrl+N");
+    AppendMenuA(file, MF_STRING, kIdOpenProject, "&Open Completed Project...\tCtrl+O");
+    AppendMenuA(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(file, MF_STRING, kIdOpenResults, "Open &Output Folder");
+    AppendMenuA(file, MF_STRING, kIdOpenReview, "&Review Inverse Candidate");
+    AppendMenuA(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(file, MF_STRING, kIdExit, "E&xit\tAlt+F4");
+    AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), "&File");
     const std::string windowTitle = "what-a-relief " WHAT_A_RELIEF_VERSION;
     HWND hwnd = CreateWindowExA(
         WS_EX_DLGMODALFRAME,
         className,
         windowTitle.c_str(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         kWindowWidth,
         kWindowHeight,
         nullptr,
-        nullptr,
+        menu,
         instance,
         &state);
     if (hwnd == nullptr) {
+        DestroyMenu(menu);
         throw std::runtime_error("Could not create setup window.");
     }
 
     state.hwnd = hwnd;
     createSetupControls(hwnd, state);
-    ShowWindow(hwnd, SW_SHOW);
+    updateApplicationState(state);
+    MONITORINFO monitor = {};
+    monitor.cbSize = sizeof(monitor);
+    if (GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        RECT bounds = {};
+        GetWindowRect(hwnd, &bounds);
+        const int height = std::min(kWindowHeight, static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top));
+        const int x = std::max(static_cast<int>(monitor.rcWork.left), std::min(static_cast<int>(bounds.left), static_cast<int>(monitor.rcWork.right) - kWindowWidth));
+        const int y = std::max(static_cast<int>(monitor.rcWork.top), std::min(static_cast<int>(bounds.top), static_cast<int>(monitor.rcWork.bottom) - height));
+        SetWindowPos(hwnd, nullptr, x, y, kWindowWidth, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
     UpdateWindow(hwnd);
 
+    ACCEL shortcuts[] = {{FVIRTKEY | FCONTROL, 'N', kIdNewProject}, {FVIRTKEY | FCONTROL, 'O', kIdOpenProject}};
+    HACCEL accelerators = CreateAcceleratorTableA(shortcuts, 2);
     MSG msg = {};
     while (state.running && GetMessageA(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageA(hwnd, &msg)) {
+        if (!TranslateAcceleratorA(hwnd, accelerators, &msg) && !IsDialogMessageA(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
     }
 
-    return state.accepted;
+    DestroyAcceleratorTable(accelerators);
+    if (IsWindow(hwnd)) DestroyWindow(hwnd);
 #else
     (void)opt;
+    (void)processor;
+    (void)visible;
     throw std::runtime_error("GUI image loading is only implemented on Windows. Use --image arguments on this platform.");
 #endif
 }

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import importlib.util
 import sys
 import tempfile
@@ -44,6 +45,10 @@ def main() -> int:
                 raise RuntimeError("Second fallback progress update was incomplete")
             if path.with_name(path.name + ".part").exists():
                 raise RuntimeError("Fallback progress writer retained a partial file")
+            progress.live = dict(iteration=5, total=12, remaining_seconds=23.0, preview_iteration=5)
+            progress(50, "Iteration preview")
+            if json.loads(path.read_text().splitlines()[2]) != progress.live:
+                raise RuntimeError("Network fallback lost iteration/ETA metadata")
         finally:
             worker.atomic_text = original_atomic_text
 

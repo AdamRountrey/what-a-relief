@@ -3217,8 +3217,34 @@ void testHeightFlatteningSemantics(TestContext& context) {
 
 } // namespace
 
+void testSolveProgress(TestContext& context) {
+    const auto lights = makeRingLights(8);
+    const auto images = renderLambertianPlane(65, 12, lights, normalized({0.1f, -0.15f, 1.0f}), 0.6f);
+    const cv::Mat mask(65, 12, CV_8U, cv::Scalar(255));
+    for (auto mode : {NormalSolverMode::Robust, NormalSolverMode::Standard}) {
+        SolveResult plain, tracked;
+        const auto solve = [&](SolveResult& result, const std::function<void(int, int)>& progress) {
+            solvePhotometricStereo(images, lights, mask, 0.02f, mode, 0.98f, LightingModel::Directional,
+                0, 0, 0, {0, 0}, {0, 0, 1}, result.normals, result.albedo, result.residual,
+                result.validMask, result.diagnostics, {}, {}, progress);
+        };
+        solve(plain, {});
+        int previous = 0;
+        solve(tracked, [&](int done, int total) {
+            context.check(done >= previous && done <= total && total == 65, "Row progress is monotonic and bounded");
+            previous = done;
+        });
+        context.check(previous == 65, "Row progress reaches every row, independent of parallel stripe size");
+        context.check(cv::norm(plain.normals, tracked.normals, cv::NORM_INF) == 0 &&
+            cv::norm(plain.albedo, tracked.albedo, cv::NORM_INF) == 0, "Progress callbacks do not change reconstructed products");
+        expectThrows(context, [&]() { solve(tracked, [](int, int) { throw std::runtime_error("cancel test"); }); },
+            "Row checkpoint must propagate cancellation");
+    }
+}
+
 int main(int argc, char** argv) {
     TestContext context;
+    testSolveProgress(context);
     if (argc == 2 && std::string(argv[1]) == "--exposure-boundaries") {
         testRobustDarkBoundaryStability(context);
         testRobustClippingBoundaryStability(context);

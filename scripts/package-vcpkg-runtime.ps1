@@ -43,6 +43,7 @@ function Write-ThirdPartyLicenseBundle {
     }
 
     $packages = @(
+        @{ Package = "nlohmann-json"; Display = "JSON for Modern C++ (nlohmann/json)" },
         @{ Package = "opencv4"; Display = "OpenCV 4" },
         @{ Package = "abseil"; Display = "Abseil" },
         @{ Package = "protobuf"; Display = "Protocol Buffers" },

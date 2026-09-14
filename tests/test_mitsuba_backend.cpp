@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
         diagnostics.robustWeight = cv::Mat(8, 8, CV_32F, cv::Scalar(1.0f));
         int lastProgress = -1;
         std::string lastMessage;
+        bool receivedLive = false;
         const auto run = [&]() { runMitsubaInverseRefinement(
             options,
             lights,
@@ -160,10 +161,16 @@ int main(int argc, char** argv) {
             std::vector<cv::Mat>(6, cv::Mat(8, 8, CV_8U, cv::Scalar(0))),
             diagnostics,
             [&](const std::string& message, int percent) { lastProgress = percent; lastMessage = message; },
-            []() { return false; }); };
+            []() { return false; },
+            [&](const ProgressUpdate& update) {
+                require(update.stage == "Mitsuba optimization" && update.completed == 5 && update.total == 12 &&
+                    update.remainingSeconds == 23, "Backend live progress lost iteration/ETA metadata");
+                receivedLive = true;
+            }); };
         run();
 
         require(lastProgress == 100, "Backend contract did not report completion");
+        require(receivedLive, "Backend did not forward live progress");
         require(diagnostics.mitsuba.attempted, "Backend attempt was not recorded");
         require(diagnostics.mitsuba.succeeded, "Completed backend result was not recognized");
         require(!diagnostics.mitsuba.accepted, "Fake rejected candidate was marked accepted");

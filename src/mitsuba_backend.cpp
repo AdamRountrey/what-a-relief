@@ -6,6 +6,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -341,6 +342,7 @@ void writeJob(
     out << "    \"backend_requested\": \"" << backendModeName(opt.mitsubaBackendMode) << "\",\n";
     out << "    \"backend_selected\": \"" << selectedBackend << "\",\n";
     out << "    \"quality\": \"" << qualityModeName(opt.mitsubaQualityMode) << "\",\n";
+    out << "    \"live_preview\": " << (opt.guiMode ? "true" : "false") << ",\n";
     out << "    \"srgb_decode\": false,\n";
     out << "    \"height_scale\": " << opt.heightScale << ",\n";
     out << "    \"seed\": 1592607270\n";
@@ -399,8 +401,10 @@ void readProgressFile(
     const fs::path& path,
     int& previousPercent,
     std::string& previousMessage,
-    const std::function<void(const std::string&, int)>& progress) {
-    if (!progress) {
+    const std::function<void(const std::string&, int)>& progress,
+    const std::function<void(const ProgressUpdate&)>& liveProgress,
+    int& previousPreview) {
+    if (!progress && !liveProgress) {
         return;
     }
     std::string snapshot;
@@ -442,7 +446,46 @@ void readProgressFile(
     if (percent != previousPercent || message != previousMessage) {
         previousPercent = percent;
         previousMessage = message;
-        progress(message.empty() ? "Mitsuba inverse refinement" : message, percent);
+        bool delivered = false;
+        ProgressUpdate event;
+        if (liveProgress) {
+            // Optional third line; old workers remain compatible. Torn SMB snapshots are ignored.
+            std::string metadata;
+            std::getline(in, metadata);
+            try {
+                const auto live = nlohmann::json::parse(metadata);
+                const int iteration = live.at("iteration").get<int>();
+                const int total = live.at("total").get<int>();
+                const double eta = live.at("remaining_seconds").get<double>();
+                if (iteration < 0 || total < 1 || total > 10000 || iteration > total || !std::isfinite(eta) || eta < 0) throw std::runtime_error("Invalid live progress");
+                event = {message, 92 + 7 * percent / 100, percent <= 80 ? "Mitsuba optimization" : "Mitsuba validation and export"};
+                if (percent <= 80) {
+                    event.completed = iteration;
+                    event.total = total;
+                    event.remainingSeconds = eta;
+                    event.estimateScope = "optimization only; validation/export follow";
+                }
+                const int previewIteration = live.value("preview_iteration", 0);
+                if (previewIteration > previousPreview && previewIteration <= iteration) {
+                    const fs::path previewPath = path.parent_path() / ("iteration_" + std::to_string(previewIteration) + ".png");
+                    std::error_code error;
+                    if (fs::file_size(previewPath, error) <= 4 * 1024 * 1024 && !error) {
+                        cv::Mat frame = cv::imread(previewPath.string(), cv::IMREAD_COLOR);
+                        if (!frame.empty() && frame.cols <= 1024 && frame.rows <= 512) {
+                            event.preview = frame;
+                            event.previewIteration = previewIteration;
+                            event.previewTotal = total;
+                            previousPreview = previewIteration;
+                        }
+                    }
+                }
+                delivered = true;
+            } catch (const std::exception&) {
+                // Progress and previews must not turn a valid reconstruction into a failure.
+            }
+        }
+        if (delivered) liveProgress(event);
+        else if (progress) progress(message.empty() ? "Mitsuba inverse refinement" : message, percent);
     }
 }
 
@@ -453,9 +496,14 @@ int runProcess(
     const fs::path& logPath,
     const fs::path& progressPath,
     const std::function<void(const std::string&, int)>& progress,
-    const std::function<bool()>& cancellationRequested) {
+    const std::function<bool()>& cancellationRequested,
+    const std::function<void(const ProgressUpdate&)>& liveProgress = {}) {
     int previousPercent = -1;
+    int previousPreview = 0;
     std::string previousMessage;
+    const auto readProgress = [&]() {
+        readProgressFile(progressPath, previousPercent, previousMessage, progress, liveProgress, previousPreview);
+    };
 #ifdef _WIN32
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
@@ -508,10 +556,21 @@ int runProcess(
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
             "Could not launch the Mitsuba backend");
     }
+    struct ProcessGuard {
+        PROCESS_INFORMATION& process;
+        ~ProcessGuard() {
+            if (WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+                TerminateProcess(process.hProcess, 2);
+                WaitForSingleObject(process.hProcess, INFINITE);
+            }
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+    } processGuard{process};
 
     bool canceled = false;
     while (WaitForSingleObject(process.hProcess, 125) == WAIT_TIMEOUT) {
-        readProgressFile(progressPath, previousPercent, previousMessage, progress);
+        readProgress();
         if (cancellationRequested && cancellationRequested()) {
             TerminateProcess(process.hProcess, 2);
             canceled = true;
@@ -521,9 +580,7 @@ int runProcess(
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD exitCode = 1;
     GetExitCodeProcess(process.hProcess, &exitCode);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    readProgressFile(progressPath, previousPercent, previousMessage, progress);
+    readProgress();
     if (canceled) {
         throw std::runtime_error("Processing canceled by user.");
     }
@@ -556,9 +613,19 @@ int runProcess(
         execv(executable.c_str(), argv.data());
         _exit(127);
     }
+    struct ChildGuard {
+        pid_t child;
+        ~ChildGuard() {
+            int status = 0;
+            if (waitpid(child, &status, WNOHANG) == 0) {
+                kill(child, SIGTERM);
+                waitpid(child, &status, 0);
+            }
+        }
+    } childGuard{child};
     int status = 0;
     while (waitpid(child, &status, WNOHANG) == 0) {
-        readProgressFile(progressPath, previousPercent, previousMessage, progress);
+        readProgress();
         if (cancellationRequested && cancellationRequested()) {
             kill(child, SIGTERM);
             waitpid(child, &status, 0);
@@ -566,7 +633,7 @@ int runProcess(
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(125));
     }
-    readProgressFile(progressPath, previousPercent, previousMessage, progress);
+    readProgress();
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 #endif
 }
@@ -728,7 +795,8 @@ void runMitsubaInverseRefinement(
     const std::vector<cv::Mat>& saturationMasks,
     PhotometricDiagnostics& diagnostics,
     const std::function<void(const std::string&, int)>& progress,
-    const std::function<bool()>& cancellationRequested) {
+    const std::function<bool()>& cancellationRequested,
+    const std::function<void(const ProgressUpdate&)>& liveProgress) {
     MitsubaRefinementDiagnostics& result = diagnostics.mitsuba;
     result.attempted = true;
     result.status = "preparing";
@@ -804,7 +872,8 @@ void runMitsubaInverseRefinement(
             staging / "backend.log",
             staging / "progress.txt",
             progress,
-            cancellationRequested);
+            cancellationRequested,
+            liveProgress);
         if (exitCode != 0) {
             result.status = "failed";
             result.decision = "backend process exited with code " + std::to_string(exitCode);

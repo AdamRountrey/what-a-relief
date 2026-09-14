@@ -1974,7 +1974,7 @@ cv::Mat photometricHeadroomWeights(const cv::Mat& raw) {
 }
 
 std::vector<cv::Mat> loadLuminanceImages(const Options& opt, std::vector<cv::Mat>* saturationMasks,
-    std::vector<cv::Mat>* headroomWeights) {
+    std::vector<cv::Mat>* headroomWeights, const std::function<void(int, int)>& progress) {
     const auto& paths = opt.imagePaths;
     std::vector<cv::Mat> images;
     images.reserve(paths.size());
@@ -2004,6 +2004,7 @@ std::vector<cv::Mat> loadLuminanceImages(const Options& opt, std::vector<cv::Mat
         }
         if (headroomWeights) headroomWeights->push_back(photometricHeadroomWeights(raw));
         images.push_back(gray);
+        if (progress) progress(static_cast<int>(i + 1), static_cast<int>(paths.size()));
     }
     normalizeRelativeIntensityStack(images);
     return images;
@@ -2095,14 +2096,19 @@ void saveOutputs(
     writeLightVectorsCsv(outDir / "light_vectors.csv", lights);
     reportProgress(progress, "Writing image outputs...");
     const cv::Mat albedo8 = albedoPreview8U(albedo, validMask);
+    reportProgress(progress, "Writing normal_rgb.png...");
     writeImageChecked(outDir / "normal_rgb.png", normalRgbTo8U(normalMap, validMask));
+    reportProgress(progress, "Writing normal_x.png and normal_y.png...");
     writeImageChecked(outDir / "normal_x.png", normalComponentTo8U(normalMap, validMask, 0, true));
     writeImageChecked(outDir / "normal_y.png", normalComponentTo8U(normalMap, validMask, 1, true));
+    reportProgress(progress, "Rendering diffuse hillshade_ul.png...");
     writeImageChecked(outDir / "hillshade_ul.png", hillshadeTo8U(normalMap, validMask, cv::Vec3f(-0.5f, 0.5f, 0.70710678f)));
+    reportProgress(progress, "Writing normal_z.png, albedo, residual, and validity mask...");
     writeImageChecked(outDir / "normal_z.png", normalComponentTo8U(normalMap, validMask, 2, false));
     writeImageChecked(outDir / "albedo.png", albedo8);
     writeImageChecked(outDir / "residual.png", normalizeFloatTo8U(residual, validMask, true));
     writeImageChecked(outDir / "valid_mask.png", validMask);
+    reportProgress(progress, "Rendering liquid_metal.png...");
     writeImageChecked(outDir / "liquid_metal.png", liquidMetalTo8U(normalMap, validMask));
     if (opt.neuralFusion && !diagnostics.neuralNormal.empty()) {
         writeNormalSet(outDir, "fused", normalMap, validMask);

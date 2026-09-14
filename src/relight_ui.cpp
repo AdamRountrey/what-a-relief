@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 
-void launchRelightViewer(const cv::Mat&, const cv::Mat&, const std::string&) {
+void launchRelightViewer(const cv::Mat&, const cv::Mat&, const std::string&, const std::function<bool()>&) {
     throw std::runtime_error("Interactive relighting is disabled in this build.");
 }
 
@@ -160,7 +160,8 @@ void saveFullResolution(const RelightState& state) {
 
 } // namespace
 
-void launchRelightViewer(const cv::Mat& normalMap, const cv::Mat& validMask, const std::string& outputDir) {
+void launchRelightViewer(const cv::Mat& normalMap, const cv::Mat& validMask, const std::string& outputDir,
+    const std::function<bool()>& closeRequested) {
     if (normalMap.empty() || validMask.empty()) {
         throw std::runtime_error("Cannot relight an empty normal map.");
     }
@@ -189,6 +190,7 @@ void launchRelightViewer(const cv::Mat& normalMap, const cv::Mat& validMask, con
     cv::Mat preview;
     bool done = false;
     while (!done) {
+        if (closeRequested && closeRequested()) break;
         if (state.dirty || preview.empty()) {
             preview = renderRelitMetal(state.previewNormals, state.previewMask, state.light);
             drawOverlay(preview, state);

@@ -17,6 +17,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
+#include <mutex>
 
 namespace {
 
@@ -1100,7 +1102,8 @@ void solvePhotometricStereo(
     cv::Mat& validMask,
     PhotometricDiagnostics& diagnostics,
     const std::vector<cv::Mat>& saturationMasks,
-    const std::vector<cv::Mat>& headroomWeights) {
+    const std::vector<cv::Mat>& headroomWeights,
+    const std::function<void(int, int)>& progress) {
     const int n = static_cast<int>(images.size());
     if (n < 3) {
         die("Photometric stereo requires at least 3 images.");
@@ -1218,6 +1221,16 @@ void solvePhotometricStereo(
 
     diagnostics.robustMeanIterations = 0.0;
     diagnostics.robustNonconvergedFraction = 0.0;
+    std::atomic_int rowsCompleted{0};
+    std::mutex progressMutex;
+    const auto rowFinished = [&]() {
+        if (!progress) return;
+        const int done = ++rowsCompleted;
+        if (done % 16 == 0 || done == rows) {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            progress(rowsCompleted.load(), rows);
+        }
+    };
     if (solverMode == NormalSolverMode::Robust) {
         std::vector<std::uint64_t> iterationsByRow(rows, 0);
         std::vector<std::uint64_t> limitedByRow(rows, 0);
@@ -1394,6 +1407,8 @@ void solvePhotometricStereo(
                         }
                     }
                 }
+                // Count completed rows, not thread-order Y positions.
+                rowFinished();
             }
         });
 
@@ -1697,6 +1712,7 @@ void solvePhotometricStereo(
             residualRow[x] = static_cast<float>(err);
             validRow[x] = 255;
         }
+        rowFinished();
     }
     });
 

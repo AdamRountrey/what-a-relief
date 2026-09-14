@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhatARelief
-    VERSION 0.2.6
+    VERSION 0.2.7
     DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
@@ -14,6 +14,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED COMPONENTS core dnn imgcodecs imgproc highgui)
 find_package(ZLIB REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 
 if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
     message(FATAL_ERROR
@@ -27,13 +28,14 @@ add_library(what-a-relief-core STATIC
     src/input_response.cpp
     src/mitsuba_backend.cpp
     src/photometric.cpp
+    src/project_io.cpp
     src/radiometry.cpp
     src/run_manifest.cpp
     src/rti_export.cpp
     src/shadow_refinement.cpp)
 target_include_directories(what-a-relief-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(what-a-relief-core PUBLIC ${OpenCV_LIBS} ZLIB::ZLIB)
+target_link_libraries(what-a-relief-core PUBLIC ${OpenCV_LIBS} ZLIB::ZLIB nlohmann_json::nlohmann_json)
 target_compile_features(what-a-relief-core PUBLIC cxx_std_17)
 target_compile_definitions(what-a-relief-core PUBLIC
     WHAT_A_RELIEF_VERSION="${WHAT_A_RELIEF_VERSION_STRING}")
@@ -52,6 +54,9 @@ add_executable(what-a-relief
 target_link_libraries(what-a-relief PRIVATE what-a-relief-core ${OpenCV_LIBS})
 if(WIN32)
     target_link_libraries(what-a-relief PRIVATE comdlg32 shell32 ole32 user32 gdi32 comctl32)
+    if(MSVC)
+        target_link_options(what-a-relief PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    endif()
 endif()
 target_compile_features(what-a-relief PRIVATE cxx_std_17)
 
@@ -64,6 +69,30 @@ if(WHAT_A_RELIEF_MITSUBA_PIPELINE_TEST AND NOT WHAT_A_RELIEF_MITSUBA_PYTHON)
     message(FATAL_ERROR "The inverse pipeline acceptance test requires WHAT_A_RELIEF_MITSUBA_PYTHON")
 endif()
 if(BUILD_TESTING)
+    add_executable(what-a-relief-project-tests tests/test_project_io.cpp)
+    target_link_libraries(what-a-relief-project-tests PRIVATE what-a-relief-core)
+    if(WIN32)
+        add_executable(what-a-relief-gui-tests tests/test_gui_lifecycle.cpp
+            src/gui_workflow.cpp src/crop_ui.cpp src/mask_ui.cpp src/scale_ui.cpp src/sphere_ui.cpp src/relight_ui.cpp)
+        target_link_libraries(what-a-relief-gui-tests PRIVATE what-a-relief-core comdlg32 shell32 ole32 user32 gdi32 comctl32)
+        if(DEFINED VCPKG_INSTALLED_DIR)
+            add_test(NAME gui-lifecycle COMMAND ${CMAKE_COMMAND}
+                "-DTEST_EXECUTABLE=$<TARGET_FILE:what-a-relief-gui-tests>"
+                "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_with_runtime.cmake")
+        else()
+            add_test(NAME gui-lifecycle COMMAND what-a-relief-gui-tests)
+        endif()
+        set_tests_properties(gui-lifecycle PROPERTIES TIMEOUT 40 RUN_SERIAL TRUE)
+    endif()
+    if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR)
+        add_test(NAME project-io COMMAND ${CMAKE_COMMAND}
+            "-DTEST_EXECUTABLE=$<TARGET_FILE:what-a-relief-project-tests>"
+            "-DRUNTIME_DIRECTORY=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_with_runtime.cmake")
+    else()
+        add_test(NAME project-io COMMAND what-a-relief-project-tests)
+    endif()
     if(WHAT_A_RELIEF_MITSUBA_PYTHON)
         add_test(
             NAME mitsuba-worker-numerics

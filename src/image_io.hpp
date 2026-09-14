@@ -16,7 +16,8 @@ std::vector<cv::Mat> loadLuminanceImages(
 std::vector<cv::Mat> loadLuminanceImages(
     const Options& opt,
     std::vector<cv::Mat>* saturationMasks = nullptr,
-    std::vector<cv::Mat>* headroomWeights = nullptr);
+    std::vector<cv::Mat>* headroomWeights = nullptr,
+    const std::function<void(int, int)>& progress = {});
 cv::Mat photometricHeadroomWeights(const cv::Mat& raw);
 double readPixelScaleMmFromImage(const std::string& path);
 cv::Mat loadDisplayImage(const std::string& path);

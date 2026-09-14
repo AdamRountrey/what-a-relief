@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "progress.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -33,4 +34,5 @@ void runMitsubaInverseRefinement(
     const std::vector<cv::Mat>& saturationMasks,
     PhotometricDiagnostics& diagnostics,
     const std::function<void(const std::string&, int)>& progress = {},
-    const std::function<bool()>& cancellationRequested = {});
+    const std::function<bool()>& cancellationRequested = {},
+    const std::function<void(const ProgressUpdate&)>& liveProgress = {});

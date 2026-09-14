@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -57,6 +59,8 @@ int main(int argc, char** argv) {
         }
         const fs::path output = fs::path(jobPath).parent_path();
         const std::string job = readFile(jobPath);
+        writeFile(output / "progress.txt", "50\nFake iteration 5/12\n{\"iteration\":5,\"total\":12,\"remaining_seconds\":23.0,\"preview_iteration\":0}\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         const bool malformedHeight = job.find("\"quality\": \"research\"") != std::string::npos;
         const bool accepted = malformedHeight || job.find("\"quality\": \"standard\"") != std::string::npos;
         if (job.find("\"encoding\": \"png16\"") == std::string::npos ||

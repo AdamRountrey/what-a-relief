@@ -392,6 +392,7 @@ void removeKnownRunFiles(const Options& opt) {
         "height.png",
         "height.pfm",
         "height_mask.png",
+        "project_height_mask.png",
         "shadow_height_correction.png",
         "shadow_height_correction.pfm",
         "shadow_constraint_count.png",
@@ -438,6 +439,9 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
         outputDir / "residual.png",
         outputDir / "valid_mask.png",
         outputDir / "liquid_metal.png"};
+    if (opt.hasHeightMask && !opt.heightMask.empty()) {
+        paths.push_back(outputDir / "project_height_mask.png");
+    }
     if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust && opt.specularDiagnostics) {
         paths.push_back(outputDir / "robust_weight.png");
         paths.push_back(outputDir / "robust_fallback_mask.png");
@@ -616,6 +620,8 @@ void writeParameters(std::ostream& out, const Options& opt) {
     writePathOrNull(out, opt.heightMaskPath);
     out << ",\n";
     out << "    \"interactive_height_mask\": " << (opt.hasHeightMask ? "true" : "false") << ",\n";
+    out << "    \"project_height_mask_file\": "
+        << (opt.hasHeightMask && !opt.heightMask.empty() ? "\"project_height_mask.png\"" : "null") << ",\n";
     out << "    \"crop\": ";
     if (opt.hasCrop) {
         out << "{\"x\": " << opt.crop.x << ", \"y\": " << opt.crop.y
@@ -657,6 +663,7 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"high_outlier_threshold\": " << opt.highOutlierThreshold << ",\n";
     out << "    \"normal_flattening\": \"" << flattenName(opt.flattenMode) << "\",\n";
     out << "    \"calculate_height\": " << (opt.calculateHeight ? "true" : "false") << ",\n";
+    out << "    \"open_relight_viewer\": " << (opt.openRelightViewer ? "true" : "false") << ",\n";
     out << "    \"height_solver\": \"" << heightSolverName(opt.heightSolverMode) << "\",\n";
     out << "    \"integration_iterations\": " << opt.integrationIterations << ",\n";
     out << "    \"height_flattening\": \"" << heightFlattenName(opt.heightFlattenMode) << "\",\n";
@@ -733,6 +740,9 @@ RunManifestContext beginRunManifest(const Options& opt) {
     context.startedUtc = utcNow();
     writeInProgressManifest(opt, context);
     removeKnownRunFiles(opt);
+    if (opt.hasHeightMask && !opt.heightMask.empty()) {
+        writeImageChecked(fs::path(opt.outputDir) / "project_height_mask.png", opt.heightMask);
+    }
     const fs::path defaultRti = fs::path(opt.outputDir) / "rti";
     if (!opt.exportRti && fs::is_regular_file(defaultRti / "rti_manifest.json")) {
         fs::remove_all(defaultRti);

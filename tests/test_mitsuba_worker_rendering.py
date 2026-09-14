@@ -133,6 +133,7 @@ class RenderingTests(unittest.TestCase):
                         job['outputs']['directory'] = str(output)
                         job_path = output / 'job.json'
                         run_job = json.loads(json.dumps(job))
+                        run_job['parameters']['live_preview'] = name == 'tilted'
                         if name == 'tilted_clipped_views':
                             for index in (1, 4):
                                 run_job['inputs']['images'].insert(index, str(inputs / 'clipped.png'))
@@ -140,6 +141,17 @@ class RenderingTests(unittest.TestCase):
                                 run_job['inputs']['lights'].insert(index, lights[0].tolist())
                         job_path.write_text(json.dumps(run_job), encoding='utf-8')
                         self.assertEqual(w.run_job(job_path), 0)
+                        if name == 'tilted':
+                            for iteration in (5, 6):
+                                preview = np.asarray(mi.Bitmap(str(output / f'iteration_{iteration}.png')))
+                                self.assertEqual(preview.shape, (side, 2 * side, 3))
+                                self.assertGreater(int(preview.max()) - int(preview.min()), 20)
+                            self.assertFalse((output / 'iteration_1.png').exists())
+                            live = json.loads((output / 'progress.txt').read_text().splitlines()[2])
+                            self.assertEqual(live['iteration'], 6)
+                            self.assertEqual(live['remaining_seconds'], 0)
+                        else:
+                            self.assertFalse(list(output.glob('iteration_*.png')))
                         result = json.loads((output / 'result.json').read_text())
                         reconstructed = w.read_pfm(output / 'inverse_height.pfm')
                         expected_normals = w.surface_normals(truth, mask)

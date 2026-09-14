@@ -108,6 +108,7 @@ class Progress:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._atomic_replace_supported = True
+        self.live: dict[str, Any] = {}
 
     @staticmethod
     def _is_sharing_violation(error: OSError) -> bool:
@@ -133,6 +134,8 @@ class Progress:
         percent = max(0, min(100, int(percent)))
         clean = " ".join(str(message).splitlines())
         text = f"{percent}\n{clean}\n"
+        if self.live:
+            text += json.dumps(self.live, allow_nan=False) + "\n"
         if self._atomic_replace_supported:
             try:
                 atomic_text(self.path, text)
@@ -882,6 +885,38 @@ def save_rgb(mi, path: Path, image: np.ndarray) -> None:
     _write_bitmap(path, bitmap)
 
 
+def iteration_preview(height_world, mask, spacing):
+    """Fixed-scale geometry display, not a render or an accepted reconstruction."""
+    q, p = masked_slopes(height_world, mask, *spacing)
+    normal = np.stack((-p, q, np.ones_like(p)), axis=-1)
+    normal /= np.maximum(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-8)
+    rgb = normal * 0.5 + 0.5
+    light = np.array([-0.5, 0.5, 2**-0.5], dtype=np.float32)
+    shade = 0.15 + 0.85 * np.maximum(0, normal @ light)
+    hillshade = np.repeat(shade[..., None], 3, axis=2)
+    rgb[~mask] = 0.12
+    hillshade[~mask] = 0.12
+    return np.concatenate((rgb, hillshade), axis=1)
+
+
+def publish_iteration(mi, progress, prepared, control, mapping, iteration, total, began):
+    if not prepared.get("live_preview", False):
+        return
+    elapsed = max(0.0, time.monotonic() - began)
+    progress.live.update(iteration=iteration, total=total,
+                         remaining_seconds=elapsed * (total - iteration) / max(iteration, 1))
+    if iteration % 5 != 0 and iteration != total:
+        return
+    try:
+        expanded = expand_control_numpy(control, mapping).reshape(prepared["height_small"].shape)
+        frame = iteration_preview(prepared["baseline_positions"][..., 2] + expanded,
+                                  prepared["mask_small"], prepared["world_spacing"])
+        save_rgb(mi, progress.path.parent / f"iteration_{iteration}.png", frame)
+        progress.live["preview_iteration"] = iteration
+    except (OSError, RuntimeError) as error:
+        print(f"Iteration preview unavailable: {error}", flush=True)
+
+
 def display_stretch(values: np.ndarray, mask: np.ndarray, symmetric: bool = False) -> np.ndarray:
     selected = values[mask & np.isfinite(values)]
     if selected.size == 0:
@@ -1391,6 +1426,7 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
     if refit_interval > 0:
         checkpoint(0)
     denominator = max(float(prepared["weights"][train].sum()), 1.0e-8)
+    iteration_began = time.monotonic()
     for iteration in range(iterations):
         # Accumulate the exact summed-objective gradient one light at a time;
         # retaining every renderer's AD graph scales poorly with image count.
@@ -1444,6 +1480,9 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
         if refit_interval > 0 and ((iteration + 1) % refit_interval == 0 or iteration + 1 == iterations):
             progress(22 + int(58 * (iteration + 1) / iterations), "Refitting material from training lights")
             checkpoint(iteration + 1)
+        if prepared.get("live_preview", False):
+            current_control = optimizer["height_control"].numpy().reshape((control_height, control_width))
+            publish_iteration(mi, progress, prepared, current_control, mapping, iteration + 1, iterations, iteration_began)
         progress(22 + int(58 * (iteration + 1) / iterations), f"Differentiable inverse iteration {iteration + 1}/{iterations}")
     if best is not None:
         _, control, expanded, best_material, selected_iteration = best
@@ -1542,6 +1581,7 @@ def run_job(job_path: Path) -> int:
             prediction_before, prepared["images_small"], prepared["weights"], holdout
         )
         mapping = control_mapping(render_height, render_width, int(settings["control_spacing"]))
+        prepared["live_preview"] = job.get("parameters", {}).get("live_preview", False) is True
         progress(20, "Optimizing a smooth height correction while preserving baseline detail")
         control, correction_small_world, iterations = optimize_ad(
             mi,

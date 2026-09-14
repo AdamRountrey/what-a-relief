@@ -20,6 +20,12 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <cstdio>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -27,10 +33,23 @@ void logStage(const std::string& message) {
     std::cout << message << std::endl;
 }
 
-using ProgressCallback = std::function<void(const std::string&, int)>;
+class ProgressCallback {
+public:
+    explicit ProgressCallback(GuiProgress callback) : callback_(std::move(callback)) {}
+    explicit operator bool() const { return static_cast<bool>(callback_); }
+    void stage(const std::string& value) { stage_ = value; }
+    void operator()(const std::string& message, int percent, double done = 0, double total = 0) const {
+        if (callback_) callback_({message, percent, stage_, done, total});
+    }
+    void live(const ProgressUpdate& event) const { if (callback_) callback_(event); }
+private:
+    GuiProgress callback_;
+    std::string stage_;
+};
 
-void reportStage(const ProgressCallback& progress, const std::string& message, int percent) {
+void reportStage(ProgressCallback& progress, const std::string& message, int percent) {
     logStage(message);
+    progress.stage(message);
     if (progress) {
         progress(message, percent);
     }
@@ -101,7 +120,8 @@ const char* heightFlattenName(HeightFlattenMode mode) {
     }
 }
 
-MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCallback& progress = {}) {
+GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}) {
+    ProgressCallback progress(callback);
     if (!opt.uncalibratedLighting && opt.lightsFile.empty() && !opt.hasSphere) {
         std::cout << "Select the highlight sphere on the first image.\n";
         opt.sphere = chooseSphereInteractive(loadDisplayImage(opt.imagePaths.front()));
@@ -119,7 +139,12 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
     std::vector<cv::Mat> saturationMasks;
     std::vector<cv::Mat> headroomWeights;
     const std::vector<cv::Mat> images = loadLuminanceImages(opt, &saturationMasks,
-        !opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust ? &headroomWeights : nullptr);
+        !opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust ? &headroomWeights : nullptr,
+        [&](int done, int total) {
+            progress("Loaded image " + std::to_string(done) + "/" + std::to_string(total) +
+                ": " + std::filesystem::path(opt.imagePaths[done - 1]).filename().string(),
+                5 + 9 * done / total, done, total);
+        });
     reportStage(progress, "[2/6] Loading mask...", 15);
     cv::Mat mask = loadMask(opt.maskPath, images[0].size());
     if (opt.hasCrop) {
@@ -246,7 +271,11 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
             validMask,
             diagnostics,
             saturationMasks,
-            headroomWeights);
+            headroomWeights,
+            [&](int done, int total) {
+                progress("Normal solve: " + std::to_string(done) + "/" + std::to_string(total) +
+                    " rows, " + std::to_string(images.size()) + " lights", 45 + 15 * done / total, done, total);
+            });
         std::cout << "      light geometry condition number: "
                   << diagnostics.lightingConditionNumber << std::endl;
         if (opt.solverMode == NormalSolverMode::Robust && diagnostics.robustNonconvergedFraction > 0.0) {
@@ -312,7 +341,7 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
                 [&](int done, int total) {
                     std::cout << "      height solve " << done << "/" << total << std::endl;
                     if (progress && total > 0) {
-                        progress("height solve " + std::to_string(done) + "/" + std::to_string(total), 72 + (12 * done) / total);
+                        progress("Height solve: step " + std::to_string(done) + "/" + std::to_string(total), 72 + (9 * done) / total, done, total);
                     }
                 });
             if (opt.heightFlattenMode != HeightFlattenMode::None) {
@@ -407,15 +436,14 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
             [&](const std::string& message, int backendPercent) {
                 const int mappedPercent = 92 + (7 * std::clamp(backendPercent, 0, 100)) / 100;
                 std::cout << "      " << message << std::endl;
-                if (opt.guiMode) {
-                    updateGuiProgress(message, mappedPercent);
-                } else if (progress) {
+                if (progress) {
                     progress(message, mappedPercent);
                 }
             },
             opt.guiMode
                 ? std::function<bool()>([]() { return guiProgressCancellationRequested(); })
-                : std::function<bool()>());
+                : std::function<bool()>(),
+            [&](const ProgressUpdate& event) { progress.live(event); });
     }
 
     completeRunManifest(opt, runManifest, lights, diagnostics);
@@ -424,65 +452,42 @@ MitsubaRefinementDiagnostics runPhotometricStereo(Options& opt, const ProgressCa
         progress("Complete.", 100);
     }
     std::cout << "Wrote photometric stereo outputs to: " << opt.outputDir << '\n';
-    if (opt.guiMode && opt.openRelightViewer) {
-        launchRelightViewer(normalMap, validMask, opt.outputDir);
-    }
-    return diagnostics.mitsuba;
+    return {diagnostics.mitsuba,
+        opt.guiMode && opt.openRelightViewer ? normalMap : cv::Mat(),
+        opt.guiMode && opt.openRelightViewer ? validMask : cv::Mat()};
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    bool graphicalLaunch = argc == 1;
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--gui") graphicalLaunch = true;
+    if (!graphicalLaunch) {
+        const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE), error = GetStdHandle(STD_ERROR_HANDLE);
+        const bool hasOutput = output && output != INVALID_HANDLE_VALUE && GetFileType(output) != FILE_TYPE_UNKNOWN;
+        const bool hasError = error && error != INVALID_HANDLE_VALUE && GetFileType(error) != FILE_TYPE_UNKNOWN;
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            FILE* stream = nullptr;
+            if (!hasOutput) (void)freopen_s(&stream, "CONOUT$", "w", stdout);
+            else SetStdHandle(STD_OUTPUT_HANDLE, output);
+            if (!hasError) (void)freopen_s(&stream, "CONOUT$", "w", stderr);
+            else SetStdHandle(STD_ERROR_HANDLE, error);
+        }
+    }
+#endif
     bool guiMode = false;
-    bool progressShown = false;
     try {
         Options opt = parseArgs(argc, argv);
         guiMode = opt.guiMode;
         if (opt.guiMode) {
-            if (!launchGuiWorkflow(opt)) {
-                return 0;
-            }
-            showGuiProgress("what-a-relief Processing", "Starting photometric stereo...");
-            progressShown = true;
-        }
-        const MitsubaRefinementDiagnostics inverse = runPhotometricStereo(
-            opt,
-            opt.guiMode
-                ? ProgressCallback([](const std::string& message, int percent) {
-                      updateGuiProgress(message, percent);
-                      if (guiProgressCancellationRequested()) {
-                          throw std::runtime_error("Processing canceled by user.");
-                      }
-                  })
-                : ProgressCallback());
-        if (progressShown) {
-            closeGuiProgress();
-            progressShown = false;
-        }
-        if (opt.guiMode) {
-            const std::string complete = "Outputs were written to:\n\n" + opt.outputDir;
-            if (inverse.candidateSaved) {
-                if (askGuiYesNo("what-a-relief Complete", complete +
-                    "\n\nMitsuba refinement was not accepted: " + inverse.decision +
-                    "\nThe default inverse height retains the baseline. An unvalidated candidate was saved separately."
-                    "\n\nOpen the comparison report? Viewing it does not accept the candidate.", false)) {
-                    openGuiReviewFile(inverse.candidateReviewPath);
-                }
-            } else {
-                const std::string inverseStatus = inverse.attempted && !inverse.accepted
-                    ? "\n\nMitsuba refinement was not accepted: " + inverse.decision +
-                      "\nThe default inverse height retains the baseline."
-                      "\nCandidate export: " + inverse.candidateExportStatus + ". See inverse/result.json."
-                    : "";
-                showGuiInfo("what-a-relief Complete", complete + inverseStatus);
-            }
+            launchGuiApplication(opt, runPhotometricStereo);
+        } else {
+            runPhotometricStereo(opt);
         }
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
-        if (progressShown) {
-            closeGuiProgress();
-        }
         if (guiMode && std::string(e.what()) != "Processing canceled by user.") {
             showGuiInfo("what-a-relief Error", e.what());
         }

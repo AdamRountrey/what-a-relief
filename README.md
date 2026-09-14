@@ -61,14 +61,14 @@ cmake --preset ninja-vcpkg
 cmake --build --preset ninja-vcpkg-release
 ```
 
-If you use a standalone OpenCV install instead, set `OpenCV_DIR` to that install's `OpenCVConfig.cmake` directory and provide the zlib development headers/library (set `ZLIB_ROOT` if CMake cannot find them). The CMake file intentionally rejects Anaconda paths. The vcpkg build supplies both dependencies.
+If you use a standalone OpenCV install instead, set `OpenCV_DIR` to that install's `OpenCVConfig.cmake` directory and provide the zlib development headers/library (set `ZLIB_ROOT` if CMake cannot find them) and the `nlohmann_json` CMake package. The CMake file intentionally rejects Anaconda paths. The vcpkg build supplies all three dependencies; the JSON parser is header-only and adds no runtime installation step.
 
 ```powershell
 cmake -S . -B build -DOpenCV_DIR=C:/opencv/build/x64/vc16/lib
 cmake --build build --config Release
 ```
 
-The executable target is `what-a-relief`; on Windows the direct build writes `build-vcpkg-direct\what-a-relief.exe`. The direct build and installer accept `-Version` (currently `0.2.6`); CMake accepts `-DWHAT_A_RELIEF_VERSION_STRING=0.2.6`. This version is recorded in run manifests. When packaging with `-SkipBuild`, use the same version as the already-built executable.
+The executable target is `what-a-relief`; on Windows the direct build writes `build-vcpkg-direct\what-a-relief.exe`. The direct build and installer accept `-Version` (currently `0.2.7`); CMake accepts `-DWHAT_A_RELIEF_VERSION_STRING=0.2.7`. This version is recorded in run manifests. When packaging with `-SkipBuild`, use the same version as the already-built executable.
 
 ### Scientific regression tests
 
@@ -94,7 +94,7 @@ To rebuild the app, package the OpenCV DLLs, and create the installer in one ste
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
 ```
 
-The installer is written to `dist\what-a-relief-0.2.6-setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\what-a-relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
+The installer is written to `dist\what-a-relief-0.2.7-setup.exe` by default. It installs under `%LOCALAPPDATA%\Programs\what-a-relief`, creates a Start Menu shortcut, and registers an uninstall entry for the current user. It does not require administrator privileges.
 
 The installer is currently unsigned. Distribute it from a trusted release location, and expect Windows SmartScreen or antivirus tools to warn about new unsigned binaries.
 
@@ -106,11 +106,11 @@ The standard installer remains self-contained and does not include the larger in
 powershell.exe -ExecutionPolicy Bypass -File scripts\build-mitsuba-backend-installer.ps1
 ```
 
-The optional `dist\what-a-relief-0.2.6-mitsuba-backend-setup.exe` bundles private CPython 3.13.13, Mitsuba 3.8.0, Dr.Jit 1.3.1, NumPy 2.3.3, and official LLVM 15.0.7. Run it separately after installing the main application to place the backend under `%LOCALAPPDATA%\Programs\what-a-relief-mitsuba`; users do not install Python, pip, Conda, Anaconda, or LLVM separately. Packaging requires staged numerical and real CPU rendering tests to pass. The [earlier package record](docs/review-fixes-2026-09.md#backend-package) documents the runtime compatibility investigation; those historical hashes are not hashes of the current package. Extraction tests do not install or modify the user's existing application.
+The optional `dist\what-a-relief-0.2.7-mitsuba-backend-setup.exe` bundles private CPython 3.13.13, Mitsuba 3.8.0, Dr.Jit 1.3.1, NumPy 2.3.3, and official LLVM 15.0.7. Run it separately after installing the main application to place the backend under `%LOCALAPPDATA%\Programs\what-a-relief-mitsuba`; users do not install Python, pip, Conda, Anaconda, or LLVM separately. Packaging requires staged numerical and real CPU rendering tests to pass. The [earlier package record](docs/review-fixes-2026-09.md#backend-package) documents the runtime compatibility investigation; those historical hashes are not hashes of the current package. Extraction tests do not install or modify the user's existing application.
 
 Official LLVM 15.0.7 is the empirically tested Windows CPU compatibility pin, with at most eight workers and both primary and indirect silhouette sampling enabled. The Windows guard requires LLVM major version 15 and directs incompatible installations to reinstall the backend. CUDA's moving-shadow probe passed, but GPU reconstruction remains unqualified. See the [backend README](tools/mitsuba_backend/README.md).
 
-GitHub Actions can also build the Windows application installer, portable ZIP, and self-contained Mitsuba backend installer. Run the **Windows Build** workflow manually to download them as workflow artifacts, or push a version tag such as `v0.2.6` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installers with the same tag-derived version. The package builders verify required models, backend components, and license files; the portable ZIP is assembled from an explicit runtime whitelist, so old smoke runs or input data in the build folder cannot enter the artifact.
+GitHub Actions can also build the Windows application installer, portable ZIP, and self-contained Mitsuba backend installer. Run the **Windows Build** workflow manually to download them as workflow artifacts, or push a version tag such as `v0.2.7` to publish those files on a GitHub Release. Tagged builds stamp the executable manifest and installers with the same tag-derived version. The package builders verify required models, backend components, and license files; the portable ZIP is assembled from an explicit runtime whitelist, so old smoke runs or input data in the build folder cannot enter the artifact.
 
 ## Run
 
@@ -126,7 +126,23 @@ The setup window lets you choose the image set, output folder, lighting mode, op
 
 The program prints progress in the console and shows progress in the GUI while long operations run. Skipping height is faster and still writes normals, relative albedo, residual, light metadata, and `liquid_metal.png`. If experimental neural fusion is enabled, the output folder also includes separate classical, neural, and fused normal-map sets so the result can be reviewed directly. Height preview, `surface.ply`, and `printable_surface.ply` stay on the classical geometry path in that mode. If the interactive specular relight viewer is enabled, drag in the viewer to move the virtual light, press `S` to save the current full-resolution view as `liquid_metal_custom.png`, press `R` to reset the light, or Esc to close. If height preview and PLY export are enabled, the GUI writes `surface.ply`, an open inspection mesh made from the reconstructed height field. If printable export is enabled, it also writes `printable_surface.ply`, a watertight solid PLY with a flat base. The optional smart-fill checkbox reconstructs enclosed missing surface pixels only for that printable mesh and writes `printable_fill_mask.png` to disclose every synthesized pixel.
 
-When a Mitsuba candidate fails automatic validation but has finite geometry, GUI completion offers to open its offline HTML comparison report, with **No** selected by default. The report can also be opened directly from `inverse/unvalidated_candidate/review.html`. Opening it or acknowledging its warning does not accept the candidate or replace any default output.
+Processing runs in a background worker; the tabs and window continue to repaint while it runs. The **Progress** tab opens when a run starts and retains the most recent 200 progress messages. Image loading reports files completed, and calibrated normal solving reports completed rows. The bar shows the current stage's measured progress, or an activity indicator when that stage has no work count. Elapsed time updates throughout the run. **Stage ETA** estimates only the current measured stage, not the entire pipeline; unmeasured or overdue estimates say "estimating". Inverse optimization uses measured iteration times and explicitly excludes subsequent validation/export.
+
+Mitsuba GUI runs show a reduced-resolution preview every fifth iteration and at the final iteration: RGB normals on the left and fixed-light diffuse hillshade on the right. These previews use the current optimization height and physical XY spacing, with fixed display mapping, without an extra rendering pass. They are provisional, not validated outputs; the final selected iteration can differ. Normal outputs, acceptance checks, and baseline protection are unchanged. Older custom workers still run but do not provide live previews. Starting another run clears the previous preview.
+
+The Windows executable uses the GUI subsystem, so a graphical launch does not create a terminal behind it. Command-line runs retain redirected output and can attach to an existing terminal ([Windows console attachment](https://learn.microsoft.com/en-us/windows/console/attachconsole)); in `cmd.exe` scripts use `start /wait` if you need to wait for the GUI-subsystem executable.
+
+After processing, the main window stays open and keeps the current settings, including the Advanced tab. Completion, cancellation, and processing errors appear in the status area beneath the tabs; there is no completion popup. Adjust the settings and click **Run Again**, or use the **File** menu:
+
+- **New Project** (`Ctrl+N`) clears images, selections, and processing settings. This computer's explicit backend configuration is retained.
+- **Open Completed Project** (`Ctrl+O`) opens a prior output folder's `run_manifest.json`. Input order, scale, lighting setup, sphere/crop, masks, and processing/export options return to the tabs for review before Start. Original photographs must still be available. When moving a project, keep the image/output folder layout together.
+- **Open Output Folder** opens the most recent completed or reopened result folder.
+- **Review Inverse Candidate** opens the offline comparison report when an unvalidated candidate exists. Viewing it never accepts the candidate or changes default outputs.
+- **Exit** closes the application. During processing it requests cancellation and exits at the next processing checkpoint; **Cancel Run** instead keeps the window and settings available.
+
+GUI runs preserve prior results by choosing an unused output directory when the selected directory is nonempty, for example `what-a-relief-2`. Reopening a completed project does not write files or start computation. New/Open are disabled during a solve to prevent changing its inputs. Selecting New/Open/Exit while the optional relight viewer is open closes that viewer before switching projects. CLI jobs remain single-run and retain their existing output-replacement behavior.
+
+New runs save interactive specimen selections as `project_height_mask.png`, separately from the final `height_mask.png`. Older runs without this snapshot restore the final height mask with a warning: it can contain previous validity exclusions, so redraw the outline to reconsider those pixels. If an older run never saved either mask, reopening asks you to redraw the outline on the Geometry tab before calculating masked height. These masks still affect only height and geometry, never the normal or albedo solve. Custom backend executable/script paths are not restored from project JSON; configure trusted local paths on this computer. Completed runs are reopenable projects; saving unfinished setup drafts is not currently supported.
 
 ```powershell
 .\build-vcpkg-direct\what-a-relief.exe `
@@ -160,6 +176,7 @@ For repeat runs, use the sphere values written to `lights.csv`. The full file as
 ## Outputs
 
 - `run_manifest.json`: authoritative status and provenance summary for the run. It is written as `in_progress` before computation and changed to `complete` only after every requested output is present and nonempty. It records application version, input paths/sizes/timestamps, parameters, light vectors, solve conditioning and coverage, and generated files/sizes; it is not a cryptographic content-hash record.
+- `project_height_mask.png`: original interactive specimen selection for reopening a completed project, before integration-domain validity exclusions. Saved only when an interactive mask exists.
 - `lights.csv`: selected sphere geometry, estimated highlight points, light vectors, thresholds, peaks, and selected-highlight pixel counts. In uncalibrated mode this file records that no calibrated light vectors were used.
 - `light_vectors.csv`: just the `x,y,z` light vectors, suitable for `--lights-file`. In uncalibrated mode it contains only the header because no physical light vectors are estimated.
 - `normal_rgb.png`: 8-bit RGB visualization of the estimated normal map.

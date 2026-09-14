@@ -19,6 +19,22 @@ spec.loader.exec_module(w)
 
 
 class NumericalTests(unittest.TestCase):
+    def test_iteration_preview_uses_world_spacing_and_fixed_normal_encoding(self):
+        yy, xx = np.mgrid[:12, :16].astype(np.float32)
+        mask = np.ones_like(xx, dtype=bool)
+        mask[3:5, 6:8] = False
+        height = 10 + 0.2 * xx * 0.3 - 0.1 * yy * 0.7
+        original = height.copy()
+        image = w.iteration_preview(height, mask, (0.7, 0.3))
+        expected = np.array([-0.2, -0.1, 1.0])
+        expected = 0.5 + 0.5 * expected / np.linalg.norm(expected)
+        np.testing.assert_allclose(image[2, 2], expected, atol=1e-5)
+        self.assertEqual(image.shape, (12, 32, 3))
+        self.assertTrue(np.all(np.isfinite(image)))
+        np.testing.assert_allclose(image[3, 6], 0.12)
+        np.testing.assert_array_equal(height, original)
+        np.testing.assert_allclose(w.iteration_preview(height + 100, mask, (0.7, 0.3)), image, atol=1e-5)
+
     @staticmethod
     def light_support_fixture(count=8):
         angle = 2 * np.pi * np.arange(count) / count

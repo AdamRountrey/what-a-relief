@@ -39,7 +39,8 @@ void solvePhotometricStereo(
     cv::Mat& validMask,
     PhotometricDiagnostics& diagnostics,
     const std::vector<cv::Mat>& saturationMasks = {},
-    const std::vector<cv::Mat>& headroomWeights = {});
+    const std::vector<cv::Mat>& headroomWeights = {},
+    const std::function<void(int, int)>& progress = {});
 void solveUncalibratedPhotometricStereo(
     const std::vector<cv::Mat>& images,
     const cv::Mat& inputMask,

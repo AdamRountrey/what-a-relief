@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.6",
+    [string]$Version = "0.2.7",
     [switch]$SkipBuild
 )
 
@@ -55,6 +55,7 @@ function Write-ThirdPartyLicenseBundle {
     }
 
     $packages = @(
+        @{ Package = "nlohmann-json"; Display = "JSON for Modern C++ (nlohmann/json)" },
         @{ Package = "opencv4"; Display = "OpenCV 4" },
         @{ Package = "abseil"; Display = "Abseil" },
         @{ Package = "protobuf"; Display = "Protocol Buffers" },
