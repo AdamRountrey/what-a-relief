@@ -1,4 +1,5 @@
 #include "rti_export.hpp"
+#include "calibration.hpp"
 #include "input_response.hpp"
 #include "checked_io.hpp"
 #include "radiometry.hpp"
@@ -46,7 +47,8 @@ void validateRtiDestination(const fs::path& destination, const Options& opt) {
         die("RTI output must be an empty folder or an existing what-a-relief RTI package: " + destination.string());
     }
     std::vector<std::string> inputs = opt.imagePaths;
-    inputs.insert(inputs.end(), {opt.lightsFile, opt.maskPath, opt.heightMaskPath, opt.neuralModelPath});
+    inputs.insert(inputs.end(), {opt.lightsFile, opt.microscopeCalibrationFile,
+                                 opt.maskPath, opt.heightMaskPath, opt.neuralModelPath});
     for (const std::string& input : inputs) {
         if (input.empty()) {
             continue;
@@ -96,7 +98,12 @@ private:
     bool committed_ = false;
 };
 
-cv::Mat loadRtiColorImage(const std::string& path, const cv::Size& expectedSize, bool srgb) {
+cv::Mat loadRtiColorImage(
+    const std::string& path,
+    const cv::Size& expectedSize,
+    bool srgb,
+    const MicroscopeRectificationMaps* microscope,
+    double lightGain) {
     cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
     if (raw.empty()) {
         die("Failed to read RTI image: " + path);
@@ -116,7 +123,15 @@ cv::Mat loadRtiColorImage(const std::string& path, const cv::Size& expectedSize,
         die("Unsupported channel count for RTI image: " + path);
     }
 
-    return convertToLinearColor(bgr, srgb);
+    cv::Mat linear = convertToLinearColor(bgr, srgb);
+    if (microscope != nullptr) {
+        // Keep geometric interpolation in linear light for both scientific
+        // input and display-encoded color images.
+        linear = rectifyMicroscopeImage(linear, *microscope, cv::INTER_LINEAR);
+    }
+    if (!std::isfinite(lightGain) || lightGain <= 0.0) die("RTI light gain must be finite and positive.");
+    linear *= static_cast<float>(1.0 / lightGain);
+    return linear;
 }
 
 bool solveSymmetric6x6(
@@ -979,8 +994,24 @@ void exportRtiPackage(
 
     std::vector<cv::Mat> images;
     images.reserve(opt.imagePaths.size());
+    const bool hasMicroscopeCalibration = !opt.microscopeCalibrationFile.empty();
+    const MicroscopeCalibration microscope = hasMicroscopeCalibration
+        ? loadMicroscopeCalibration(opt.microscopeCalibrationFile)
+        : MicroscopeCalibration{};
+    if (hasMicroscopeCalibration) {
+        validateMicroscopeCalibration(microscope, expectedSize, opt.imagePaths.size());
+    }
+    const MicroscopeRectificationMaps rectificationMaps = hasMicroscopeCalibration
+        ? buildMicroscopeRectificationMaps(microscope)
+        : MicroscopeRectificationMaps{};
     for (size_t i = 0; i < opt.imagePaths.size(); ++i) {
-        images.push_back(loadRtiColorImage(opt.imagePaths[i], expectedSize, inputResponseForImage(opt, i).srgb));
+        const double gain = opt.lightGains.empty() ? 1.0 : opt.lightGains.at(i);
+        images.push_back(loadRtiColorImage(
+            opt.imagePaths[i],
+            expectedSize,
+            inputResponseForImage(opt, i).srgb,
+            hasMicroscopeCalibration ? &rectificationMaps : nullptr,
+            gain));
     }
     normalizeRelativeIntensityStack(images, false);
 

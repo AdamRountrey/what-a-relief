@@ -156,6 +156,7 @@ LoadedProject loadCompletedProject(const fs::path& manifestOrDirectory) {
     opt.outputDir = freshProjectOutputDirectory(manifest.parent_path());
     readBool(p, "keep_sphere_in_solve", opt.keepSphere);
     readBool(p, "lights_file_order_override", opt.lightsFileByOrder);
+    readBool(p, "estimate_light_gains", opt.estimateLightGains);
     readBool(p, "calculate_height", opt.calculateHeight);
     readBool(p, "open_relight_viewer", opt.openRelightViewer);
     readBool(p, "printable_fill_holes", opt.printableFillHoles);
@@ -183,7 +184,8 @@ LoadedProject loadCompletedProject(const fs::path& manifestOrDirectory) {
     readEnum(p, "mitsuba_backend_requested", opt.mitsubaBackendMode,
         {{"auto", MitsubaBackendMode::Auto}, {"cpu", MitsubaBackendMode::Cpu}, {"cuda", MitsubaBackendMode::Cuda}});
     readEnum(p, "mitsuba_quality", opt.mitsubaQualityMode,
-        {{"preview", MitsubaQualityMode::Preview}, {"standard", MitsubaQualityMode::Standard}, {"research", MitsubaQualityMode::Research}});
+        {{"preview", MitsubaQualityMode::Preview}, {"standard", MitsubaQualityMode::Standard},
+         {"research", MitsubaQualityMode::Research}, {"ultra", MitsubaQualityMode::Ultra}});
     if (p.contains("input_response_mode")) {
         readEnum(p, "input_response_mode", opt.inputResponseMode,
             {{"auto", InputResponseMode::Auto}, {"linear", InputResponseMode::Linear}, {"srgb", InputResponseMode::Srgb}});
@@ -224,6 +226,38 @@ LoadedProject loadCompletedProject(const fs::path& manifestOrDirectory) {
         opt.sphere = {numberValue(sphere.at("cx"), "sphere cx", 0),
             numberValue(sphere.at("cy"), "sphere cy", 0), numberValue(sphere.at("radius"), "sphere radius", 0)};
         if (opt.sphere.radius == 0) throw invalid("sphere radius");
+        if (sphere.contains("selection_image_index")) {
+            if (!sphere.at("selection_image_index").is_number_integer()) {
+                throw invalid("sphere selection image index");
+            }
+            opt.sphereSelectionImageIndex = static_cast<int>(numberValue(
+                sphere.at("selection_image_index"), "sphere selection image index", 0,
+                std::numeric_limits<int>::max()));
+            if (opt.sphereSelectionImageIndex >= static_cast<int>(opt.imagePaths.size())) {
+                throw invalid("sphere selection image index");
+            }
+        }
+        if (sphere.contains("fit_rms_pixels")) {
+            opt.sphereFitRmsPixels = numberValue(sphere.at("fit_rms_pixels"), "sphere fit RMS", -1);
+        }
+        if (sphere.contains("fit_max_residual_pixels")) {
+            opt.sphereFitMaxResidualPixels = numberValue(
+                sphere.at("fit_max_residual_pixels"), "sphere fit maximum residual", -1);
+        }
+        if (sphere.contains("fit_coverage_degrees")) {
+            opt.sphereFitCoverageDegrees = numberValue(
+                sphere.at("fit_coverage_degrees"), "sphere fit coverage", -1, 360);
+        }
+        if (sphere.contains("edge_points")) {
+            const Json& points = sphere.at("edge_points");
+            if (!points.is_array() || points.size() > 64) throw invalid("sphere edge points");
+            for (const Json& point : points) {
+                if (!point.is_array() || point.size() != 2) throw invalid("sphere edge point");
+                opt.sphereEdgePoints.emplace_back(
+                    numberValue(point.at(0), "sphere edge x", 0),
+                    numberValue(point.at(1), "sphere edge y", 0));
+            }
+        }
         opt.hasSphere = true;
     }
     if (p.contains("view_direction")) {
@@ -270,6 +304,16 @@ LoadedProject loadCompletedProject(const fs::path& manifestOrDirectory) {
             }
         } else if (!opt.hasSphere) {
             opt.lightsFile = dataPath("lights.csv");
+        }
+    }
+    const std::string microscopeCalibration = optionalPath(p, "microscope_calibration_file");
+    if (!microscopeCalibration.empty()) {
+        try {
+            opt.microscopeCalibrationFile = dataPath(microscopeCalibration);
+        } catch (const std::exception&) {
+            opt.microscopeCalibrationFile = dataPath("microscope_calibration.json");
+            project.warnings.push_back(
+                "The original microscope calibration is unavailable; the copy saved with the completed run is being reused.");
         }
     }
     if (!optionalPath(p, "mesh_path").empty()) opt.meshPath = (fs::path(opt.outputDir) / "surface.ply").string();

@@ -142,7 +142,10 @@ MitsubaQualityMode parseMitsubaQualityMode(const std::string& s) {
     if (s == "research" || s == "high") {
         return MitsubaQualityMode::Research;
     }
-    die("Invalid Mitsuba quality: " + s + " (use preview, standard, or research)");
+    if (s == "ultra" || s == "full" || s == "native") {
+        return MitsubaQualityMode::Ultra;
+    }
+    die("Invalid Mitsuba quality: " + s + " (use preview, standard, research, or ultra)");
 }
 
 } // namespace
@@ -156,8 +159,9 @@ void printUsage() {
         << "Required:\n"
         << "  --image path                 Add one image. Use at least 3 times.\n\n"
         << "Interactive sphere selection:\n"
-        << "  If --sphere, --lights-file, and --uncalibrated are omitted, the first image opens in a window.\n"
-        << "  Click three points on the sphere edge, then press Enter or Space.\n"
+        << "  If --sphere, --lights-file, and --uncalibrated are omitted, the image set opens in a window.\n"
+        << "  Use Page Up/Page Down to choose one photo, click at least five well-spaced sphere-edge\n"
+        << "  points in that photo, then press Enter or Space when the quality-checked fit is green.\n"
         << "  Mouse wheel/+/- zoom; right-drag, WASD, or arrow keys pan.\n\n"
         << "Options:\n"
         << "  --out dir                    Output directory. Default: out\n"
@@ -167,6 +171,8 @@ void printUsage() {
         << "  --crop x y width height      Restrict solve to a rectangular image region.\n"
         << "  --sphere cx cy radius        Reuse a known sphere circle without the GUI.\n"
         << "  --lights-file path           CSV/text file with one x,y,z light vector per image.\n"
+        << "  --microscope-calibration f   Apply a reusable working-plane warp/scale and load its response prior.\n"
+        << "  --estimate-light-gains       Estimate relative gains from specimen pixels; apply only after held-out validation.\n"
         << "  --no-gui                     Disable interactive selection. Requires --sphere, --lights-file, or --uncalibrated.\n"
         << "  --input-response auto|linear|srgb  Input response (default: auto metadata).\n"
         << "  --srgb                       Force sRGB decoding (override metadata).\n"
@@ -187,7 +193,8 @@ void printUsage() {
         << "  --mitsuba-python path        Python executable from the isolated what-a-relief Mitsuba backend.\n"
         << "  --mitsuba-worker path        Override the versioned Mitsuba worker script.\n"
         << "  --mitsuba-backend mode       auto, cuda, or cpu. Default: auto\n"
-        << "  --mitsuba-quality mode       preview, standard, or research. Default: standard\n"
+        << "  --mitsuba-quality mode       preview, standard, research, or ultra. Default: standard\n"
+        << "                               Ultra solves absolute height on a grid capped at 1024 px on its longer side.\n"
         << "  --neural-fusion             Run bundled PS-FCN neural normal prior and fuse it with the classical solve.\n"
         << "                               Experimental; calibrated mode only, supports 3 to 25 images.\n"
         << "                               Height/PLY remain classical-only to avoid exaggerated geometry.\n"
@@ -216,6 +223,12 @@ void printUsage() {
         << "  --rti-color rgb|lrgb         RTI color model. LRGB uses a base image plus luminance PTM. Default: rgb\n"
         << "  --keep-sphere                Do not remove the calibration sphere from the solve mask.\n"
         << "  --view-dir x y z             Camera view vector. Default: 0 0 1\n"
+        << "\nMicroscope calibration utilities:\n"
+        << "  --make-calibration-target f.svg   Write a printable checkerboard at exact millimeter size.\n"
+        << "  --create-microscope-calibration f.json\n"
+        << "                               Build a calibration from the --image stack (one image per light).\n"
+        << "  --calibration-grid x y mm    Number of printed squares and square size. Default: 12 9 2\n"
+        << "  --calibration-page w h       Target SVG page size in mm. Default: 210 297\n"
         << "  --help                       Show this help.\n";
 }
 
@@ -263,6 +276,26 @@ Options parseArgs(int argc, char** argv) {
         } else if (arg == "--lights-file") {
             need(1);
             opt.lightsFile = argv[++i];
+        } else if (arg == "--microscope-calibration") {
+            need(1);
+            opt.microscopeCalibrationFile = argv[++i];
+        } else if (arg == "--estimate-light-gains") {
+            opt.estimateLightGains = true;
+        } else if (arg == "--make-calibration-target") {
+            need(1);
+            opt.calibrationTargetPath = argv[++i];
+        } else if (arg == "--create-microscope-calibration") {
+            need(1);
+            opt.createMicroscopeCalibrationPath = argv[++i];
+        } else if (arg == "--calibration-grid") {
+            need(3);
+            opt.calibrationGridColumns = parseInt(argv[++i], "calibration grid columns");
+            opt.calibrationGridRows = parseInt(argv[++i], "calibration grid rows");
+            opt.calibrationSquareMm = parseDouble(argv[++i], "calibration square size");
+        } else if (arg == "--calibration-page") {
+            need(2);
+            opt.calibrationPageWidthMm = parseDouble(argv[++i], "calibration page width");
+            opt.calibrationPageHeightMm = parseDouble(argv[++i], "calibration page height");
         } else if (arg == "--sphere") {
             need(3);
             opt.sphere.cx = parseDouble(argv[++i], "sphere cx");
@@ -401,14 +434,33 @@ Options parseArgs(int argc, char** argv) {
         }
     }
 
-    if (!opt.guiMode && !validImageCount(opt.imagePaths.size())) {
+    const bool calibrationUtility = !opt.calibrationTargetPath.empty() || !opt.createMicroscopeCalibrationPath.empty();
+    if (!opt.guiMode && !calibrationUtility && !validImageCount(opt.imagePaths.size())) {
         die("Use at least 3 --image arguments.");
     }
     if (opt.guiMode && !opt.imagePaths.empty() && !validImageCount(opt.imagePaths.size())) {
         die("Use at least 3 --image arguments.");
     }
-    if (opt.noGui && opt.lightsFile.empty() && !opt.hasSphere && !opt.uncalibratedLighting) {
+    if (opt.noGui && !calibrationUtility && opt.lightsFile.empty() && !opt.hasSphere && !opt.uncalibratedLighting) {
         die("--no-gui requires --sphere, --lights-file, or --uncalibrated.");
+    }
+    if (!opt.calibrationTargetPath.empty() && !opt.createMicroscopeCalibrationPath.empty()) {
+        die("Choose either --make-calibration-target or --create-microscope-calibration.");
+    }
+    if (!opt.createMicroscopeCalibrationPath.empty() && opt.imagePaths.size() < 3) {
+        die("--create-microscope-calibration requires at least 3 checkerboard --image files.");
+    }
+    if (opt.estimateLightGains && opt.uncalibratedLighting) {
+        die("--estimate-light-gains requires known light directions from a sphere or lights file.");
+    }
+    if (opt.calibrationGridColumns < 5 || opt.calibrationGridColumns > 80 ||
+        opt.calibrationGridRows < 5 || opt.calibrationGridRows > 80 ||
+        !std::isfinite(opt.calibrationSquareMm) || opt.calibrationSquareMm <= 0.0) {
+        die("--calibration-grid requires 5-80 squares per axis and a positive finite square size.");
+    }
+    if (!std::isfinite(opt.calibrationPageWidthMm) || opt.calibrationPageWidthMm <= 0.0 ||
+        !std::isfinite(opt.calibrationPageHeightMm) || opt.calibrationPageHeightMm <= 0.0) {
+        die("--calibration-page dimensions must be positive finite millimeter values.");
     }
     if (opt.uncalibratedLighting && (!opt.lightsFile.empty() || opt.hasSphere)) {
         die("--uncalibrated cannot be combined with --sphere or --lights-file.");

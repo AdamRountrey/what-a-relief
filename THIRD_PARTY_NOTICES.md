@@ -39,9 +39,9 @@ only by the opt-in inverse-rendering experiment:
 | --- | --- | --- |
 | CPython 3.13.13 embeddable distribution | Private interpreter for the versioned worker | Python Software Foundation License; `PYTHON_LICENSE.txt` is installed with the runtime |
 | Mitsuba 3.8.0 | Differentiable rendering | Wenzel Jakob and contributors; BSD-style license retained in the wheel metadata |
-| Dr.Jit 1.3.1 | Automatic differentiation and CUDA/LLVM execution | Wenzel Jakob and contributors; BSD-3-Clause license retained in the wheel metadata |
+| Dr.Jit 1.3.1 | Automatic differentiation and CUDA/LLVM execution | Wenzel Jakob and contributors; BSD-3-Clause license retained in the wheel metadata. The optional Windows backend replaces `drjit-core.dll` with a source build from pinned commit `213983e47c99db0c6ab5e3dfce952e68bb9a8bd3` carrying the bundled large-CUDA-reduction overflow patch. |
 | NumPy 2.3.3 | Numeric arrays and image data transfer | NumPy Developers; BSD-3-Clause and bundled-library notices retained in the wheel metadata |
-| LLVM 18.1.6 `LLVM-C.dll` | CPU execution for systems without a compatible NVIDIA GPU | Apache License 2.0 with LLVM Exceptions; `LLVM_LICENSE.TXT` is installed with the runtime |
+| LLVM 15.0.7 `LLVM-C.dll` | CPU execution for systems without a compatible NVIDIA GPU | Apache License 2.0 with LLVM Exceptions; `LLVM_LICENSE.TXT` is installed with the runtime |
 
 The add-on build uses exact Windows artifacts with pinned SHA-256 values and
 performs a live LLVM render probe before packaging and installation. It does

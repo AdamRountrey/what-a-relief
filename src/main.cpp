@@ -1,10 +1,12 @@
 #include "args.hpp"
+#include "calibration.hpp"
 #include "gui_workflow.hpp"
 #include "image_io.hpp"
 #include "input_response.hpp"
 #include "mitsuba_backend.hpp"
 #include "neural_fusion.hpp"
 #include "photometric.hpp"
+#include "radiometry.hpp"
 #include "relight_ui.hpp"
 #include "run_manifest.hpp"
 #include "rti_export.hpp"
@@ -122,13 +124,42 @@ const char* heightFlattenName(HeightFlattenMode mode) {
 
 GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}) {
     ProgressCallback progress(callback);
+    std::vector<double> lightGainPrior;
+    if (!opt.microscopeCalibrationFile.empty()) {
+        const MicroscopeCalibration calibration = loadMicroscopeCalibration(opt.microscopeCalibrationFile);
+        if (calibration.lightGains.size() != opt.imagePaths.size()) {
+            throw std::runtime_error(
+                "Microscope calibration lighting-position count does not match the specimen stack.");
+        }
+        lightGainPrior = calibration.lightGains;
+        opt.lightGains.clear();
+        opt.lightGainSource = "equal";
+        opt.pixelScaleMm = calibration.pixelScaleMm;
+        std::cout << "Microscope calibration: working-plane RMS=" << calibration.reprojectionRmsPixels
+                  << " px, scale=" << calibration.pixelScaleMm << " mm/pixel, "
+                  << calibration.lightGains.size() << " reference light gains (not applied without per-stack validation)"
+                  << std::endl;
+    }
     if (!opt.uncalibratedLighting && opt.lightsFile.empty() && !opt.hasSphere) {
-        std::cout << "Select the highlight sphere on the first image.\n";
-        opt.sphere = chooseSphereInteractive(loadDisplayImage(opt.imagePaths.front()));
+        std::cout << "Select an image and mark the highlight sphere.\n";
+        const SphereSelection selection = chooseSphereInteractive(
+            opt.imagePaths.size(),
+            [&](size_t imageIndex) { return loadDisplayImage(opt, imageIndex); },
+            opt.imagePaths,
+            static_cast<size_t>(std::max(0, opt.sphereSelectionImageIndex)));
+        opt.sphere = selection.sphere;
+        opt.sphereSelectionImageIndex = static_cast<int>(selection.imageIndex);
+        opt.sphereEdgePoints = selection.edgePoints;
+        opt.sphereFitRmsPixels = selection.fitRmsPixels;
+        opt.sphereFitMaxResidualPixels = selection.fitMaxResidualPixels;
+        opt.sphereFitCoverageDegrees = selection.fitCoverageDegrees;
         opt.hasSphere = true;
         std::cout << "Sphere: cx=" << opt.sphere.cx
                   << " cy=" << opt.sphere.cy
-                  << " radius=" << opt.sphere.radius << '\n';
+                  << " radius=" << opt.sphere.radius
+                  << " from image " << opt.sphereSelectionImageIndex + 1
+                  << " using " << opt.sphereEdgePoints.size() << " points"
+                  << ", fit RMS=" << opt.sphereFitRmsPixels << " px\n";
     }
 
     resolveInputResponses(opt);
@@ -138,7 +169,7 @@ GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}
     reportStage(progress, "[1/6] Loading images...", 5);
     std::vector<cv::Mat> saturationMasks;
     std::vector<cv::Mat> headroomWeights;
-    const std::vector<cv::Mat> images = loadLuminanceImages(opt, &saturationMasks,
+    std::vector<cv::Mat> images = loadLuminanceImages(opt, &saturationMasks,
         !opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust ? &headroomWeights : nullptr,
         [&](int done, int total) {
             progress("Loaded image " + std::to_string(done) + "/" + std::to_string(total) +
@@ -176,31 +207,83 @@ GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}
     } else {
         estimates.reserve(images.size());
         lights.reserve(images.size());
-        for (const cv::Mat& image : images) {
-            HighlightEstimate estimate = estimateHighlight(image, opt.sphere, opt);
-            lights.push_back(estimate.light);
-            estimates.push_back(estimate);
+        for (size_t i = 0; i < images.size(); ++i) {
+            try {
+                HighlightEstimate estimate = estimateHighlight(
+                    images[i], opt.sphere, opt,
+                    i < saturationMasks.size() ? saturationMasks[i] : cv::Mat{});
+                lights.push_back(estimate.light);
+                estimates.push_back(estimate);
+                std::cout << "      sphere highlight " << i + 1 << "/" << images.size()
+                          << ": " << estimate.selectedPixels << " connected pixels, radial="
+                          << estimate.radialFraction << ", centroid uncertainty="
+                          << estimate.centroidUncertaintyPixels << " px, " << estimate.quality << '\n';
+            } catch (const std::exception& e) {
+                throw std::runtime_error(
+                    "Sphere highlight calibration failed for image " + std::to_string(i + 1) +
+                    " (" + std::filesystem::path(opt.imagePaths[i]).filename().string() + "): " + e.what());
+            }
         }
     }
 
-    if (((!opt.uncalibratedLighting && opt.lightingModel == LightingModel::NearFieldRing) || !opt.printableMeshPath.empty()) &&
-        opt.pixelScaleMm <= 0.0) {
+    if (((!opt.uncalibratedLighting && opt.lightingModel == LightingModel::NearFieldRing) ||
+         !opt.printableMeshPath.empty()) && opt.pixelScaleMm <= 0.0) {
         opt.pixelScaleMm = readPixelScaleMmFromImage(opt.imagePaths.front());
         if (opt.pixelScaleMm > 0.0) {
             std::cout << "      pixel scale from TIFF metadata: " << opt.pixelScaleMm << " mm/pixel" << std::endl;
         }
     }
-    if (!opt.uncalibratedLighting && opt.lightingModel == LightingModel::NearFieldRing) {
-        if (opt.pixelScaleMm <= 0.0) {
-            throw std::runtime_error(
-                "Near-field ring lighting needs a pixel scale. Enter --pixel-scale-mm in mm/pixel, "
-                "or use a TIFF with readable physical scale tags.");
-        }
+    if (!opt.uncalibratedLighting && opt.lightingModel == LightingModel::NearFieldRing &&
+        opt.pixelScaleMm <= 0.0) {
+        throw std::runtime_error(
+            "Near-field ring lighting needs a pixel scale. Enter --pixel-scale-mm in mm/pixel, "
+            "or use a TIFF with readable physical scale tags.");
     }
     if (!opt.printableMeshPath.empty() && opt.pixelScaleMm <= 0.0) {
         throw std::runtime_error(
             "Printable mesh export needs a pixel scale. Enter --pixel-scale-mm in mm/pixel, "
             "draw a GUI scale line, or use a TIFF with readable physical scale tags.");
+    }
+
+    LightGainEstimate estimatedGains;
+    if (opt.estimateLightGains && !opt.uncalibratedLighting) {
+        opt.lightGains.clear();
+        opt.lightGainSource = "equal";
+        reportDetail(progress, "Estimating relative light balance from diffuse specimen pixels...", 32);
+        cv::Mat gainMask = mask.clone();
+        if (opt.hasSphere) removeSphereFromMask(gainMask, opt.sphere);
+        estimatedGains = estimateRelativeLightGains(
+            images,
+            lights,
+            gainMask,
+            static_cast<float>(opt.shadowThreshold),
+            static_cast<float>(opt.highOutlierThreshold),
+            lightGainPrior,
+            LightGainGeometry{
+                opt.lightingModel,
+                opt.ringLightRadiusMm,
+                opt.ringLightHeightMm,
+                opt.pixelScaleMm,
+                lightingCenter},
+            saturationMasks);
+        if (estimatedGains.accepted) {
+            opt.lightGains = estimatedGains.gains;
+            opt.lightGainSource = "specimen_estimate";
+            std::cout << "      relative light balance accepted: held-out normalized error "
+                      << estimatedGains.validationErrorBefore << " -> "
+                      << estimatedGains.validationErrorAfter << ", spatial log-RMS="
+                      << estimatedGains.stability << ", normal dispersion="
+                      << estimatedGains.normalDiversity << std::endl;
+        } else {
+            std::cout << "      relative light balance not applied: " << estimatedGains.decision << std::endl;
+        }
+    }
+    if (!opt.lightGains.empty()) {
+        applyLightGainCorrection(images, opt.lightGains);
+        normalizeRelativeIntensityStack(images, false);
+        std::cout << "      applied relative light balance from " << opt.lightGainSource << ":";
+        for (const double gain : opt.lightGains) std::cout << ' ' << gain;
+        std::cout << std::endl;
     }
 
     if (!opt.uncalibratedLighting && opt.hasSphere && !opt.keepSphere) {
@@ -218,6 +301,17 @@ GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}
     cv::Mat geometryNormalMap;
     cv::Mat geometryValidMask;
     PhotometricDiagnostics diagnostics;
+    diagnostics.lightGainEstimationAttempted = estimatedGains.attempted;
+    diagnostics.lightGainCorrectionApplied = !opt.lightGains.empty();
+    diagnostics.lightGainDecision = estimatedGains.attempted
+        ? estimatedGains.decision
+        : (!opt.lightGains.empty() ? "applied_microscope_checkerboard" : "not_requested");
+    diagnostics.lightGainSource = opt.lightGainSource;
+    diagnostics.lightGains = opt.lightGains;
+    diagnostics.lightGainValidationErrorBefore = estimatedGains.validationErrorBefore;
+    diagnostics.lightGainValidationErrorAfter = estimatedGains.validationErrorAfter;
+    diagnostics.lightGainStability = estimatedGains.stability;
+    diagnostics.lightGainNormalDiversity = estimatedGains.normalDiversity;
     diagnostics.collectObservationMasks = !opt.uncalibratedLighting &&
         opt.solverMode == NormalSolverMode::Robust &&
         (opt.specularDiagnostics || opt.shadowHeightRefinement);
@@ -452,9 +546,25 @@ GuiRunResult runPhotometricStereo(Options& opt, const GuiProgress& callback = {}
         progress("Complete.", 100);
     }
     std::cout << "Wrote photometric stereo outputs to: " << opt.outputDir << '\n';
-    return {diagnostics.mitsuba,
-        opt.guiMode && opt.openRelightViewer ? normalMap : cv::Mat(),
-        opt.guiMode && opt.openRelightViewer ? validMask : cv::Mat()};
+    GuiRunResult result;
+    result.lightGain.attempted = diagnostics.lightGainEstimationAttempted;
+    result.lightGain.applied = diagnostics.lightGainCorrectionApplied;
+    result.lightGain.source = diagnostics.lightGainSource;
+    result.lightGain.decision = diagnostics.lightGainDecision;
+    result.lightGain.validationErrorBefore = diagnostics.lightGainValidationErrorBefore;
+    result.lightGain.validationErrorAfter = diagnostics.lightGainValidationErrorAfter;
+    result.lightGain.stability = diagnostics.lightGainStability;
+    result.lightGain.normalDiversity = diagnostics.lightGainNormalDiversity;
+    result.inverse = diagnostics.mitsuba;
+    result.shadow.attempted = opt.shadowHeightRefinement;
+    result.shadow.applied = diagnostics.shadowHeightRefinementApplied;
+    result.shadow.decision = diagnostics.shadowHeightRefinementDecision;
+    result.shadow.balancedMismatchBefore = diagnostics.shadowMismatchRateBefore;
+    result.shadow.balancedMismatchAfter = diagnostics.shadowMismatchRateAfter;
+    result.shadow.correctionRmsPixels = diagnostics.shadowCorrectionRms;
+    result.relightNormals = opt.guiMode && opt.openRelightViewer ? normalMap : cv::Mat();
+    result.relightMask = opt.guiMode && opt.openRelightViewer ? validMask : cv::Mat();
+    return result;
 }
 
 } // namespace
@@ -480,7 +590,27 @@ int main(int argc, char** argv) {
     try {
         Options opt = parseArgs(argc, argv);
         guiMode = opt.guiMode;
-        if (opt.guiMode) {
+        if (!opt.calibrationTargetPath.empty()) {
+            writePrintableCheckerboardSvg(
+                opt.calibrationTargetPath,
+                opt.calibrationGridColumns,
+                opt.calibrationGridRows,
+                opt.calibrationSquareMm,
+                opt.calibrationPageWidthMm,
+                opt.calibrationPageHeightMm);
+            std::cout << "Wrote printable checkerboard: " << opt.calibrationTargetPath << '\n';
+        } else if (!opt.createMicroscopeCalibrationPath.empty()) {
+            resolveInputResponses(opt);
+            const MicroscopeCalibration calibration = createMicroscopeCalibration(
+                opt,
+                opt.calibrationGridColumns,
+                opt.calibrationGridRows,
+                opt.calibrationSquareMm);
+            saveMicroscopeCalibration(opt.createMicroscopeCalibrationPath, calibration);
+            std::cout << "Wrote microscope calibration: " << opt.createMicroscopeCalibrationPath << '\n'
+                      << "Working-plane fit RMS: " << calibration.reprojectionRmsPixels << " px\n"
+                      << "Pixel scale: " << calibration.pixelScaleMm << " mm/pixel\n";
+        } else if (opt.guiMode) {
             launchGuiApplication(opt, runPhotometricStereo);
         } else {
             runPhotometricStereo(opt);

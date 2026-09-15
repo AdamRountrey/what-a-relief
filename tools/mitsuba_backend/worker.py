@@ -9,6 +9,8 @@ baseline files. Its guarded result is written to a separate inverse directory.
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
 import html
 import errno
 import json
@@ -65,17 +67,48 @@ QUALITY = {
         "material_refit_interval": 5,
         "learning_rate": 0.008,
     },
+    "ultra": {
+        "max_side": 1024,
+        "iterations_ad": 75,
+        "spp": 32,
+        "validation_spp": 256,
+        "control_spacing": 1,
+        "material_refit_interval": 5,
+        "learning_rate": 0.004,
+        "geometry_mode": "absolute_height",
+        "curvature_strength": 0.002,
+        "datum_strength": 1.0,
+        "absolute_height_limit": 2.0,
+    },
 }
 
+# Differentiable path records, rather than the height array itself, dominate
+# GPU memory at the optimization resolution. Ultra caps the paths in one stochastic
+# optimization render. Independent seeds across 75 iterations still accumulate
+# samples, while fixed-seed validation retains its separate higher sample count.
+ULTRA_AD_SAMPLE_BUDGET = 8_000_000
+# Dr.Jit-Core 1.3.1 rounds the block length of a CUDA reduction to the
+# next uint32 power of two. A monolithic reduction longer than 2^31 wraps
+# that intermediate to zero and terminates the worker with 0xc0000094.
+# Hierarchical power-of-two blocks are mathematically the same sum and keep
+# every optimization-grid pixel in the objective.
+DRJIT_REDUCTION_CHUNK = 1 << 20
+DRJIT_CORE_PATCH_ID = "drjit-core-1.3.1-large-cuda-reductions-v1"
+
 _DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def runtime_root_path() -> Path:
+    runtime_root = Path(sys.executable).resolve().parent
+    if runtime_root.name.lower() == "scripts":
+        runtime_root = runtime_root.parent
+    return runtime_root
 
 
 def configure_runtime_paths() -> None:
     if os.name != "nt":
         return
-    runtime_root = Path(sys.executable).resolve().parent
-    if runtime_root.name.lower() == "scripts":
-        runtime_root = runtime_root.parent
+    runtime_root = runtime_root_path()
     candidates = [
         runtime_root / "LLVM-C.dll",
         runtime_root / "llvm" / "bin" / "LLVM-C.dll",
@@ -427,8 +460,70 @@ def crop_bounds(mask: np.ndarray, margin: int = 3) -> tuple[int, int, int, int]:
 
 
 def target_size(height: int, width: int, maximum: int) -> tuple[int, int]:
+    if maximum <= 0:
+        return height, width
     scale = min(1.0, maximum / float(max(height, width)))
     return max(16, int(round(height * scale))), max(16, int(round(width * scale)))
+
+
+def effective_ultra_spp(pixel_count: int, requested_spp: int) -> int:
+    return min(
+        requested_spp,
+        max(1, ULTRA_AD_SAMPLE_BUDGET // max(1, pixel_count)),
+    )
+
+
+def effective_ultra_learning_rate(world_spacing: tuple[float, float], requested: float) -> float:
+    # Adam's first update is approximately the learning rate at every vertex,
+    # independent of gradient magnitude. A fixed scene-space step therefore
+    # creates extreme pixel-to-pixel curvature when the native pitch is small.
+    return min(requested, 0.02 * min(world_spacing))
+
+
+def safe_dr_sum(dr, value):
+    """Sum a Dr.Jit value without a >2^31-element CUDA block reduction."""
+    partials = dr.ravel(value)
+    while len(partials) > DRJIT_REDUCTION_CHUNK:
+        partials = dr.block_sum(partials, DRJIT_REDUCTION_CHUNK)
+    return dr.sum(partials)
+
+
+def drjit_core_patch_status(runtime_root: Path | None = None) -> dict[str, Any]:
+    """Verify the native large-reduction fix rather than trusting a marker alone."""
+    root = runtime_root.resolve() if runtime_root is not None else runtime_root_path()
+    marker_path = root / "drjit-core-patch.json"
+    library_path = root / "Lib" / "site-packages" / "drjit" / "drjit-core.dll"
+    status: dict[str, Any] = {
+        "required_id": DRJIT_CORE_PATCH_ID,
+        "marker_found": marker_path.is_file(),
+        "library_found": library_path.is_file(),
+        "valid": False,
+    }
+    if not status["marker_found"] or not status["library_found"]:
+        return status
+    try:
+        record = json.loads(marker_path.read_text(encoding="utf-8-sig"))
+        expected_hash = str(record.get("library_sha256", "")).lower()
+        digest = hashlib.sha256()
+        with library_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_hash = digest.hexdigest()
+        status.update(
+            {
+                "id": record.get("id"),
+                "source_commit": record.get("source_commit"),
+                "library_sha256": actual_hash,
+                "valid": (
+                    record.get("id") == DRJIT_CORE_PATCH_ID
+                    and len(expected_hash) == 64
+                    and actual_hash == expected_hash
+                ),
+            }
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        status["verification_error"] = str(error)
+    return status
 
 
 def normalized_height(height: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
@@ -437,6 +532,44 @@ def normalized_height(height: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray,
     result = height.astype(np.float32) - datum
     result[~mask] = 0.0
     return result, datum
+
+
+def full_height_solution(prepared, optimized_world: np.ndarray, absolute_height: bool):
+    """Return a full-size candidate and its signed difference from the classical baseline."""
+    baseline = prepared["height"]
+    mask = prepared["mask"]
+    x0, y0, x1, y1 = prepared["bounds"]
+    conversion = prepared["scene_scale"] * prepared["physical_scale"]
+    if not math.isfinite(conversion) or abs(conversion) <= 1.0e-12:
+        raise ValueError("Invalid scene-to-height conversion")
+    if absolute_height:
+        candidate_crop = resize_bilinear(
+            optimized_world / conversion + prepared["height_datum"], y1 - y0, x1 - x0)
+        candidate = np.where(mask, baseline, 0.0).astype(np.float32)
+        fit_mask = prepared.get("fit_mask")
+        if fit_mask is None:
+            fit_mask = mask[y0:y1, x0:x1]
+        else:
+            fit_mask = np.asarray(fit_mask, dtype=bool)
+            if fit_mask.ndim != 2:
+                raise ValueError("Absolute-height fitting mask must be two-dimensional")
+            if fit_mask.shape != candidate_crop.shape:
+                fit_mask = resize_nearest(
+                    fit_mask.astype(np.float32), y1 - y0, x1 - x0) >= 0.5
+        fit_mask &= mask[y0:y1, x0:x1]
+        crop = candidate[y0:y1, x0:x1]
+        crop[fit_mask] = candidate_crop[fit_mask]
+        candidate[~mask] = 0.0
+        difference = candidate - baseline
+    else:
+        difference = np.zeros_like(baseline, dtype=np.float32)
+        difference[y0:y1, x0:x1] = resize_bilinear(
+            optimized_world / conversion, y1 - y0, x1 - x0)
+        difference[~mask] = 0.0
+        candidate = baseline + difference
+        candidate[~mask] = 0.0
+    difference[~mask] = 0.0
+    return candidate.astype(np.float32), difference.astype(np.float32)
 
 
 def masked_slopes(height: np.ndarray, mask: np.ndarray, spacing_y=1.0, spacing_x=1.0):
@@ -485,6 +618,127 @@ def slope_stencils(mask: np.ndarray, spacing_y: float, spacing_x: float):
     return stencils
 
 
+def curvature_stencils(mask: np.ndarray, spacing_y: float, spacing_x: float):
+    center = np.arange(mask.size, dtype=np.uint32).reshape(mask.shape)
+    stencils = []
+    for axis, spacing in ((0, spacing_y), (1, spacing_x)):
+        before = np.roll(mask, 1, axis=axis)
+        after = np.roll(mask, -1, axis=axis)
+        edge = [slice(None), slice(None)]
+        edge[axis] = 0
+        before[tuple(edge)] = False
+        edge[axis] = -1
+        after[tuple(edge)] = False
+        valid = mask & before & after
+        left = np.where(valid, np.roll(center, 1, axis=axis), center)
+        right = np.where(valid, np.roll(center, -1, axis=axis), center)
+        scale = np.where(valid, 1.0 / (spacing * spacing), 0.0).astype(np.float32)
+        stencils.append((left.ravel(), center.ravel(), right.ravel(), scale.ravel(),
+                         valid.astype(np.float32).ravel()))
+    return stencils
+
+
+def triangle_vertex_support(mask: np.ndarray) -> np.ndarray:
+    """Vertices belonging to at least one triangle emitted by write_grid_ply."""
+    support = np.zeros_like(mask, dtype=bool)
+    first = mask[:-1, :-1] & mask[1:, :-1] & mask[:-1, 1:]
+    second = mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:]
+    support[:-1, :-1] |= first
+    support[1:, :-1] |= first | second
+    support[:-1, 1:] |= first | second
+    support[1:, 1:] |= second
+    return support
+
+
+def absolute_height_regularization_numpy(prepared, height_world: np.ndarray, settings) -> float:
+    return absolute_height_regularization_gradient_numpy(
+        prepared, height_world, settings)[0]
+
+
+def absolute_height_regularization_gradient_numpy(
+        prepared, height_world: np.ndarray, settings) -> tuple[float, float, np.ndarray]:
+    """Evaluate Ultra's priors and exact gradient without dense AD stencils."""
+    mask = prepared.get("fit_mask", prepared["mask_small"])
+    count = max(float(mask.sum()), 1.0)
+    baseline = prepared["baseline_positions"][..., 2]
+    datum_offset = float(np.sum((height_world - baseline) * mask) / count)
+    datum_strength = float(settings.get("datum_strength", 1.0))
+    curvature_strength = float(settings.get("curvature_strength", 0.002))
+    gradient = (2.0 * datum_strength * datum_offset / count
+                * mask.astype(np.float32))
+    loss = datum_strength * datum_offset * datum_offset
+
+    spacing_y, spacing_x = prepared["world_spacing"]
+    for axis, spacing in ((0, spacing_y), (1, spacing_x)):
+        if height_world.shape[axis] < 3:
+            continue
+        before = [slice(None), slice(None)]
+        center = [slice(None), slice(None)]
+        after = [slice(None), slice(None)]
+        before[axis] = slice(None, -2)
+        center[axis] = slice(1, -1)
+        after[axis] = slice(2, None)
+        before = tuple(before)
+        center = tuple(center)
+        after = tuple(after)
+        valid = mask[before] & mask[center] & mask[after]
+        scale = 1.0 / (spacing * spacing)
+        second = ((height_world[before] - 2.0 * height_world[center]
+                   + height_world[after]) * scale)
+        second = np.where(valid, second, 0.0)
+        loss += curvature_strength * float(np.sum(second * second) / count)
+        contribution = (2.0 * curvature_strength * second * scale / count).astype(np.float32)
+        gradient[before] += contribution
+        gradient[center] -= 2.0 * contribution
+        gradient[after] += contribution
+
+    prior_loss = 0.0
+    prior_weight = prepared.get("normal_prior_weight")
+    if prior_weight is None:
+        prior_weight = np.zeros_like(height_world, dtype=np.float32)
+    if np.any(prior_weight > 0):
+        q, p = masked_slopes(height_world, prepared["mask_small"], spacing_y, spacing_x)
+        inverse_length = 1.0 / np.sqrt(1.0 + p * p + q * q)
+        normal = np.stack((-p * inverse_length, q * inverse_length, inverse_length), axis=-1)
+        error = normal - prepared["normal_prior"]
+        prior_denominator = max(float(prior_weight.sum()), 1.0e-8)
+        prior_loss = float(np.sum(np.sum(error * error, axis=-1) * prior_weight)
+                           / prior_denominator)
+
+        # d ||normalize(v)-target||^2 / dv, where v=(-p, q, 1).
+        tangent = error - normal * np.sum(normal * error, axis=-1, keepdims=True)
+        derivative_v = (2.0 * tangent * inverse_length[..., None]
+                        * prior_weight[..., None] / prior_denominator)
+        derivative_p = -NORMAL_PRIOR_STRENGTH * derivative_v[..., 0]
+        derivative_q = NORMAL_PRIOR_STRENGTH * derivative_v[..., 1]
+
+        for axis, spacing, derivative in (
+                (1, spacing_x, derivative_p), (0, spacing_y, derivative_q)):
+            before_valid = (np.roll(prepared["mask_small"], 1, axis=axis)
+                            & prepared["mask_small"])
+            after_valid = (np.roll(prepared["mask_small"], -1, axis=axis)
+                           & prepared["mask_small"])
+            edge = [slice(None), slice(None)]
+            edge[axis] = 0
+            before_valid[tuple(edge)] = False
+            edge[axis] = -1
+            after_valid[tuple(edge)] = False
+            steps = before_valid.astype(np.float32) + after_valid.astype(np.float32)
+            slope_scale = np.divide(
+                1.0, steps * spacing, out=np.zeros_like(steps), where=steps > 0)
+            term = derivative * slope_scale
+            gradient += term * (before_valid.astype(np.float32) - after_valid.astype(np.float32))
+            if axis == 1:
+                gradient[:, 1:] += (term * after_valid)[:, :-1]
+                gradient[:, :-1] -= (term * before_valid)[:, 1:]
+            else:
+                gradient[1:, :] += (term * after_valid)[:-1, :]
+                gradient[:-1, :] -= (term * before_valid)[1:, :]
+
+    gradient[~mask] = 0.0
+    return float(loss), prior_loss, gradient.astype(np.float32, copy=False)
+
+
 def load_normal_prior(inputs, mask, confidence, bounds, shape):
     paths = inputs.get("normal_prior_pfm")
     if paths is None:
@@ -530,12 +784,16 @@ def normal_prior_loss_ad(mi, dr, z, prior, weight, stencils, denominator):
     inv_length = dr.rsqrt(1.0 + p * p + q * q)
     error = ((-p * inv_length - prior[0])**2
              + (q * inv_length - prior[1])**2 + (inv_length - prior[2])**2)
-    return dr.sum(error * weight) / denominator
+    return safe_dr_sum(dr, error * weight) / denominator
 
 
 def control_mapping(height: int, width: int, spacing: int):
     control_height = max(3, int(math.ceil((height - 1) / spacing)) + 1)
     control_width = max(3, int(math.ceil((width - 1) / spacing)) + 1)
+    if spacing == 1 and control_height == height and control_width == width:
+        # The native parameterization is already an identity map. Four dense
+        # index planes plus four weight planes only duplicate the whole image.
+        return control_height, control_width, None, None
     ys = np.linspace(0.0, control_height - 1.0, height, dtype=np.float32)
     xs = np.linspace(0.0, control_width - 1.0, width, dtype=np.float32)
     y0 = np.floor(ys).astype(np.int32)
@@ -562,6 +820,8 @@ def control_mapping(height: int, width: int, spacing: int):
 
 def expand_control_numpy(control: np.ndarray, mapping) -> np.ndarray:
     _, _, indices, weights = mapping
+    if indices is None:
+        return control.ravel()
     flat = control.ravel()
     expanded = sum(flat[index] * weight for index, weight in zip(indices, weights))
     return expanded
@@ -899,7 +1159,26 @@ def iteration_preview(height_world, mask, spacing):
     return np.concatenate((rgb, hillshade), axis=1)
 
 
-def publish_iteration(mi, progress, prepared, control, mapping, iteration, total, began):
+def fit_preview_frame(frame: np.ndarray, maximum_height: int = 512,
+                      maximum_width: int = 1024) -> np.ndarray:
+    """Downsample a diagnostic RGB frame to the GUI's guarded decode limits."""
+    values = np.asarray(frame, dtype=np.float32)
+    if values.ndim != 3 or values.shape[2] != 3 or not values.shape[0] or not values.shape[1]:
+        raise ValueError("Iteration preview must be a non-empty H-by-W-by-3 image")
+    if maximum_height < 1 or maximum_width < 1:
+        raise ValueError("Iteration preview limits must be positive")
+    height, width = values.shape[:2]
+    scale = min(1.0, maximum_height / height, maximum_width / width)
+    if scale >= 1.0:
+        return values.copy()
+    new_height = max(1, int(np.floor(height * scale)))
+    new_width = max(1, int(np.floor(width * scale)))
+    channels_first = np.moveaxis(values, -1, 0)
+    resized = resize_bilinear(channels_first, new_height, new_width)
+    return np.moveaxis(resized, 0, -1)
+
+
+def publish_iteration(mi, progress, prepared, control, mapping, iteration, total, began, absolute_height=False):
     if not prepared.get("live_preview", False):
         return
     elapsed = max(0.0, time.monotonic() - began)
@@ -909,11 +1188,13 @@ def publish_iteration(mi, progress, prepared, control, mapping, iteration, total
         return
     try:
         expanded = expand_control_numpy(control, mapping).reshape(prepared["height_small"].shape)
-        frame = iteration_preview(prepared["baseline_positions"][..., 2] + expanded,
+        height_world = expanded if absolute_height else prepared["baseline_positions"][..., 2] + expanded
+        frame = iteration_preview(height_world,
                                   prepared["mask_small"], prepared["world_spacing"])
+        frame = fit_preview_frame(frame)
         save_rgb(mi, progress.path.parent / f"iteration_{iteration}.png", frame)
         progress.live["preview_iteration"] = iteration
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"Iteration preview unavailable: {error}", flush=True)
 
 
@@ -932,10 +1213,15 @@ def display_stretch(values: np.ndarray, mask: np.ndarray, symmetric: bool = Fals
     return output
 
 
-def output_products(mi, output: Path, baseline: np.ndarray, correction: np.ndarray, mask: np.ndarray, albedo: np.ndarray, height_scale: float, unvalidated: bool = False) -> None:
+def output_products(mi, output: Path, baseline: np.ndarray, correction_or_height: np.ndarray,
+                    mask: np.ndarray, albedo: np.ndarray, height_scale: float,
+                    unvalidated: bool = False, absolute_height: bool = False) -> None:
     prefix = "candidate" if unvalidated else "inverse"
-    final_height = baseline + correction
+    final_height = correction_or_height.copy() if absolute_height else baseline + correction_or_height
     final_height[~mask] = 0.0
+    correction = final_height - baseline if absolute_height else correction_or_height
+    correction = correction.copy()
+    correction[~mask] = 0.0
     normals = surface_normals(final_height, mask)
     normals[~mask] = 0.0
     write_pfm(output / f"{prefix}_height.pfm", final_height)
@@ -977,6 +1263,16 @@ def write_candidate_review(directory: Path, result: dict[str, Any]) -> None:
                        ("Withheld image loss", "holdout_loss_before", "holdout_loss_after"),
                        ("Photometric-normal prior loss", "normal_prior_loss_before", "normal_prior_loss_after")))
     decision = html.escape(str(result["decision"]))
+    if result.get("geometry_parameterization") == "absolute_height_grid":
+        geometry_note = (
+            "The Ultra candidate is an absolute-height field optimized on a grid capped at 1024 pixels "
+            "on its longer side. The classical height is its initialization and comparison baseline, "
+            "not an additive output layer; larger accepted results are interpolated back to the source grid."
+        )
+    else:
+        geometry_note = (
+            "The full-resolution height retains baseline detail plus the upsampled correction."
+        )
     page = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>what-a-relief | Unvalidated candidate</title>
@@ -1012,7 +1308,7 @@ The normal prior measures agreement with that solve, not accuracy against measur
 <figure id="candidateFigure"><figcaption>Unvalidated candidate</figcaption>
 <img id="candidateImage" src="review_candidate_height.png" alt="Unvalidated candidate height"></figure></div>
 <p>Normals here are derived from the two height fields, not the original photometric normal maps.
-The full-resolution height retains baseline detail plus the upsampled correction. PNGs are visualization products, not quantitative height data.</p>
+__GEOMETRY_NOTE__ PNGs are visualization products, not quantitative height data.</p>
 <h2>Candidate files</h2>
 <p><label><input type="checkbox" id="acknowledge"> I understand that this candidate failed automatic validation.</label></p>
 <div id="files" class="files" hidden><a href="candidate_surface.ply" download>Unvalidated mesh (PLY)</a>
@@ -1042,25 +1338,34 @@ for(const mode of ['both','baseline','candidate'])document.getElementById(mode).
 document.getElementById('acknowledge').addEventListener('change',event=>{document.getElementById('files').hidden=!event.target.checked;});
 </script></body></html>
 """
-    (directory / "review.html").write_text(page.replace("__ROWS__", rows).replace("__DECISION__", decision), encoding="utf-8")
+    (directory / "review.html").write_text(
+        page.replace("__ROWS__", rows).replace("__DECISION__", decision).replace(
+            "__GEOMETRY_NOTE__", html.escape(geometry_note)),
+        encoding="utf-8")
 
 
-def retain_unvalidated_candidate(mi, output: Path, baseline: np.ndarray, correction: np.ndarray,
+def retain_unvalidated_candidate(mi, output: Path, baseline: np.ndarray, correction_or_height: np.ndarray,
                                  mask: np.ndarray, albedo: np.ndarray, height_scale: float,
-                                 result: dict[str, Any]) -> None:
+                                 result: dict[str, Any], absolute_height: bool = False) -> None:
     result["candidate_saved"] = False
     result["candidate_directory"] = None
-    result["delivered_geometry"] = "accepted_refinement" if result["accepted"] else "baseline"
+    result["delivered_geometry"] = (
+        "accepted_inverse_solution" if result["accepted"] and absolute_height else
+        "accepted_refinement" if result["accepted"] else "baseline"
+    )
     if result["accepted"]:
         result["candidate_export_status"] = "not_needed_accepted"
         return
-    if not np.all(np.isfinite(correction[mask])) or not np.all(np.isfinite((baseline + correction)[mask])):
+    candidate_height = correction_or_height if absolute_height else baseline + correction_or_height
+    if (not np.all(np.isfinite(correction_or_height[mask])) or
+            not np.all(np.isfinite(candidate_height[mask]))):
         result["candidate_export_status"] = "not_saved_nonfinite_geometry"
         return
     directory = output / "unvalidated_candidate"
     directory.mkdir(parents=True, exist_ok=True)
-    output_products(mi, directory, baseline, correction, mask, albedo, height_scale, unvalidated=True)
-    previews, display_range = comparison_stretch(baseline, baseline + correction, mask)
+    output_products(mi, directory, baseline, correction_or_height, mask, albedo, height_scale,
+                    unvalidated=True, absolute_height=absolute_height)
+    previews, display_range = comparison_stretch(baseline, candidate_height, mask)
     for name, preview in zip(("baseline", "candidate"), previews):
         save_gray(mi, directory / f"review_{name}_height.png", preview)
     candidate_fields = dict(candidate_saved=True, candidate_directory="unvalidated_candidate",
@@ -1231,15 +1536,21 @@ def prepare_job(
         "directional_distance_world": 100.0 * camera_extent,
         "fallback_azimuth": 0.0,
     }
-    # Border pixels may sample outside the open triangle mesh. Do not ask
-    # geometry to explain those coverage changes as material or shading.
-    fit_mask = mask_small.copy()
-    fit_mask[1:] &= mask_small[:-1]
-    fit_mask[:-1] &= mask_small[1:]
-    fit_mask[:, 1:] &= mask_small[:, :-1]
-    fit_mask[:, :-1] &= mask_small[:, 1:]
-    fit_mask[[0, -1], :] = False
-    fit_mask[:, [0, -1]] = False
+    if settings.get("geometry_mode") == "absolute_height":
+        # Ultra keeps every optimization-grid pixel that can move a rendered surface triangle,
+        # including the silhouette. Isolated/thin mask samples with no emitted
+        # triangle are not modeled geometry and cannot supply an equality loss.
+        fit_mask = triangle_vertex_support(mask_small)
+    else:
+        # Coarse refinement excludes a one-pixel rim where area reduction and
+        # open-mesh coverage can otherwise masquerade as a shading correction.
+        fit_mask = mask_small.copy()
+        fit_mask[1:] &= mask_small[:-1]
+        fit_mask[:-1] &= mask_small[1:]
+        fit_mask[:, 1:] &= mask_small[:, :-1]
+        fit_mask[:, :-1] &= mask_small[:, 1:]
+        fit_mask[[0, -1], :] = False
+        fit_mask[:, [0, -1]] = False
     weights = (
         fit_mask[None, :, :].astype(np.float32)
         * np.clip(weight_small[None, :, :], 0.05, 1.0)
@@ -1257,6 +1568,7 @@ def prepare_job(
         "height_small": height_small,
         "albedo_small": albedo_small,
         "mask_small": mask_small,
+        "fit_mask": fit_mask,
         "weights": weights,
         "lights": lights,
         "baseline_positions": baseline_positions,
@@ -1374,13 +1686,41 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
     import drjit as dr
 
     control_height, control_width, indices_numpy, weights_numpy = mapping
-    optimizer = mi.ad.Adam(lr=float(settings["learning_rate"]))
-    optimizer["height_control"] = mi.Float(np.zeros(control_height * control_width, dtype=np.float32))
-    index_arrays = [mi.UInt(index) for index in indices_numpy]
-    weight_arrays = [mi.Float(weight) for weight in weights_numpy]
-    baseline_flat = mi.Float(prepared["baseline_positions"].ravel())
-    observed = [mi.TensorXf(image) for image in prepared["images_small"]]
-    data_weights = [mi.TensorXf(weight) for weight in prepared["weights"]]
+    absolute_height = settings.get("geometry_mode") == "absolute_height"
+    if absolute_height and (control_height, control_width) != prepared["height_small"].shape:
+        raise ValueError("Absolute-height optimization requires one control per render pixel")
+    requested_learning_rate = float(settings["learning_rate"])
+    learning_rate = (effective_ultra_learning_rate(
+        prepared["world_spacing"], requested_learning_rate)
+        if absolute_height else requested_learning_rate)
+    if absolute_height:
+        prepared["learning_rate_requested"] = requested_learning_rate
+        prepared["learning_rate_effective"] = learning_rate
+    optimizer = mi.ad.Adam(lr=learning_rate)
+    initial_control = (prepared["baseline_positions"][..., 2].ravel().astype(np.float32)
+                       if absolute_height else
+                       np.zeros(control_height * control_width, dtype=np.float32))
+    absolute_limit = max(
+        float(settings.get("absolute_height_limit", 2.0)),
+        1.25 * float(np.max(np.abs(initial_control))) + 0.22,
+    )
+    if absolute_height:
+        prepared["absolute_height_limit_world"] = absolute_limit
+    optimizer["height_control"] = mi.Float(initial_control)
+    identity_mapping = indices_numpy is None
+    index_arrays = [] if identity_mapping else [mi.UInt(index) for index in indices_numpy]
+    weight_arrays = [] if identity_mapping else [mi.Float(weight) for weight in weights_numpy]
+    baseline_flat = (None if absolute_height else
+                     mi.Float(prepared["baseline_positions"].ravel()))
+    baseline_xy = prepared["baseline_positions"].copy()
+    baseline_xy[..., 2] = 0.0
+    baseline_xy_flat = (mi.Float(baseline_xy.ravel()) if absolute_height else None)
+    # Ultra streams observations one light at a time. Keeping every image and
+    # validity plane resident on the GPU duplicated a large optimization stack.
+    observed = (None if absolute_height else
+                [mi.TensorXf(image) for image in prepared["images_small"]])
+    data_weights = (None if absolute_height else
+                    [mi.TensorXf(weight) for weight in prepared["weights"]])
     material = [mi.TensorXf(coefficients[..., index]) for index in range(3)]
     iterations = int(settings["iterations_ad"])
     maximum_delta = 0.22
@@ -1388,16 +1728,29 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
     refit_interval = int(settings.get("material_refit_interval", 0))
     history = []
     best = None
-    prior_weight = mi.Float(prepared["normal_prior_weight"].ravel())
-    prior = [mi.Float(prepared["normal_prior"][..., axis].ravel()) for axis in range(3)]
+    prior_weight = (None if absolute_height else
+                    mi.Float(prepared["normal_prior_weight"].ravel()))
+    prior = ([] if absolute_height else
+             [mi.Float(prepared["normal_prior"][..., axis].ravel()) for axis in range(3)])
     prior_denominator = max(float(prepared["normal_prior_weight"].sum()), 1e-8)
     prior_enabled = bool(np.any(prepared["normal_prior_weight"] > 0))
-    stencils = [(mi.UInt(a), mi.UInt(b), mi.Float(scale))
-                for a, b, scale in slope_stencils(prepared["mask_small"], *prepared["world_spacing"])]
-    baseline_z = mi.Float(prepared["baseline_positions"][..., 2].ravel())
+    stencils = ([] if absolute_height else
+                [(mi.UInt(a), mi.UInt(b), mi.Float(scale))
+                 for a, b, scale in slope_stencils(
+                     prepared["mask_small"], *prepared["world_spacing"])])
+    regularization_mask = prepared.get("fit_mask", prepared["mask_small"])
+    curvature = ([] if absolute_height else [
+        (mi.UInt(left), mi.UInt(center), mi.UInt(right), mi.Float(scale), mi.Float(valid))
+        for left, center, right, scale, valid in curvature_stencils(
+            regularization_mask, *prepared["world_spacing"])
+    ])
+    baseline_z = (None if absolute_height else
+                  mi.Float(prepared["baseline_positions"][..., 2].ravel()))
 
     def expanded_control():
         control = optimizer["height_control"]
+        if identity_mapping:
+            return control
         return sum(
             dr.gather(mi.Float, control, index) * weight
             for index, weight in zip(index_arrays, weight_arrays)
@@ -1408,7 +1761,10 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
         control = optimizer["height_control"].numpy().reshape((control_height, control_width)).astype(np.float32)
         expanded = expand_control_numpy(control, mapping).reshape(prepared["height_small"].shape)
         positions = prepared["baseline_positions"].copy()
-        positions[..., 2] += expanded
+        if absolute_height:
+            positions[..., 2] = expanded
+        else:
+            positions[..., 2] += expanded
         basis = render_basis_numpy(mi, scenes_by_basis, parameters_by_basis, positions,
                                    int(settings["validation_spp"]), 20000)
         refitted, current_loss = refit_training_material(
@@ -1417,14 +1773,34 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
         coefficients[:] = refitted
         material = [mi.TensorXf(coefficients[..., index]) for index in range(3)]
         prior_loss = normal_prior_loss(prepared, positions[..., 2])
-        objective = current_loss + NORMAL_PRIOR_STRENGTH * prior_loss
+        geometry_regularization = (absolute_height_regularization_numpy(
+            prepared, positions[..., 2], settings) if absolute_height else 0.0)
+        objective = current_loss + NORMAL_PRIOR_STRENGTH * prior_loss + geometry_regularization
         history.append({"iteration": iteration, "training_loss": current_loss,
-                        "normal_prior_loss": prior_loss, "objective": objective})
+                        "normal_prior_loss": prior_loss,
+                        "geometry_regularization": geometry_regularization,
+                        "objective": objective})
         if math.isfinite(objective) and (best is None or objective < best[0]):
             best = (objective, control.copy(), expanded.copy(), coefficients.copy(), iteration)
 
     if refit_interval > 0:
-        checkpoint(0)
+        if absolute_height and "initial_training_loss" in prepared:
+            expanded = initial_control.reshape(prepared["height_small"].shape).copy()
+            prior_loss = normal_prior_loss(prepared, expanded)
+            geometry_regularization = absolute_height_regularization_numpy(
+                prepared, expanded, settings)
+            objective = (float(prepared["initial_training_loss"])
+                         + NORMAL_PRIOR_STRENGTH * prior_loss
+                         + geometry_regularization)
+            history.append({"iteration": 0,
+                            "training_loss": float(prepared["initial_training_loss"]),
+                            "normal_prior_loss": prior_loss,
+                            "geometry_regularization": geometry_regularization,
+                            "objective": objective})
+            best = (objective, initial_control.reshape((control_height, control_width)).copy(),
+                    expanded, coefficients.copy(), 0)
+        else:
+            checkpoint(0)
     denominator = max(float(prepared["weights"][train].sum()), 1.0e-8)
     iteration_began = time.monotonic()
     for iteration in range(iterations):
@@ -1432,57 +1808,128 @@ def optimize_ad(mi, prepared, scenes_by_basis, parameters_by_basis, coefficients
         # retaining every renderer's AD graph scales poorly with image count.
         for training_index, light_index in enumerate(train):
             expanded = expanded_control()
-            positions = baseline_flat + dr.ravel(mi.Vector3f(
+            z_displacement = dr.ravel(mi.Vector3f(
                 dr.zeros(mi.Float, render_height * render_width),
                 dr.zeros(mi.Float, render_height * render_width),
                 expanded,
             ))
-            rendered = []
-            for basis_index, (basis_scenes, basis_parameters) in enumerate(zip(scenes_by_basis, parameters_by_basis)):
-                scene = basis_scenes[light_index]
-                params = update_scene_parameters(mi, basis_parameters[light_index], positions)
-                image = mi.render(
-                    scene,
-                    params,
-                    spp=int(settings["spp"]),
-                    spp_grad=int(settings["spp"]),
-                    seed=30000 + iteration * 1009 + basis_index * 101 + light_index,
-                )
-                rendered.append(dr.mean(image, axis=2))
-            prediction = sum(
-                rendered[basis] * material[basis]
-                for basis in range(3)
-            )
-            residual = prediction - observed[light_index]
-            robust = dr.sqrt(residual * residual + 0.0025**2) - 0.0025
-            dr.backward(dr.sum(robust * data_weights[light_index]) / denominator)
+            positions = (baseline_xy_flat + z_displacement if absolute_height else
+                         baseline_flat + z_displacement)
+            if absolute_height:
+                # First evaluate the prediction without recording geometry AD.
+                # Then replay one material basis at a time with the exact
+                # d(loss)/d(prediction). This retains one renderer graph rather
+                # than three full-grid graphs and is mathematically identical
+                # to differentiating their sum.
+                detached_positions = dr.detach(positions)
+                dr.eval(detached_positions)
+                del positions, z_displacement, expanded
+                prediction = None
+                for basis_index, (basis_scenes, basis_parameters) in enumerate(
+                        zip(scenes_by_basis, parameters_by_basis)):
+                    scene = basis_scenes[light_index]
+                    params = update_scene_parameters(
+                        mi, basis_parameters[light_index], detached_positions)
+                    image = mi.render(
+                        scene, params, spp=int(settings["spp"]),
+                        seed=30000 + iteration * 1009 + basis_index * 101 + light_index)
+                    value = dr.detach(dr.mean(image, axis=2)) * material[basis_index]
+                    prediction = value if prediction is None else prediction + value
+                observed_light = mi.TensorXf(prepared["images_small"][light_index])
+                weight_light = mi.TensorXf(prepared["weights"][light_index])
+                residual = prediction - observed_light
+                upstream = dr.detach(
+                    residual / dr.sqrt(residual * residual + 0.0025**2)
+                    * weight_light / denominator)
+                dr.eval(upstream)
+                del prediction, residual, observed_light, weight_light
+                for basis_index, (basis_scenes, basis_parameters) in enumerate(
+                        zip(scenes_by_basis, parameters_by_basis)):
+                    basis_expanded = expanded_control()
+                    basis_displacement = dr.ravel(mi.Vector3f(
+                        dr.zeros(mi.Float, render_height * render_width),
+                        dr.zeros(mi.Float, render_height * render_width),
+                        basis_expanded,
+                    ))
+                    basis_positions = baseline_xy_flat + basis_displacement
+                    scene = basis_scenes[light_index]
+                    params = update_scene_parameters(
+                        mi, basis_parameters[light_index], basis_positions)
+                    image = mi.render(
+                        scene, params, spp=int(settings["spp"]),
+                        spp_grad=int(settings["spp"]),
+                        seed=30000 + iteration * 1009 + basis_index * 101 + light_index)
+                    dr.backward(safe_dr_sum(
+                        dr, dr.mean(image, axis=2)
+                        * material[basis_index] * upstream))
+                del upstream
+            else:
+                rendered = []
+                for basis_index, (basis_scenes, basis_parameters) in enumerate(
+                        zip(scenes_by_basis, parameters_by_basis)):
+                    scene = basis_scenes[light_index]
+                    params = update_scene_parameters(
+                        mi, basis_parameters[light_index], positions)
+                    image = mi.render(
+                        scene, params, spp=int(settings["spp"]),
+                        spp_grad=int(settings["spp"]),
+                        seed=30000 + iteration * 1009 + basis_index * 101 + light_index)
+                    rendered.append(dr.mean(image, axis=2))
+                prediction = sum(
+                    rendered[basis] * material[basis]
+                    for basis in range(3))
+                residual = prediction - observed[light_index]
+                robust = dr.sqrt(residual * residual + 0.0025**2) - 0.0025
+                dr.backward(safe_dr_sum(
+                    dr, robust * data_weights[light_index]) / denominator)
             progress(22 + int(58 * (iteration + (training_index + 1) / len(train)) / iterations),
                      f"Inverse iteration {iteration + 1}/{iterations}, light {training_index + 1}/{len(train)}")
 
         control = optimizer["height_control"]
-        grid = mi.TensorXf(control, shape=(control_height, control_width))
-        dx = grid[:, 1:] - grid[:, :-1]
-        dy = grid[1:, :] - grid[:-1, :]
-        dxx = dx[:, 1:] - dx[:, :-1]
-        dyy = dy[1:, :] - dy[:-1, :]
-        regularization = (
-            0.012 * dr.mean(control * control)
-            + 0.025 * (dr.mean(dx * dx) + dr.mean(dy * dy))
-            + 0.018 * (dr.mean(dxx * dxx) + dr.mean(dyy * dyy))
-        )
-        if prior_enabled:
-            z = baseline_z + expanded_control()
+        if absolute_height:
+            control = optimizer["height_control"]
+            height_numpy = control.numpy().reshape((control_height, control_width)).astype(
+                np.float32, copy=False)
+            geometry_regularization, prior_loss, regularization_gradient = (
+                absolute_height_regularization_gradient_numpy(
+                    prepared, height_numpy, settings))
+            data_gradient = dr.grad(control)
+            dr.set_grad(
+                control,
+                data_gradient + mi.Float(regularization_gradient.ravel()))
+            regularization = (geometry_regularization
+                              + NORMAL_PRIOR_STRENGTH * prior_loss)
+        else:
+            grid = mi.TensorXf(control, shape=(control_height, control_width))
+            dx = grid[:, 1:] - grid[:, :-1]
+            dy = grid[1:, :] - grid[:-1, :]
+            dxx = dx[:, 1:] - dx[:, :-1]
+            dyy = dy[1:, :] - dy[:-1, :]
+            regularization = (
+                0.012 * dr.mean(control * control)
+                + 0.025 * (dr.mean(dx * dx) + dr.mean(dy * dy))
+                + 0.018 * (dr.mean(dxx * dxx) + dr.mean(dyy * dyy))
+            )
+        if prior_enabled and not absolute_height:
+            z = expanded_control() if absolute_height else baseline_z + expanded_control()
             regularization += NORMAL_PRIOR_STRENGTH * normal_prior_loss_ad(
                 mi, dr, z, prior, prior_weight, stencils, prior_denominator)
-        dr.backward(regularization)
+        if not absolute_height:
+            dr.backward(regularization)
         optimizer.step()
-        optimizer["height_control"] = dr.clip(optimizer["height_control"], -maximum_delta, maximum_delta)
+        if absolute_height:
+            optimizer["height_control"] = dr.clip(
+                optimizer["height_control"], -absolute_limit, absolute_limit)
+        else:
+            optimizer["height_control"] = dr.clip(
+                optimizer["height_control"], -maximum_delta, maximum_delta)
         if refit_interval > 0 and ((iteration + 1) % refit_interval == 0 or iteration + 1 == iterations):
             progress(22 + int(58 * (iteration + 1) / iterations), "Refitting material from training lights")
             checkpoint(iteration + 1)
         if prepared.get("live_preview", False):
             current_control = optimizer["height_control"].numpy().reshape((control_height, control_width))
-            publish_iteration(mi, progress, prepared, current_control, mapping, iteration + 1, iterations, iteration_began)
+            publish_iteration(mi, progress, prepared, current_control, mapping, iteration + 1,
+                              iterations, iteration_began, absolute_height=absolute_height)
         progress(22 + int(58 * (iteration + 1) / iterations), f"Differentiable inverse iteration {iteration + 1}/{iterations}")
     if best is not None:
         _, control, expanded, best_material, selected_iteration = best
@@ -1520,6 +1967,15 @@ def run_job(job_path: Path) -> int:
         mi, variant, optimizer_name = configure_backend(selected_backend)
         import drjit as dr
 
+        core_patch = drjit_core_patch_status()
+        result["drjit_core_patch"] = core_patch
+        if quality == "ultra" and selected_backend == "cuda" and not core_patch["valid"]:
+            raise RuntimeError(
+                "Ultra CUDA requires the patched Dr.Jit Core runtime from the "
+                "what-a-relief 0.2.16 Mitsuba backend installer. Reinstall that "
+                "backend before retrying; baseline outputs are unchanged."
+            )
+
         result.update(
             {
                 "selected_backend": selected_backend,
@@ -1533,7 +1989,14 @@ def run_job(job_path: Path) -> int:
                 "python_version": platform.python_version(),
             }
         )
-        settings = QUALITY[quality]
+        settings = dict(QUALITY[quality])
+        absolute_height = settings.get("geometry_mode") == "absolute_height"
+        result.update(
+            geometry_parameterization=("absolute_height_grid" if absolute_height else
+                                       "coarse_additive_correction"),
+            absolute_height_inverse=absolute_height,
+            initialization="classical_integrated_height",
+        )
         progress(3, f"Starting {variant} inverse-rendering worker")
         renderer_workspace = tempfile.TemporaryDirectory(
             prefix="what-a-relief-mitsuba-renderer-"
@@ -1544,6 +2007,37 @@ def run_job(job_path: Path) -> int:
         render_height, render_width = prepared["height_small"].shape
         result["render_width"] = render_width
         result["render_height"] = render_height
+        x0, y0, x1, y1 = prepared["bounds"]
+        source_crop_width = x1 - x0
+        source_crop_height = y1 - y0
+        optimization_downsampled = (
+            render_width != source_crop_width or render_height != source_crop_height)
+        result["source_crop_width"] = source_crop_width
+        result["source_crop_height"] = source_crop_height
+        result["optimization_max_side"] = int(settings["max_side"])
+        result["optimization_downsampled"] = optimization_downsampled
+        result["full_resolution_inverse"] = absolute_height and not optimization_downsampled
+        result["geometry_mask_pixels"] = int(np.count_nonzero(prepared["mask_small"]))
+        result["modeled_fit_pixels"] = int(np.count_nonzero(prepared["fit_mask"]))
+        result["pixel_inclusion_policy"] = (
+            "all_valid_triangle_supported_optimization_grid_vertices" if absolute_height else
+            "valid_eroded_geometry_pixels"
+        )
+        if absolute_height:
+            requested_spp = int(settings["spp"])
+            effective_spp = effective_ultra_spp(
+                render_height * render_width, requested_spp)
+            settings["spp"] = effective_spp
+            result["optimization_spp_requested"] = requested_spp
+            result["optimization_spp_effective"] = effective_spp
+            result["optimization_path_budget"] = ULTRA_AD_SAMPLE_BUDGET
+            if effective_spp < requested_spp:
+                progress(
+                    9,
+                    f"Ultra memory guard reduced each stochastic AD pass from "
+                    f"{requested_spp} to {effective_spp} spp at the optimization resolution; "
+                    "fixed-seed validation remains at full quality",
+                )
         prepared, train, holdout = select_supported_lights(prepared, result)
         selection = result["light_selection"]
         if selection["excluded_light_indices"]:
@@ -1580,10 +2074,18 @@ def run_job(job_path: Path) -> int:
         holdout_before = data_loss_numpy(
             prediction_before, prepared["images_small"], prepared["weights"], holdout
         )
+        mean_before = np.mean(prediction_before[train], axis=0)
+        prepared["initial_training_loss"] = train_before
+        # Baseline basis images are large at the optimization resolution and are no
+        # longer needed during AD. Release them before allocating the optimizer.
+        del baseline_basis, prediction_before
+        gc.collect()
         mapping = control_mapping(render_height, render_width, int(settings["control_spacing"]))
         prepared["live_preview"] = job.get("parameters", {}).get("live_preview", False) is True
-        progress(20, "Optimizing a smooth height correction while preserving baseline detail")
-        control, correction_small_world, iterations = optimize_ad(
+        progress(20, (f"Optimizing an absolute {render_width}x{render_height} height field "
+                      f"({settings['max_side']} px maximum side)" if absolute_height else
+                      "Optimizing a smooth height correction while preserving baseline detail"))
+        control, optimized_small_world, iterations = optimize_ad(
             mi,
             prepared,
             scenes_by_basis,
@@ -1596,7 +2098,12 @@ def run_job(job_path: Path) -> int:
         )
         del control
         candidate_positions = prepared["baseline_positions"].copy()
-        candidate_positions[..., 2] += correction_small_world
+        if absolute_height:
+            candidate_positions[..., 2] = optimized_small_world
+        else:
+            candidate_positions[..., 2] += optimized_small_world
+        candidate_height, correction_full = full_height_solution(
+            prepared, optimized_small_world, absolute_height)
         progress(82, "Rendering fixed-seed candidate for training and withheld-light validation")
         candidate_basis = render_basis_numpy(
             mi,
@@ -1614,12 +2121,13 @@ def run_job(job_path: Path) -> int:
             prediction_after, prepared["images_small"], prepared["weights"], holdout
         )
         conversion = prepared["scene_scale"] * prepared["physical_scale"]
+        correction_small_world = (optimized_small_world - prepared["baseline_positions"][..., 2]
+                                  if absolute_height else optimized_small_world)
         correction_small_pixels = correction_small_world / max(conversion, 1.0e-12)
-        masked_correction = correction_small_pixels[prepared["mask_small"]]
+        masked_correction = correction_small_pixels[prepared["fit_mask"]]
         correction_rms = float(np.sqrt(np.mean(masked_correction**2)))
         correction_maximum = float(np.max(np.abs(masked_correction)))
-        x0, y0, x1, y1 = prepared["bounds"]
-        correction_crop = resize_bilinear(correction_small_pixels, y1 - y0, x1 - x0)
+        correction_crop = correction_full[y0:y1, x0:x1]
         crop_mask = prepared["mask"][y0:y1, x0:x1]
         q, p = masked_slopes(correction_crop, crop_mask)
         slope_rms = float(np.sqrt(np.mean(p[crop_mask] ** 2 + q[crop_mask] ** 2)))
@@ -1664,18 +2172,17 @@ def run_job(job_path: Path) -> int:
         else:
             decision = "rejected_excessive_height_change"
 
-        correction_full = np.zeros_like(prepared["height"], dtype=np.float32)
-        correction_full[y0:y1, x0:x1] = correction_crop
-        correction_full[~prepared["mask"]] = 0.0
         progress(90, "Writing guarded inverse geometry, material maps, and audit previews")
         output_products(
             mi,
             output,
             prepared["height"],
-            correction_full if accepted else np.zeros_like(correction_full),
+            (candidate_height if accepted else prepared["height"]) if absolute_height else
+            (correction_full if accepted else np.zeros_like(correction_full)),
             prepared["mask"],
             prepared["albedo"],
             float(job["parameters"]["height_scale"]),
+            absolute_height=absolute_height,
         )
         delivered_material = coefficients if accepted else baseline_coefficients
         roughness = material_roughness(delivered_material)
@@ -1690,7 +2197,6 @@ def run_job(job_path: Path) -> int:
         save_gray(mi, output / "material_diffuse.png", display_stretch(diffuse_full, prepared["mask"]))
         save_gray(mi, output / "material_specular.png", display_stretch(specular_full, prepared["mask"]))
         save_gray(mi, output / "material_roughness.png", np.where(prepared["mask"], roughness_full / 0.5, 0.0))
-        mean_before = np.mean(prediction_before[train], axis=0)
         mean_after = np.mean(prediction_after[train], axis=0)
         render_previews, render_display_range = comparison_stretch(mean_before, mean_after, prepared["mask_small"])
         save_gray(mi, output / "render_before.png", render_previews[0])
@@ -1705,7 +2211,12 @@ def run_job(job_path: Path) -> int:
                 "optimization_history": prepared.get("optimization_history", []),
                 "control_grid_shape": list(mapping[:2]),
                 "optimization_spp": settings["spp"],
+                "loss_reduction_chunk": DRJIT_REDUCTION_CHUNK,
                 "material_refit_interval": settings.get("material_refit_interval", 0),
+                "learning_rate_requested": prepared.get(
+                    "learning_rate_requested", settings["learning_rate"]),
+                "learning_rate_effective": prepared.get(
+                    "learning_rate_effective", settings["learning_rate"]),
                 "normal_prior_enabled": bool(np.any(prepared["normal_prior_weight"] > 0)),
                 "normal_prior_strength": NORMAL_PRIOR_STRENGTH,
                 "normal_prior_loss_before": prior_before,
@@ -1721,6 +2232,8 @@ def run_job(job_path: Path) -> int:
                 "candidate_correction_rms_pixels": correction_rms,
                 "candidate_correction_maximum_pixels": correction_maximum,
                 "candidate_slope_change_rms": slope_rms,
+                "height_difference_product": "candidate_minus_classical_initialization",
+                "absolute_height_limit_world": prepared.get("absolute_height_limit_world"),
                 "height_datum_assumption": "shared flat-surface/percentile reference assigned to explicit physical reference Z",
                 "reference_height_pixels": prepared["height_datum"],
                 "reference_surface_z_mm": job["geometry"]["reference_surface_z_mm"],
@@ -1738,11 +2251,15 @@ def run_job(job_path: Path) -> int:
             }
         )
         retain_unvalidated_candidate(
-            mi, output, prepared["height"], correction_full, prepared["mask"],
-            prepared["albedo"], float(job["parameters"]["height_scale"]), result,
+            mi, output, prepared["height"],
+            candidate_height if absolute_height else correction_full,
+            prepared["mask"], prepared["albedo"],
+            float(job["parameters"]["height_scale"]), result,
+            absolute_height=absolute_height,
         )
         atomic_json(result_path, result)
-        progress(100, "Mitsuba inverse refinement complete")
+        progress(100, ("Mitsuba absolute-height inverse solution complete" if absolute_height else
+                       "Mitsuba inverse refinement complete"))
         return 0
     except Exception as error:
         result["error"] = str(error)

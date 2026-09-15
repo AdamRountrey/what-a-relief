@@ -1,4 +1,6 @@
 #include "photometric.hpp"
+#include "calibration.hpp"
+#include "checked_io.hpp"
 #include "image_io.hpp"
 #include "radiometry.hpp"
 #include "robust_fit.hpp"
@@ -10,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -3215,6 +3218,155 @@ void testHeightFlatteningSemantics(TestContext& context) {
         "quadratic mode must remove its documented second-order basis");
 }
 
+void testMicroscopeCalibrationAndTarget(TestContext& context) {
+    const fs::path root = fs::absolute("calibration-test-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(root);
+    const fs::path target = root / "target.svg";
+    writePrintableCheckerboardSvg(target.string(), 12, 9, 2.0, 210.0, 297.0);
+    std::ifstream targetInput(target);
+    const std::string svg((std::istreambuf_iterator<char>(targetInput)), std::istreambuf_iterator<char>());
+    targetInput.close();
+    context.check(svg.find("width=\"210.0000mm\"") != std::string::npos &&
+        svg.find("10 mm check") != std::string::npos,
+        "Printable calibration target must preserve physical page dimensions and a print-scale check");
+
+    constexpr int columns = 12;
+    constexpr int rows = 9;
+    constexpr int squarePixels = 20;
+    constexpr int left = 40;
+    constexpr int top = 30;
+    const std::vector<double> trueGains{0.80, 1.00, 1.25, 0.90, 1.10};
+    Options calibrationOptions;
+    calibrationOptions.inputResponseMode = InputResponseMode::Linear;
+    for (size_t light = 0; light < trueGains.size(); ++light) {
+        cv::Mat image(240, 320, CV_16U, cv::Scalar(6000));
+        for (int row = 0; row < rows; ++row) {
+            for (int column = 0; column < columns; ++column) {
+                const double base = (row + column) % 2 == 0 ? 0.03 : 0.55;
+                const unsigned short value = cv::saturate_cast<unsigned short>(
+                    65535.0 * base * trueGains[light]);
+                image(cv::Rect(left + column * squarePixels, top + row * squarePixels,
+                    squarePixels, squarePixels)).setTo(value);
+            }
+        }
+        const fs::path path = root / ("light_" + std::to_string(light) + ".png");
+        writeImageChecked(path, image);
+        calibrationOptions.imagePaths.push_back(path.string());
+    }
+    calibrationOptions.inputResponses.assign(trueGains.size(), InputResponse{false, false, "test"});
+    const MicroscopeCalibration calibration = createMicroscopeCalibration(
+        calibrationOptions, columns, rows, 0.10);
+    context.check(std::abs(calibration.pixelScaleMm - 0.005) < 0.00015,
+        "Checkerboard must recover microscope working-plane pixel scale");
+    context.check(calibration.reprojectionRmsPixels < 0.25,
+        "Undistorted synthetic checkerboard should have a subpixel working-plane fit");
+    std::vector<double> normalizedTruth = trueGains;
+    double logMean = 0.0;
+    for (double gain : normalizedTruth) logMean += std::log(gain);
+    const double normalizer = std::exp(logMean / normalizedTruth.size());
+    for (double& gain : normalizedTruth) gain /= normalizer;
+    for (size_t i = 0; i < normalizedTruth.size(); ++i) {
+        context.check(std::abs(std::log(calibration.lightGains[i] / normalizedTruth[i])) < 0.02,
+            "Checkerboard white cells must recover relative lighting-position response");
+    }
+    const fs::path json = root / "calibration.json";
+    saveMicroscopeCalibration(json.string(), calibration);
+    const MicroscopeCalibration reloaded = loadMicroscopeCalibration(json.string());
+    context.check(reloaded.imageWidth == 320 && reloaded.imageHeight == 240 &&
+        reloaded.lightGains.size() == trueGains.size(),
+        "Microscope calibration must round-trip through its reusable JSON schema");
+    for (const std::string& path : calibrationOptions.imagePaths) fs::remove(path);
+    fs::remove(target);
+    fs::remove(json);
+    fs::remove(root);
+}
+
+void testSpecimenLightGainEstimation(TestContext& context) {
+    const auto lights = makeRingLights(8, 0.78f);
+    std::vector<double> truth{0.78, 1.18, 0.91, 1.27, 0.84, 1.08, 0.95, 1.04};
+    double logMean = 0.0;
+    for (double gain : truth) logMean += std::log(gain);
+    const double normalizer = std::exp(logMean / truth.size());
+    for (double& gain : truth) gain /= normalizer;
+    std::vector<cv::Mat> images;
+    images.reserve(lights.size());
+    for (size_t i = 0; i < lights.size(); ++i) images.emplace_back(120, 160, CV_32F);
+    for (int y = 0; y < 120; ++y) {
+        for (int x = 0; x < 160; ++x) {
+            const float nx = static_cast<float>(0.32 * std::sin(2.0 * kPi * x / 159.0));
+            const float ny = static_cast<float>(0.28 * std::cos(2.0 * kPi * y / 119.0));
+            const cv::Vec3f normal = normalized(cv::Vec3f(nx, ny, 1.0f));
+            const float albedo = 0.42f + 0.16f * std::sin(0.07f * x) * std::cos(0.09f * y);
+            for (size_t i = 0; i < lights.size(); ++i) {
+                images[i].at<float>(y, x) = static_cast<float>(
+                    truth[i] * albedo * std::max(0.0f, normal.dot(lights[i])));
+            }
+        }
+    }
+    const cv::Mat mask(120, 160, CV_8U, cv::Scalar(255));
+    const LightGainEstimate estimate = estimateRelativeLightGains(
+        images, lights, mask, 0.01f, 0.98f);
+    context.check(estimate.accepted,
+        "Stable specimen-derived gains should pass spatial and leave-one-light-out validation");
+    context.check(estimate.validationErrorAfter < 0.5 * estimate.validationErrorBefore,
+        "Accepted gain correction should materially improve held-out prediction");
+    if (estimate.gains.size() == truth.size()) {
+        for (size_t i = 0; i < truth.size(); ++i) {
+            context.check(std::abs(std::log(estimate.gains[i] / truth[i])) < 0.12,
+                "Specimen estimator should recover synthetic relative light gain");
+        }
+    } else {
+        context.check(false, "Accepted specimen estimate must return one gain per light");
+    }
+
+    std::vector<cv::Mat> lowerExposure;
+    lowerExposure.reserve(images.size());
+    for (const cv::Mat& image : images) lowerExposure.push_back(0.31f * image);
+    const LightGainEstimate lowerEstimate = estimateRelativeLightGains(
+        lowerExposure, lights, mask, 0.003f, 0.98f);
+    context.check(lowerEstimate.accepted && lowerEstimate.gains.size() == truth.size(),
+        "A common exposure change between microscope stacks must not invalidate relative gain estimation");
+    if (lowerEstimate.gains.size() == truth.size() && estimate.gains.size() == truth.size()) {
+        for (size_t i = 0; i < truth.size(); ++i) {
+            context.check(std::abs(std::log(lowerEstimate.gains[i] / estimate.gains[i])) < 0.02,
+                "Relative gains must be invariant to a common stack exposure multiplier");
+        }
+    }
+
+    const LightGainGeometry nearField{
+        LightingModel::NearFieldRing, 18.0, 24.0, 0.05, cv::Point2d(79.5, 59.5)};
+    std::vector<cv::Mat> nearFieldImages;
+    nearFieldImages.reserve(lights.size());
+    for (size_t i = 0; i < lights.size(); ++i) nearFieldImages.emplace_back(120, 160, CV_32F);
+    for (int y = 0; y < 120; ++y) {
+        for (int x = 0; x < 160; ++x) {
+            const float nx = static_cast<float>(0.32 * std::sin(2.0 * kPi * x / 159.0));
+            const float ny = static_cast<float>(0.28 * std::cos(2.0 * kPi * y / 119.0));
+            const cv::Vec3f normal = normalized(cv::Vec3f(nx, ny, 1.0f));
+            const float albedo = 0.42f + 0.16f * std::sin(0.07f * x) * std::cos(0.09f * y);
+            for (size_t i = 0; i < lights.size(); ++i) {
+                const cv::Vec3f pixelLight = photometricLightVectorAtPixel(
+                    lights[i], static_cast<int>(i), static_cast<int>(lights.size()), x, y,
+                    nearField.model, nearField.ringLightRadiusMm, nearField.ringLightHeightMm,
+                    nearField.pixelScaleMm, nearField.lightingCenter);
+                nearFieldImages[i].at<float>(y, x) = static_cast<float>(
+                    truth[i] * albedo * std::max(0.0f, normal.dot(pixelLight)));
+            }
+        }
+    }
+    const LightGainEstimate nearFieldEstimate = estimateRelativeLightGains(
+        nearFieldImages, lights, mask, 0.01f, 0.98f, {}, nearField);
+    context.check(nearFieldEstimate.accepted && nearFieldEstimate.gains.size() == truth.size(),
+        "Specimen gain estimation must use the near-field ring model when the solve uses it");
+    if (nearFieldEstimate.gains.size() == truth.size()) {
+        for (size_t i = 0; i < truth.size(); ++i) {
+            context.check(std::abs(std::log(nearFieldEstimate.gains[i] / truth[i])) < 0.12,
+                "Near-field specimen estimation should recover synthetic relative light gain");
+        }
+    }
+}
+
 } // namespace
 
 void testSolveProgress(TestContext& context) {
@@ -3242,9 +3394,124 @@ void testSolveProgress(TestContext& context) {
     }
 }
 
+void testSphereCircleAndHighlightQuality(TestContext& context) {
+    const cv::Point2d center(23.4, 71.6);
+    const double radius = 18.5;
+    std::vector<cv::Point2d> edgePoints;
+    for (int i = 0; i < 8; ++i) {
+        const double angle = 2.0 * kPi * static_cast<double>(i) / 8.0;
+        const double perturbation = (i % 2 == 0) ? 0.15 : -0.12;
+        edgePoints.emplace_back(
+            center.x + (radius + perturbation) * std::cos(angle),
+            center.y + (radius + perturbation) * std::sin(angle));
+    }
+    const SphereCircleFit fit = fitSphereCircle(edgePoints);
+    context.check(fit.accepted, "Five-plus-point sphere fit rejected a well-spaced off-center circle");
+    context.check(std::hypot(fit.sphere.cx - center.x, fit.sphere.cy - center.y) < 0.1 &&
+        std::abs(fit.sphere.radius - radius) < 0.1,
+        "Five-plus-point sphere fit did not recover off-center circle geometry");
+    context.check(fit.rmsResidualPixels < 0.2 && fit.angularCoverageDegrees > 300.0,
+        "Sphere fit quality did not report low residual and broad circumference coverage");
+
+    std::vector<cv::Point2d> sparse(edgePoints.begin(), edgePoints.begin() + 4);
+    context.check(!fitSphereCircle(sparse).accepted,
+        "Sphere circle accepted fewer than five redundant edge points");
+    std::vector<cv::Point2d> clustered;
+    for (int i = 0; i < 6; ++i) {
+        const double angle = -0.25 + 0.10 * i;
+        clustered.emplace_back(center.x + radius * std::cos(angle), center.y + radius * std::sin(angle));
+    }
+    context.check(!fitSphereCircle(clustered).accepted,
+        "Sphere circle accepted edge points confined to a narrow arc");
+    std::vector<cv::Point2d> inconsistent = edgePoints;
+    inconsistent.emplace_back(center.x + radius + 12.0, center.y);
+    context.check(!fitSphereCircle(inconsistent).accepted,
+        "Sphere circle accepted an inaccurate circumference click despite a large fit residual");
+
+    Options opt;
+    opt.highlightPercentile = 99.0;
+    opt.minHighlight = 0.1;
+    opt.viewDir = cv::Vec3f(0, 0, 1);
+    const Sphere sphere{25.0, 72.0, 20.0};
+    cv::Mat image(112, 160, CV_32F, cv::Scalar(0.04f));
+    const cv::Point highlightCenter(30, 68);
+    cv::circle(image, highlightCenter, 2, cv::Scalar(0.80f), cv::FILLED);
+    image.at<float>(highlightCenter) = 0.90f;
+    image.at<float>(82, 20) = 1.0f; // Brighter hot pixel must not beat a connected highlight.
+    cv::Mat saturation(image.size(), CV_8U, cv::Scalar(0));
+    const HighlightEstimate estimate = estimateHighlight(image, sphere, opt, saturation);
+    context.check(cv::norm(estimate.point - cv::Point2f(30.0f, 68.0f)) < 0.3,
+        "Connected highlight detector was distracted by an isolated hot pixel");
+    const cv::Vec3f expectedNormal(
+        static_cast<float>((30.0 - sphere.cx) / sphere.radius),
+        static_cast<float>(-(68.0 - sphere.cy) / sphere.radius),
+        static_cast<float>(std::sqrt(1.0 - 41.0 / 400.0)));
+    const cv::Vec3f expectedLight = normalized(2.0f * expectedNormal[2] * expectedNormal - cv::Vec3f(0, 0, 1));
+    context.check(std::acos(std::clamp(estimate.light.dot(expectedLight), -1.0f, 1.0f)) * kRadiansToDegrees < 0.5,
+        "Off-center sphere coordinates changed the recovered light direction");
+    context.check(estimate.selectedPixels >= 10 && estimate.candidateComponents == 1 &&
+        estimate.radialFraction < 0.4f && estimate.centroidUncertaintyPixels < 1.0f,
+        "Accepted highlight omitted its component, margin, or uncertainty quality evidence");
+
+    cv::Mat clipped = image.clone();
+    cv::Mat compactClip(image.size(), CV_8U, cv::Scalar(0));
+    cv::circle(clipped, highlightCenter, 2, cv::Scalar(1.0f), cv::FILLED);
+    cv::circle(compactClip, highlightCenter, 2, cv::Scalar(255), cv::FILLED);
+    const HighlightEstimate clippedEstimate = estimateHighlight(clipped, sphere, opt, compactClip);
+    context.check(clippedEstimate.saturatedPixels > 0 && clippedEstimate.quality == "accepted_clipped_compact",
+        "A compact clipped highlight was not retained with an explicit quality label");
+
+    cv::Mat isolated(image.size(), CV_32F, cv::Scalar(0.04f));
+    for (int i = 0; i < 8; ++i) isolated.at<float>(58 + 3 * i, 16 + (7 * i) % 25) = 1.0f;
+    Options isolatedOpt = opt;
+    isolatedOpt.highlightPercentile = 99.5;
+    expectThrows(context, [&]() { estimateHighlight(isolated, sphere, isolatedOpt); },
+        "Isolated bright pixels were accepted as a sphere highlight");
+
+    cv::Mat ambiguous(image.size(), CV_32F, cv::Scalar(0.04f));
+    cv::rectangle(ambiguous, cv::Rect(17, 66, 4, 4), cv::Scalar(0.85f), cv::FILLED);
+    cv::rectangle(ambiguous, cv::Rect(31, 74, 4, 4), cv::Scalar(0.85f), cv::FILLED);
+    Options ambiguousOpt = opt;
+    ambiguousOpt.highlightPercentile = 98.0;
+    expectThrows(context, [&]() { estimateHighlight(ambiguous, sphere, ambiguousOpt); },
+        "Two similarly strong sphere reflections were accepted as one light direction");
+
+    cv::Mat broadClip(image.size(), CV_32F, cv::Scalar(0.04f));
+    cv::Mat broadClipMask(image.size(), CV_8U, cv::Scalar(0));
+    cv::rectangle(broadClip, cv::Rect(24, 64, 7, 7), cv::Scalar(1.0f), cv::FILLED);
+    cv::rectangle(broadClipMask, cv::Rect(24, 64, 7, 7), cv::Scalar(255), cv::FILLED);
+    Options broadOpt = opt;
+    broadOpt.highlightPercentile = 97.0;
+    expectThrows(context, [&]() { estimateHighlight(broadClip, sphere, broadOpt, broadClipMask); },
+        "An excessively broad clipped sphere plateau was accepted");
+
+    cv::Mat rim(image.size(), CV_32F, cv::Scalar(0.04f));
+    cv::circle(rim, cv::Point(44, 72), 2, cv::Scalar(0.9f), cv::FILLED);
+    expectThrows(context, [&]() { estimateHighlight(rim, sphere, opt); },
+        "A highlight centroid too close to the sphere rim was clamped instead of rejected");
+
+    const Sphere croppedSphere{5.0, 72.0, 20.0};
+    expectThrows(context, [&]() { estimateHighlight(image, croppedSphere, opt); },
+        "A sphere cropped by the image boundary was accepted");
+}
+
 int main(int argc, char** argv) {
     TestContext context;
+    testSphereCircleAndHighlightQuality(context);
     testSolveProgress(context);
+    if (argc == 2 && std::string(argv[1]) == "--microscope-calibration") {
+        testMicroscopeCalibrationAndTarget(context);
+        return context.failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--gain-calibration") {
+        testSpecimenLightGainEstimation(context);
+        return context.failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--calibration") {
+        testMicroscopeCalibrationAndTarget(context);
+        testSpecimenLightGainEstimation(context);
+        return context.failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--exposure-boundaries") {
         testRobustDarkBoundaryStability(context);
         testRobustClippingBoundaryStability(context);
@@ -3295,6 +3562,8 @@ int main(int argc, char** argv) {
     testHeightIntegration(context);
     testHeightIntegrationPixelCenterSlopes(context);
     testHeightFlatteningSemantics(context);
+    testMicroscopeCalibrationAndTarget(context);
+    testSpecimenLightGainEstimation(context);
 
     if (context.failures != 0) {
         std::cerr << context.failures << " scientific regression check(s) failed.\n";

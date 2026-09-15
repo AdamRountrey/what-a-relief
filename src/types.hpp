@@ -67,7 +67,8 @@ enum class MitsubaBackendMode {
 enum class MitsubaQualityMode {
     Preview,
     Standard,
-    Research
+    Research,
+    Ultra
 };
 
 struct MitsubaRefinementDiagnostics {
@@ -105,10 +106,18 @@ struct Options {
     std::string maskPath;
     std::string heightMaskPath;
     std::string lightsFile;
+    std::string microscopeCalibrationFile;
+    std::string calibrationTargetPath;
+    std::string createMicroscopeCalibrationPath;
     std::string meshPath;
     std::string printableMeshPath;
     std::string rtiPath;
     Sphere sphere;
+    int sphereSelectionImageIndex = 0;
+    std::vector<cv::Point2d> sphereEdgePoints;
+    double sphereFitRmsPixels = -1.0;
+    double sphereFitMaxResidualPixels = -1.0;
+    double sphereFitCoverageDegrees = -1.0;
     cv::Rect crop;
     bool hasSphere = false;
     bool hasCrop = false;
@@ -120,6 +129,7 @@ struct Options {
     bool keepSphere = false;
     bool uncalibratedLighting = false;
     bool lightsFileByOrder = false;
+    bool estimateLightGains = false;
     bool calculateHeight = true;
     bool openRelightViewer = false;
     bool specularDiagnostics = false;
@@ -156,6 +166,13 @@ struct Options {
     double heightSlopeCap = 3.0;
     double heightScale = 1.0;
     double printableThicknessMm = 2.0;
+    int calibrationGridColumns = 12;
+    int calibrationGridRows = 9;
+    double calibrationSquareMm = 2.0;
+    double calibrationPageWidthMm = 210.0;
+    double calibrationPageHeightMm = 297.0;
+    std::vector<double> lightGains;
+    std::string lightGainSource = "equal";
     cv::Vec3f viewDir = cv::Vec3f(0.0f, 0.0f, 1.0f);
     cv::Mat heightMask;
 };
@@ -192,6 +209,15 @@ struct PhotometricDiagnostics {
     cv::Mat classicalNormal;
     cv::Mat neuralValidMask;
     cv::Mat neuralNormal;
+    bool lightGainEstimationAttempted = false;
+    bool lightGainCorrectionApplied = false;
+    std::string lightGainDecision = "not_requested";
+    std::string lightGainSource = "equal";
+    std::vector<double> lightGains;
+    double lightGainValidationErrorBefore = -1.0;
+    double lightGainValidationErrorAfter = -1.0;
+    double lightGainStability = -1.0;
+    double lightGainNormalDiversity = -1.0;
     bool shadowHeightRefinementApplied = false;
     std::string shadowHeightRefinementDecision = "not_requested";
     double shadowMismatchRateBefore = -1.0;
@@ -228,4 +254,22 @@ struct HighlightEstimate {
     float threshold = 0.0f;
     float peak = 0.0f;
     int selectedPixels = 0;
+    int candidateComponents = 0;
+    int saturatedPixels = 0;
+    float saturationFraction = 0.0f;
+    float componentAreaFraction = 0.0f;
+    float compactness = 0.0f;
+    float centroidUncertaintyPixels = 0.0f;
+    float radialFraction = 0.0f;
+    std::string quality = "accepted";
+};
+
+struct SphereCircleFit {
+    Sphere sphere;
+    bool hasGeometry = false;
+    bool accepted = false;
+    double rmsResidualPixels = -1.0;
+    double maxResidualPixels = -1.0;
+    double angularCoverageDegrees = -1.0;
+    std::string message;
 };

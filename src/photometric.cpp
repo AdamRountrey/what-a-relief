@@ -283,7 +283,7 @@ cv::Matx33d rotationAroundZ(double radians) {
         0.0, 0.0, 1.0);
 }
 
-cv::Vec3f nearFieldRingLightVector(
+cv::Vec3f nearFieldRingLightVectorImpl(
     const cv::Vec3f& reference,
     int index,
     int count,
@@ -784,7 +784,164 @@ bool solveRobustPixel(
 
 } // namespace
 
-HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, const Options& opt) {
+SphereCircleFit fitSphereCircle(const std::vector<cv::Point2d>& points) {
+    SphereCircleFit result;
+    if (points.size() < 3) {
+        result.message = "Add at least 5 well-spaced edge points.";
+        return result;
+    }
+
+    cv::Mat design(static_cast<int>(points.size()), 3, CV_64F);
+    cv::Mat rhs(static_cast<int>(points.size()), 1, CV_64F);
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (!std::isfinite(points[i].x) || !std::isfinite(points[i].y)) {
+            result.message = "Sphere edge points must be finite.";
+            return result;
+        }
+        design.at<double>(static_cast<int>(i), 0) = points[i].x;
+        design.at<double>(static_cast<int>(i), 1) = points[i].y;
+        design.at<double>(static_cast<int>(i), 2) = 1.0;
+        rhs.at<double>(static_cast<int>(i), 0) = -(points[i].x * points[i].x + points[i].y * points[i].y);
+    }
+
+    cv::Mat solution;
+    if (!cv::solve(design, rhs, solution, cv::DECOMP_SVD)) {
+        result.message = "The selected edge points do not define a stable circle.";
+        return result;
+    }
+    double cx = -0.5 * solution.at<double>(0, 0);
+    double cy = -0.5 * solution.at<double>(1, 0);
+    const double radiusSquared = cx * cx + cy * cy - solution.at<double>(2, 0);
+    if (!std::isfinite(radiusSquared) || radiusSquared <= 9.0) {
+        result.message = "The selected sphere is too small or ill-conditioned.";
+        return result;
+    }
+    double radius = std::sqrt(radiusSquared);
+
+    // Refine the algebraic initialization against geometric radial residuals.
+    for (int iteration = 0; iteration < 12; ++iteration) {
+        cv::Mat jacobian(static_cast<int>(points.size()), 3, CV_64F);
+        cv::Mat residual(static_cast<int>(points.size()), 1, CV_64F);
+        bool usable = true;
+        for (size_t i = 0; i < points.size(); ++i) {
+            const double dx = points[i].x - cx;
+            const double dy = points[i].y - cy;
+            const double distance = std::hypot(dx, dy);
+            if (!std::isfinite(distance) || distance < 1.0e-9) {
+                usable = false;
+                break;
+            }
+            jacobian.at<double>(static_cast<int>(i), 0) = -dx / distance;
+            jacobian.at<double>(static_cast<int>(i), 1) = -dy / distance;
+            jacobian.at<double>(static_cast<int>(i), 2) = -1.0;
+            residual.at<double>(static_cast<int>(i), 0) = distance - radius;
+        }
+        if (!usable) {
+            result.message = "The selected edge points do not define a stable circle.";
+            return result;
+        }
+        cv::Mat delta;
+        if (!cv::solve(jacobian, -residual, delta, cv::DECOMP_SVD)) break;
+        cx += delta.at<double>(0, 0);
+        cy += delta.at<double>(1, 0);
+        radius += delta.at<double>(2, 0);
+        if (cv::norm(delta) < 1.0e-8) break;
+    }
+
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(radius) || radius <= 3.0) {
+        result.message = "The selected edge points do not define a finite sphere circle.";
+        return result;
+    }
+    result.sphere = {cx, cy, radius};
+    result.hasGeometry = true;
+
+    double squaredResidual = 0.0;
+    double maxResidual = 0.0;
+    std::vector<double> angles;
+    angles.reserve(points.size());
+    for (const cv::Point2d& point : points) {
+        const double dx = point.x - cx;
+        const double dy = point.y - cy;
+        const double radialResidual = std::abs(std::hypot(dx, dy) - radius);
+        squaredResidual += radialResidual * radialResidual;
+        maxResidual = std::max(maxResidual, radialResidual);
+        double angle = std::atan2(dy, dx);
+        if (angle < 0.0) angle += 2.0 * CV_PI;
+        angles.push_back(angle);
+    }
+    result.rmsResidualPixels = std::sqrt(squaredResidual / static_cast<double>(points.size()));
+    result.maxResidualPixels = maxResidual;
+    std::sort(angles.begin(), angles.end());
+    double largestGap = 0.0;
+    for (size_t i = 1; i < angles.size(); ++i) largestGap = std::max(largestGap, angles[i] - angles[i - 1]);
+    largestGap = std::max(largestGap, angles.front() + 2.0 * CV_PI - angles.back());
+    result.angularCoverageDegrees = (2.0 * CV_PI - largestGap) * 180.0 / CV_PI;
+
+    const double rmsLimit = std::max(2.0, 0.02 * radius);
+    const double maxLimit = std::max(4.0, 0.05 * radius);
+    if (points.size() < 5) {
+        result.message = "Add at least 5 edge points; spread them around the sphere.";
+    } else if (result.angularCoverageDegrees < 180.0) {
+        result.message = "Edge points cover too little of the circumference; add points around the opposite side.";
+    } else if (result.rmsResidualPixels > rmsLimit || result.maxResidualPixels > maxLimit) {
+        std::ostringstream message;
+        message << "Circle fit is inconsistent (RMS " << result.rmsResidualPixels
+                << " px, maximum " << result.maxResidualPixels
+                << " px); remove the inaccurate point or reset.";
+        result.message = message.str();
+    } else {
+        result.accepted = true;
+        result.message = "Circle fit accepted.";
+    }
+    return result;
+}
+
+cv::Vec3f photometricLightVectorAtPixel(
+    const cv::Vec3f& reference,
+    int index,
+    int count,
+    int x,
+    int y,
+    LightingModel lightingModel,
+    double ringLightRadiusMm,
+    double ringLightHeightMm,
+    double pixelScaleMm,
+    cv::Point2d lightingCenter) {
+    if (lightingModel == LightingModel::Directional) return reference;
+    return nearFieldRingLightVectorImpl(
+        reference,
+        index,
+        count,
+        x,
+        y,
+        ringLightRadiusMm,
+        ringLightHeightMm,
+        pixelScaleMm,
+        lightingCenter);
+}
+
+HighlightEstimate estimateHighlight(
+    const cv::Mat& image,
+    const Sphere& sphere,
+    const Options& opt,
+    const cv::Mat& saturationMask) {
+    if (image.empty() || image.type() != CV_32F) {
+        die("Sphere highlight estimation requires one floating-point luminance image.");
+    }
+    if (!saturationMask.empty() &&
+        (saturationMask.type() != CV_8U || saturationMask.size() != image.size())) {
+        die("Sphere saturation mask must be an 8-bit mask matching the image size.");
+    }
+    if (!std::isfinite(sphere.cx) || !std::isfinite(sphere.cy) ||
+        !std::isfinite(sphere.radius) || sphere.radius <= 3.0) {
+        die("Selected sphere circle is invalid or too small for reliable highlight calibration.");
+    }
+    if (sphere.cx - sphere.radius < -0.5 || sphere.cy - sphere.radius < -0.5 ||
+        sphere.cx + sphere.radius > static_cast<double>(image.cols) - 0.5 ||
+        sphere.cy + sphere.radius > static_cast<double>(image.rows) - 0.5) {
+        die("The selected sphere is cropped by the image boundary; the complete sphere must be visible, but it need not be centered.");
+    }
+
     const int x0 = std::max(0, static_cast<int>(std::floor(sphere.cx - sphere.radius)));
     const int y0 = std::max(0, static_cast<int>(std::floor(sphere.cy - sphere.radius)));
     const int x1 = std::min(image.cols - 1, static_cast<int>(std::ceil(sphere.cx + sphere.radius)));
@@ -812,13 +969,13 @@ HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, 
 
     const float threshold = percentile(samples, opt.highlightPercentile);
     const float minValue = std::max(threshold, static_cast<float>(opt.minHighlight));
-    double sumW = 0.0;
-    double sumX = 0.0;
-    double sumY = 0.0;
-    int selected = 0;
-
+    if (peak < static_cast<float>(opt.minHighlight)) {
+        die("No sufficiently bright reflection was found inside the selected sphere.");
+    }
+    cv::Mat candidates(y1 - y0 + 1, x1 - x0 + 1, CV_8U, cv::Scalar(0));
     for (int y = y0; y <= y1; ++y) {
         const float* row = image.ptr<float>(y);
+        uchar* candidateRow = candidates.ptr<uchar>(y - y0);
         for (int x = x0; x <= x1; ++x) {
             if (!insideSphere(sphere, x, y)) {
                 continue;
@@ -827,27 +984,146 @@ HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, 
             if (!std::isfinite(value) || value < minValue) {
                 continue;
             }
-            const double w = static_cast<double>(value - minValue) + 1.0e-6;
-            sumW += w;
-            sumX += w * static_cast<double>(x);
-            sumY += w * static_cast<double>(y);
-            ++selected;
+            candidateRow[x - x0] = 255;
         }
     }
 
-    if (sumW <= 0.0 || selected == 0) {
-        die("Could not find a bright highlight inside the selected sphere.");
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int labelCount = cv::connectedComponentsWithStats(candidates, labels, stats, centroids, 8, CV_32S);
+    const double sphereArea = CV_PI * sphere.radius * sphere.radius;
+    const int minimumArea = std::clamp(static_cast<int>(std::ceil(sphereArea * 0.0001)), 3, 12);
+    struct Component {
+        int label = 0;
+        int area = 0;
+        double score = 0.0;
+        float peak = 0.0f;
+    };
+    std::vector<double> componentScores(static_cast<size_t>(labelCount), 0.0);
+    std::vector<float> componentPeaks(static_cast<size_t>(labelCount), 0.0f);
+    for (int ry = 0; ry < labels.rows; ++ry) {
+        const int* labelRow = labels.ptr<int>(ry);
+        const float* imageRow = image.ptr<float>(ry + y0);
+        for (int rx = 0; rx < labels.cols; ++rx) {
+            const int label = labelRow[rx];
+            if (label <= 0) continue;
+            const float value = imageRow[rx + x0];
+            componentScores[static_cast<size_t>(label)] += std::max(0.0f, value);
+            componentPeaks[static_cast<size_t>(label)] = std::max(
+                componentPeaks[static_cast<size_t>(label)], value);
+        }
+    }
+    std::vector<Component> components;
+    for (int label = 1; label < labelCount; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area < minimumArea) continue;
+        Component component;
+        component.label = label;
+        component.area = area;
+        component.score = componentScores[static_cast<size_t>(label)];
+        component.peak = componentPeaks[static_cast<size_t>(label)];
+        components.push_back(component);
+    }
+    if (components.empty()) {
+        die("The bright sphere samples are isolated or too small to form a reliable highlight (minimum connected area " +
+            std::to_string(minimumArea) + " pixels).");
+    }
+    std::sort(components.begin(), components.end(), [](const Component& a, const Component& b) {
+        return a.score > b.score;
+    });
+    if (components.size() > 1 && components[1].score >= 0.70 * components[0].score) {
+        die("Multiple similarly bright highlight components were found inside the sphere; choose a cleaner exposure or remove stray reflections.");
     }
 
+    const Component& component = components.front();
+    const int width = stats.at<int>(component.label, cv::CC_STAT_WIDTH);
+    const int height = stats.at<int>(component.label, cv::CC_STAT_HEIGHT);
+    const double compactness = static_cast<double>(component.area) /
+        static_cast<double>(std::max(1, width * height));
+    const double areaFraction = static_cast<double>(component.area) / sphereArea;
+    if (compactness < 0.18) {
+        die("The selected sphere highlight is too fragmented or elongated to calibrate a stable light direction.");
+    }
+    if (areaFraction > 0.08) {
+        die("The bright region covers too much of the sphere to be a localized calibration highlight.");
+    }
+
+    const double weightFloor = std::max(1.0e-6, static_cast<double>(component.peak) * 0.02);
+    double sumW = 0.0;
+    double sumW2 = 0.0;
+    double sumX = 0.0;
+    double sumY = 0.0;
+    int saturatedPixels = 0;
+    for (int ry = 0; ry < labels.rows; ++ry) {
+        const int* labelRow = labels.ptr<int>(ry);
+        const float* imageRow = image.ptr<float>(ry + y0);
+        const uchar* saturationRow = saturationMask.empty() ? nullptr : saturationMask.ptr<uchar>(ry + y0);
+        for (int rx = 0; rx < labels.cols; ++rx) {
+            if (labelRow[rx] != component.label) continue;
+            const double weight = std::max(
+                weightFloor,
+                static_cast<double>(imageRow[rx + x0]) - static_cast<double>(minValue));
+            const double x = static_cast<double>(rx + x0);
+            const double y = static_cast<double>(ry + y0);
+            sumW += weight;
+            sumW2 += weight * weight;
+            sumX += weight * x;
+            sumY += weight * y;
+            if (saturationRow != nullptr && saturationRow[rx + x0] != 0) ++saturatedPixels;
+        }
+    }
+    if (sumW <= 0.0) die("Could not compute a finite centroid for the sphere highlight.");
     const double hx = sumX / sumW;
     const double hy = sumY / sumW;
+    double covarianceXX = 0.0;
+    double covarianceYY = 0.0;
+    double covarianceXY = 0.0;
+    for (int ry = 0; ry < labels.rows; ++ry) {
+        const int* labelRow = labels.ptr<int>(ry);
+        const float* imageRow = image.ptr<float>(ry + y0);
+        for (int rx = 0; rx < labels.cols; ++rx) {
+            if (labelRow[rx] != component.label) continue;
+            const double weight = std::max(
+                weightFloor,
+                static_cast<double>(imageRow[rx + x0]) - static_cast<double>(minValue));
+            const double dx = static_cast<double>(rx + x0) - hx;
+            const double dy = static_cast<double>(ry + y0) - hy;
+            covarianceXX += weight * dx * dx;
+            covarianceYY += weight * dy * dy;
+            covarianceXY += weight * dx * dy;
+        }
+    }
+    covarianceXX /= sumW;
+    covarianceYY /= sumW;
+    covarianceXY /= sumW;
+    const double trace = covarianceXX + covarianceYY;
+    const double discriminant = std::sqrt(std::max(
+        0.0,
+        (covarianceXX - covarianceYY) * (covarianceXX - covarianceYY) +
+            4.0 * covarianceXY * covarianceXY));
+    const double eigenMax = 0.5 * (trace + discriminant);
+    const double eigenMin = std::max(1.0e-6, 0.5 * (trace - discriminant));
+    const double aspectRatio = std::sqrt(std::max(0.0, eigenMax) / eigenMin);
+    if (!std::isfinite(aspectRatio) || aspectRatio > 12.0) {
+        die("The selected sphere highlight is too elongated to define a reliable centroid.");
+    }
+    const double effectiveSamples = sumW2 > 0.0 ? sumW * sumW / sumW2 : 1.0;
+    const double centroidUncertainty = std::sqrt(std::max(0.0, trace) / std::max(1.0, effectiveSamples));
+    if (!std::isfinite(centroidUncertainty) || centroidUncertainty > std::max(1.5, 0.03 * sphere.radius)) {
+        die("The selected sphere highlight centroid is too uncertain; use a sharper or cleaner exposure.");
+    }
+
     double nx = (hx - sphere.cx) / sphere.radius;
     double ny = -(hy - sphere.cy) / sphere.radius;
     const double rr = nx * nx + ny * ny;
-    if (rr >= 1.0) {
-        const double s = 0.999 / std::sqrt(rr);
-        nx *= s;
-        ny *= s;
+    const double radialFraction = std::sqrt(std::max(0.0, rr));
+    if (!std::isfinite(radialFraction) || radialFraction > 0.92) {
+        die("The highlight centroid lies too close to the sphere rim; the light direction would be unstable.");
+    }
+    const double clippedAreaFraction = static_cast<double>(saturatedPixels) / sphereArea;
+    if (clippedAreaFraction > 0.03) {
+        die("The clipped highlight plateau is too large for reliable sphere calibration; reduce exposure or choose another image.");
     }
     const double nz = std::sqrt(std::max(0.0, 1.0 - nx * nx - ny * ny));
     cv::Vec3f normal(static_cast<float>(nx), static_cast<float>(ny), static_cast<float>(nz));
@@ -867,8 +1143,17 @@ HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, 
     estimate.point = cv::Point2f(static_cast<float>(hx), static_cast<float>(hy));
     estimate.light = light;
     estimate.threshold = threshold;
-    estimate.peak = peak;
-    estimate.selectedPixels = selected;
+    estimate.peak = component.peak;
+    estimate.selectedPixels = component.area;
+    estimate.candidateComponents = static_cast<int>(components.size());
+    estimate.saturatedPixels = saturatedPixels;
+    estimate.saturationFraction = static_cast<float>(
+        static_cast<double>(saturatedPixels) / static_cast<double>(component.area));
+    estimate.componentAreaFraction = static_cast<float>(areaFraction);
+    estimate.compactness = static_cast<float>(compactness);
+    estimate.centroidUncertaintyPixels = static_cast<float>(centroidUncertainty);
+    estimate.radialFraction = static_cast<float>(radialFraction);
+    estimate.quality = saturatedPixels > 0 ? "accepted_clipped_compact" : "accepted_unclipped";
     return estimate;
 }
 
@@ -1165,8 +1450,9 @@ void solvePhotometricStereo(
         const int centerX = static_cast<int>(std::lround(lightingCenter.x));
         const int centerY = static_cast<int>(std::lround(lightingCenter.y));
         for (int i = 0; i < n; ++i) {
-            conditionLights.push_back(nearFieldRingLightVector(
-                lights[i], i, n, centerX, centerY, ringLightRadiusMm, ringLightHeightMm, pixelScaleMm, lightingCenter));
+            conditionLights.push_back(photometricLightVectorAtPixel(
+                lights[i], i, n, centerX, centerY, lightingModel,
+                ringLightRadiusMm, ringLightHeightMm, pixelScaleMm, lightingCenter));
         }
     } else {
         conditionLights = lights;
@@ -1303,12 +1589,13 @@ void solvePhotometricStereo(
                             ? 1
                             : 0;
                         if (lightingModel == LightingModel::NearFieldRing) {
-                            pixelLights[static_cast<size_t>(i)] = nearFieldRingLightVector(
+                            pixelLights[static_cast<size_t>(i)] = photometricLightVectorAtPixel(
                                 lights[static_cast<size_t>(i)],
                                 i,
                                 n,
                                 x,
                                 y,
+                                lightingModel,
                                 ringLightRadiusMm,
                                 ringLightHeightMm,
                                 pixelScaleMm,
@@ -1520,12 +1807,13 @@ void solvePhotometricStereo(
             if (lightingModel == LightingModel::NearFieldRing) {
                 nearFieldLights.reserve(static_cast<size_t>(n));
                 for (int i = 0; i < n; ++i) {
-                    nearFieldLights.push_back(nearFieldRingLightVector(
+                    nearFieldLights.push_back(photometricLightVectorAtPixel(
                         lights[i],
                         i,
                         n,
                         x,
                         y,
+                        lightingModel,
                         ringLightRadiusMm,
                         ringLightHeightMm,
                         pixelScaleMm,

@@ -1,4 +1,5 @@
 #include "image_io.hpp"
+#include "calibration.hpp"
 #include "input_response.hpp"
 #include "checked_io.hpp"
 #include "radiometry.hpp"
@@ -815,7 +816,21 @@ void writeLightsCsv(
     out << "sphere_cx," << opt.sphere.cx << "\n";
     out << "sphere_cy," << opt.sphere.cy << "\n";
     out << "sphere_radius," << opt.sphere.radius << "\n";
-    out << "image,highlight_x,highlight_y,light_x,light_y,light_z,threshold,peak,selected_pixels\n";
+    if (opt.hasSphere) {
+        out << "sphere_selection_image_index," << opt.sphereSelectionImageIndex << "\n";
+        if (opt.sphereSelectionImageIndex >= 0 &&
+            opt.sphereSelectionImageIndex < static_cast<int>(opt.imagePaths.size())) {
+            out << "sphere_selection_image,\""
+                << opt.imagePaths[static_cast<size_t>(opt.sphereSelectionImageIndex)] << "\"\n";
+        }
+        out << "sphere_edge_point_count," << opt.sphereEdgePoints.size() << "\n";
+        out << "sphere_fit_rms_pixels," << opt.sphereFitRmsPixels << "\n";
+        out << "sphere_fit_max_residual_pixels," << opt.sphereFitMaxResidualPixels << "\n";
+        out << "sphere_fit_coverage_degrees," << opt.sphereFitCoverageDegrees << "\n";
+    }
+    out << "image,highlight_x,highlight_y,light_x,light_y,light_z,threshold,peak,selected_pixels,"
+           "candidate_components,saturated_pixels,saturation_fraction,component_area_fraction,compactness,"
+           "centroid_uncertainty_pixels,radial_fraction,quality\n";
     out << std::fixed << std::setprecision(8);
     for (size_t i = 0; i < lights.size(); ++i) {
         out << '"' << opt.imagePaths[i] << '"';
@@ -826,9 +841,13 @@ void writeLightsCsv(
         }
         out << ',' << lights[i][0] << ',' << lights[i][1] << ',' << lights[i][2];
         if (i < estimates.size()) {
-            out << ',' << estimates[i].threshold << ',' << estimates[i].peak << ',' << estimates[i].selectedPixels;
+            out << ',' << estimates[i].threshold << ',' << estimates[i].peak << ',' << estimates[i].selectedPixels
+                << ',' << estimates[i].candidateComponents << ',' << estimates[i].saturatedPixels
+                << ',' << estimates[i].saturationFraction << ',' << estimates[i].componentAreaFraction
+                << ',' << estimates[i].compactness << ',' << estimates[i].centroidUncertaintyPixels
+                << ',' << estimates[i].radialFraction << ',' << estimates[i].quality;
         } else {
-            out << ",,,";
+            out << ",,,,,,,,,,,";
         }
         out << '\n';
     }
@@ -1987,22 +2006,43 @@ std::vector<cv::Mat> loadLuminanceImages(const Options& opt, std::vector<cv::Mat
         saturationMasks->reserve(paths.size());
     }
     cv::Size expected;
+    const bool rectify = !opt.microscopeCalibrationFile.empty();
+    const MicroscopeCalibration microscope = rectify
+        ? loadMicroscopeCalibration(opt.microscopeCalibrationFile)
+        : MicroscopeCalibration{};
+    const MicroscopeRectificationMaps rectificationMaps = rectify
+        ? buildMicroscopeRectificationMaps(microscope)
+        : MicroscopeRectificationMaps{};
     for (size_t i = 0; i < paths.size(); ++i) {
         const auto& path = paths[i];
         cv::Mat raw = cv::imread(path, cv::IMREAD_UNCHANGED);
         if (raw.empty()) {
             die("Failed to read image: " + path);
         }
+        cv::Mat saturation = saturationMasks != nullptr ? definiteSaturationMask(raw) : cv::Mat();
+        cv::Mat headroom = headroomWeights != nullptr ? photometricHeadroomWeights(raw) : cv::Mat();
         cv::Mat gray = convertToLinearLuminance(raw, inputResponseForImage(opt, i).srgb);
+        if (rectify) {
+            validateMicroscopeCalibration(microscope, raw.size(), paths.size());
+            // Resample radiometric data after response decoding so interpolation
+            // remains linear in light rather than in a gamma-encoded signal.
+            gray = rectifyMicroscopeImage(gray, rectificationMaps, cv::INTER_LINEAR);
+            if (!saturation.empty()) {
+                saturation = rectifyMicroscopeImage(saturation, rectificationMaps, cv::INTER_NEAREST);
+            }
+            if (!headroom.empty()) {
+                headroom = rectifyMicroscopeImage(headroom, rectificationMaps, cv::INTER_LINEAR);
+            }
+        }
         if (expected.empty()) {
             expected = gray.size();
         } else if (gray.size() != expected) {
             die("All input images must have identical dimensions. Mismatch at: " + path);
         }
         if (saturationMasks != nullptr) {
-            saturationMasks->push_back(definiteSaturationMask(raw));
+            saturationMasks->push_back(std::move(saturation));
         }
-        if (headroomWeights) headroomWeights->push_back(photometricHeadroomWeights(raw));
+        if (headroomWeights) headroomWeights->push_back(std::move(headroom));
         images.push_back(gray);
         if (progress) progress(static_cast<int>(i + 1), static_cast<int>(paths.size()));
     }
@@ -2209,59 +2249,61 @@ void saveOutputs(
                 diagnostics.shadowOccluderSupport);
         }
 
-        const fs::path shadowDirectory = outDir / "shadow_refinement";
-        fs::create_directories(shadowDirectory);
-        for (const int index : diagnostics.shadowRefinementLightIndices) {
-            if (index < 0 || static_cast<size_t>(index) >= lights.size()) {
-                continue;
-            }
-            std::ostringstream number;
-            number << std::setw(3) << std::setfill('0') << (index + 1);
-            const size_t lightIndex = static_cast<size_t>(index);
-            if (lightIndex < diagnostics.shadowObservedCastMasks.size() &&
-                !diagnostics.shadowObservedCastMasks[lightIndex].empty()) {
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_observed_cast.png"),
-                    diagnostics.shadowObservedCastMasks[lightIndex]);
-            }
-            if (lightIndex < diagnostics.shadowObservationConfidence.size() &&
-                !diagnostics.shadowObservationConfidence[lightIndex].empty()) {
-                cv::Mat confidence8;
-                diagnostics.shadowObservationConfidence[lightIndex].convertTo(
-                    confidence8, CV_8U, 255.0);
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_evidence_confidence.png"),
-                    confidence8);
-            }
-            if (lightIndex < diagnostics.shadowPredictedBeforeMasks.size() &&
-                !diagnostics.shadowPredictedBeforeMasks[lightIndex].empty()) {
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_predicted_before.png"),
-                    diagnostics.shadowPredictedBeforeMasks[lightIndex]);
-            }
-            if (lightIndex < diagnostics.shadowPredictedAfterMasks.size() &&
-                !diagnostics.shadowPredictedAfterMasks[lightIndex].empty()) {
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_predicted_after.png"),
-                    diagnostics.shadowPredictedAfterMasks[lightIndex]);
-            }
-            if (lightIndex < diagnostics.shadowPredictedBeforeProbability.size() &&
-                !diagnostics.shadowPredictedBeforeProbability[lightIndex].empty()) {
-                cv::Mat probability8;
-                diagnostics.shadowPredictedBeforeProbability[lightIndex].convertTo(
-                    probability8, CV_8U, 255.0);
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_probability_before.png"),
-                    probability8);
-            }
-            if (lightIndex < diagnostics.shadowPredictedAfterProbability.size() &&
-                !diagnostics.shadowPredictedAfterProbability[lightIndex].empty()) {
-                cv::Mat probability8;
-                diagnostics.shadowPredictedAfterProbability[lightIndex].convertTo(
-                    probability8, CV_8U, 255.0);
-                writeImageChecked(
-                    shadowDirectory / ("light_" + number.str() + "_probability_after.png"),
-                    probability8);
+        if (opt.specularDiagnostics) {
+            const fs::path shadowDirectory = outDir / "shadow_refinement";
+            fs::create_directories(shadowDirectory);
+            for (const int index : diagnostics.shadowRefinementLightIndices) {
+                if (index < 0 || static_cast<size_t>(index) >= lights.size()) {
+                    continue;
+                }
+                std::ostringstream number;
+                number << std::setw(3) << std::setfill('0') << (index + 1);
+                const size_t lightIndex = static_cast<size_t>(index);
+                if (lightIndex < diagnostics.shadowObservedCastMasks.size() &&
+                    !diagnostics.shadowObservedCastMasks[lightIndex].empty()) {
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_observed_cast.png"),
+                        diagnostics.shadowObservedCastMasks[lightIndex]);
+                }
+                if (lightIndex < diagnostics.shadowObservationConfidence.size() &&
+                    !diagnostics.shadowObservationConfidence[lightIndex].empty()) {
+                    cv::Mat confidence8;
+                    diagnostics.shadowObservationConfidence[lightIndex].convertTo(
+                        confidence8, CV_8U, 255.0);
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_evidence_confidence.png"),
+                        confidence8);
+                }
+                if (lightIndex < diagnostics.shadowPredictedBeforeMasks.size() &&
+                    !diagnostics.shadowPredictedBeforeMasks[lightIndex].empty()) {
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_predicted_before.png"),
+                        diagnostics.shadowPredictedBeforeMasks[lightIndex]);
+                }
+                if (lightIndex < diagnostics.shadowPredictedAfterMasks.size() &&
+                    !diagnostics.shadowPredictedAfterMasks[lightIndex].empty()) {
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_predicted_after.png"),
+                        diagnostics.shadowPredictedAfterMasks[lightIndex]);
+                }
+                if (lightIndex < diagnostics.shadowPredictedBeforeProbability.size() &&
+                    !diagnostics.shadowPredictedBeforeProbability[lightIndex].empty()) {
+                    cv::Mat probability8;
+                    diagnostics.shadowPredictedBeforeProbability[lightIndex].convertTo(
+                        probability8, CV_8U, 255.0);
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_probability_before.png"),
+                        probability8);
+                }
+                if (lightIndex < diagnostics.shadowPredictedAfterProbability.size() &&
+                    !diagnostics.shadowPredictedAfterProbability[lightIndex].empty()) {
+                    cv::Mat probability8;
+                    diagnostics.shadowPredictedAfterProbability[lightIndex].convertTo(
+                        probability8, CV_8U, 255.0);
+                    writeImageChecked(
+                        shadowDirectory / ("light_" + number.str() + "_probability_after.png"),
+                        probability8);
+                }
             }
         }
     }
@@ -2273,4 +2315,36 @@ void saveOutputs(
         writePfm(outDir / "height.pfm", height, geometryMask);
         saveGeometryMeshes(opt, height, geometryMask, normalMap, albedo8, progress);
     }
+}
+
+cv::Mat loadDisplayImage(const Options& opt, size_t imageIndex) {
+    if (imageIndex >= opt.imagePaths.size()) {
+        die("Display image index is outside the selected image stack.");
+    }
+    cv::Mat raw = cv::imread(opt.imagePaths[imageIndex], cv::IMREAD_UNCHANGED);
+    if (raw.empty()) {
+        die("Failed to read image: " + opt.imagePaths[imageIndex]);
+    }
+    if (!opt.microscopeCalibrationFile.empty()) {
+        const MicroscopeCalibration calibration = loadMicroscopeCalibration(opt.microscopeCalibrationFile);
+        validateMicroscopeCalibration(calibration, raw.size(), opt.imagePaths.size());
+        raw = rectifyMicroscopeImage(raw, calibration, cv::INTER_LINEAR);
+    }
+    cv::Mat normalized;
+    if (raw.depth() == CV_8U) {
+        normalized = raw;
+    } else {
+        cv::normalize(raw, normalized, 0, 255, cv::NORM_MINMAX, CV_MAKETYPE(CV_8U, raw.channels()));
+    }
+    if (normalized.channels() == 1) {
+        cv::Mat bgr;
+        cv::cvtColor(normalized, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    }
+    if (normalized.channels() == 4) {
+        cv::Mat bgr;
+        cv::cvtColor(normalized, bgr, cv::COLOR_BGRA2BGR);
+        return bgr;
+    }
+    return normalized;
 }

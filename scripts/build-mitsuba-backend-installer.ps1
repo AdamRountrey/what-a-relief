@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.7",
+    [string]$Version = "0.2.16",
     [string]$CacheDirectory = "",
     [ValidateRange(1, 5)]
     [int]$BackendProbeAttempts = 2
@@ -32,6 +32,9 @@ $llvmInstallerUrl = "https://github.com/llvm/llvm-project/releases/download/llvm
 $llvmDllSha256 = "df43ac672e50ffa24a844fb0b24cc63326ac942d6555be35b72366ab6857d6b8"
 $llvmLicenseSha256 = "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
 $llvmLicenseUrl = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$llvmVersion/llvm/LICENSE.TXT"
+$drjitCorePatchId = "drjit-core-1.3.1-large-cuda-reductions-v1"
+$drjitCoreSourceCommit = "213983e47c99db0c6ab5e3dfce952e68bb9a8bd3"
+$drjitCorePatch = Join-Path $repo "tools\mitsuba_backend\drjit-core-1.3.1-large-reductions.patch"
 
 $wheels = @(
     @{
@@ -187,6 +190,28 @@ foreach ($wheel in $wheels) {
     Expand-ZipMerged -ArchivePath $wheelPath -Destination $sitePackages
 }
 
+$drjitCoreLibrary = Join-Path $sitePackages "drjit\drjit-core.dll"
+$drjitCoreBuild = Join-Path $work "drjit-core-patched-build"
+& (Join-Path $repo "scripts\build-patched-drjit-core.ps1") `
+    -Destination $drjitCoreLibrary `
+    -WorkDirectory $drjitCoreBuild
+if ($LASTEXITCODE -ne 0) {
+    throw "The patched Dr.Jit Core build failed with exit code $LASTEXITCODE"
+}
+$drjitCorePatchSha256 = (Get-FileHash -LiteralPath $drjitCorePatch -Algorithm SHA256).Hash.ToLowerInvariant()
+$drjitCoreLibrarySha256 = (Get-FileHash -LiteralPath $drjitCoreLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+$drjitCorePatchRecord = [ordered]@{
+    id = $drjitCorePatchId
+    drjit_version = "1.3.1"
+    source_commit = $drjitCoreSourceCommit
+    patch_sha256 = $drjitCorePatchSha256
+    library_sha256 = $drjitCoreLibrarySha256
+}
+$drjitCorePatchRecord | ConvertTo-Json -Depth 3 |
+    Set-Content -LiteralPath (Join-Path $runtime "drjit-core-patch.json") -Encoding UTF8
+Copy-Item -LiteralPath $drjitCorePatch -Destination `
+    (Join-Path $runtime "drjit-core-1.3.1-large-reductions.patch") -Force
+
 Set-Content -LiteralPath (Join-Path $runtime "python313._pth") -Encoding ASCII -Value @(
     "python313.zip",
     ".",
@@ -249,6 +274,9 @@ $manifest = [ordered]@{
     build_inputs = [ordered]@{
         python_embed_sha256 = $pythonArchiveSha256
         llvm_c_sha256 = $llvmDllSha256
+        drjit_core_source_commit = $drjitCoreSourceCommit
+        drjit_core_patch_sha256 = $drjitCorePatchSha256
+        drjit_core_patched_library_sha256 = $drjitCoreLibrarySha256
         wheel_sha256 = [ordered]@{
             drjit = $wheels[0].Sha256
             mitsuba = $wheels[1].Sha256

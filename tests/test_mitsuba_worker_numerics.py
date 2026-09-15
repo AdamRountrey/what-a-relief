@@ -19,6 +19,177 @@ spec.loader.exec_module(w)
 
 
 class NumericalTests(unittest.TestCase):
+    def test_ultra_is_1024_capped_absolute_height_mode(self):
+        settings = w.QUALITY['ultra']
+        self.assertEqual(settings['max_side'], 1024)
+        self.assertEqual(settings['control_spacing'], 1)
+        self.assertEqual(settings['geometry_mode'], 'absolute_height')
+        self.assertEqual(w.target_size(73, 121, settings['max_side']), (73, 121))
+        self.assertEqual(w.target_size(1200, 1600, settings['max_side']), (768, 1024))
+        self.assertEqual(w.target_size(73, 121, 64), (39, 64))
+        mapping = w.control_mapping(73, 121, settings['control_spacing'])
+        self.assertEqual(mapping[:2], (73, 121))
+        self.assertIsNone(mapping[2])
+        control = np.arange(73 * 121, dtype=np.float32).reshape(73, 121)
+        self.assertTrue(np.shares_memory(w.expand_control_numpy(control, mapping), control))
+        self.assertEqual(w.effective_ultra_spp(1000, 32), 32)
+        self.assertEqual(w.effective_ultra_spp(4_000_000, 32), 2)
+        self.assertEqual(w.effective_ultra_spp(20_000_000, 32), 1)
+        self.assertAlmostEqual(w.effective_ultra_learning_rate((0.1, 0.2), 0.004), 0.002)
+        self.assertAlmostEqual(w.effective_ultra_learning_rate((0.5, 0.5), 0.004), 0.004)
+
+    def test_drjit_sum_chunks_before_uint32_power_of_two_overflow(self):
+        class FakeArray:
+            def __init__(self, size):
+                self.size = size
+
+            def __len__(self):
+                return self.size
+
+        class FakeDr:
+            def __init__(self):
+                self.blocks = []
+
+            @staticmethod
+            def ravel(value):
+                return value
+
+            def block_sum(self, value, block_size):
+                self.blocks.append((len(value), block_size))
+                return FakeArray((len(value) + block_size - 1) // block_size)
+
+            @staticmethod
+            def sum(value):
+                return len(value)
+
+        fake = FakeDr()
+        source_size = (1 << 31) + 17
+        partial_count = w.safe_dr_sum(fake, FakeArray(source_size))
+        self.assertEqual(fake.blocks, [(source_size, w.DRJIT_REDUCTION_CHUNK)])
+        self.assertEqual(partial_count,
+                         (source_size + w.DRJIT_REDUCTION_CHUNK - 1)
+                         // w.DRJIT_REDUCTION_CHUNK)
+
+    def test_ultra_native_patch_marker_verifies_the_actual_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / 'Lib/site-packages/drjit/drjit-core.dll'
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b'patched-drjit-core-test-payload')
+            digest = hashlib.sha256(library.read_bytes()).hexdigest()
+            (root / 'drjit-core-patch.json').write_text(json.dumps({
+                'id': w.DRJIT_CORE_PATCH_ID,
+                'source_commit': 'test-commit',
+                'library_sha256': digest,
+            }), encoding='utf-8')
+
+            status = w.drjit_core_patch_status(root)
+            self.assertTrue(status['valid'])
+            self.assertEqual(status['library_sha256'], digest)
+
+            library.write_bytes(b'tampered')
+            self.assertFalse(w.drjit_core_patch_status(root)['valid'])
+
+    def test_ultra_regularization_gradient_matches_finite_differences(self):
+        rng = np.random.default_rng(17)
+        shape = (7, 9)
+        mask = np.ones(shape, bool)
+        mask[2, 3] = False
+        fit_mask = w.triangle_vertex_support(mask)
+        baseline = 0.03 * rng.normal(size=shape).astype(np.float32)
+        height = baseline + 0.02 * rng.normal(size=shape).astype(np.float32)
+        prior = w.surface_normals(baseline, mask)
+        prior_weight = np.where(mask, rng.uniform(0.2, 1.0, size=shape), 0).astype(np.float32)
+        prepared = {
+            'fit_mask': fit_mask,
+            'mask_small': mask,
+            'baseline_positions': np.dstack((np.zeros(shape), np.zeros(shape), baseline)),
+            'world_spacing': (0.7, 1.3),
+            'normal_prior': prior,
+            'normal_prior_weight': prior_weight,
+        }
+        settings = {'datum_strength': 0.8, 'curvature_strength': 0.003}
+        geometry, prior_loss, gradient = w.absolute_height_regularization_gradient_numpy(
+            prepared, height, settings)
+        self.assertAlmostEqual(
+            geometry, w.absolute_height_regularization_numpy(prepared, height, settings), places=7)
+        self.assertAlmostEqual(prior_loss, w.normal_prior_loss(prepared, height), places=7)
+
+        def objective(values):
+            return (w.absolute_height_regularization_numpy(prepared, values, settings)
+                    + w.NORMAL_PRIOR_STRENGTH * w.normal_prior_loss(prepared, values))
+
+        epsilon = 2.0e-4
+        for y, x in ((0, 0), (1, 4), (3, 5), (5, 7), (6, 8)):
+            if not fit_mask[y, x]:
+                continue
+            plus = height.copy()
+            minus = height.copy()
+            plus[y, x] += epsilon
+            minus[y, x] -= epsilon
+            finite_difference = (objective(plus) - objective(minus)) / (2 * epsilon)
+            self.assertAlmostEqual(float(gradient[y, x]), finite_difference, delta=2.0e-4)
+
+    def test_absolute_solution_is_not_added_to_classical_height(self):
+        baseline = np.full((6, 8), 11.0, np.float32)
+        mask = np.zeros_like(baseline, bool)
+        mask[1:5, 1:7] = True
+        prepared = {
+            'height': baseline,
+            'mask': mask,
+            'bounds': (1, 1, 7, 5),
+            'scene_scale': 0.5,
+            'physical_scale': 0.25,
+            'height_datum': 3.0,
+        }
+        yy, xx = np.mgrid[:4, :6].astype(np.float32)
+        intended = 4.0 + 0.2 * xx - 0.1 * yy
+        optimized_world = (intended - prepared['height_datum']) * 0.125
+        candidate, difference = w.full_height_solution(prepared, optimized_world, True)
+        np.testing.assert_allclose(candidate[1:5, 1:7], intended, atol=1e-6)
+        np.testing.assert_allclose(difference[mask], candidate[mask] - baseline[mask], atol=1e-6)
+        self.assertFalse(np.any(candidate[~mask]))
+        # The same values treated as a correction would produce a different result.
+        additive, _ = w.full_height_solution(prepared, optimized_world, False)
+        self.assertGreater(float(np.max(np.abs(additive[mask] - candidate[mask]))), 1.0)
+        prepared['fit_mask'] = np.ones((4, 6), bool)
+        prepared['fit_mask'][2, 3] = False
+        candidate, difference = w.full_height_solution(prepared, optimized_world, True)
+        self.assertEqual(candidate[3, 4], baseline[3, 4])
+        self.assertEqual(difference[3, 4], 0)
+
+    def test_absolute_solution_resamples_fitting_mask_to_source_crop(self):
+        source_height, source_width = 15, 20
+        yy, xx = np.mgrid[:source_height, :source_width].astype(np.float32)
+        baseline = 2.0 + 0.03 * xx - 0.02 * yy
+        mask = np.ones_like(baseline, dtype=bool)
+        mask[[0, -1], :] = False
+        mask[:, [0, -1]] = False
+        fit_mask = np.ones((6, 8), dtype=bool)
+        fit_mask[2, 3] = False
+        optimized = np.arange(48, dtype=np.float32).reshape(6, 8) / 10.0
+        prepared = {
+            'height': baseline,
+            'mask': mask,
+            'bounds': (0, 0, source_width, source_height),
+            'scene_scale': 1.0,
+            'physical_scale': 1.0,
+            'height_datum': 0.0,
+            'fit_mask': fit_mask,
+        }
+
+        candidate, difference = w.full_height_solution(prepared, optimized, True)
+        expanded_height = w.resize_bilinear(optimized, source_height, source_width)
+        expanded_support = (
+            w.resize_nearest(fit_mask.astype(np.float32), source_height, source_width) >= 0.5)
+        expanded_support &= mask
+        expected = np.where(mask, baseline, 0.0).astype(np.float32)
+        expected[expanded_support] = expanded_height[expanded_support]
+        np.testing.assert_allclose(candidate, expected, atol=1e-6)
+        np.testing.assert_allclose(difference[mask], candidate[mask] - baseline[mask], atol=1e-6)
+        self.assertFalse(np.any(candidate[~mask]))
+        self.assertFalse(np.any(difference[~mask]))
+
     def test_iteration_preview_uses_world_spacing_and_fixed_normal_encoding(self):
         yy, xx = np.mgrid[:12, :16].astype(np.float32)
         mask = np.ones_like(xx, dtype=bool)
@@ -34,6 +205,18 @@ class NumericalTests(unittest.TestCase):
         np.testing.assert_allclose(image[3, 6], 0.12)
         np.testing.assert_array_equal(height, original)
         np.testing.assert_allclose(w.iteration_preview(height + 100, mask, (0.7, 0.3)), image, atol=1e-5)
+
+    def test_iteration_preview_is_resized_to_gui_decode_limits(self):
+        yy, xx = np.mgrid[:60, :200].astype(np.float32)
+        frame = np.stack((xx / 199, yy / 59, np.full_like(xx, 0.25)), axis=-1)
+        resized = w.fit_preview_frame(frame, maximum_height=50, maximum_width=80)
+        self.assertEqual(resized.shape, (24, 80, 3))
+        self.assertEqual(resized.dtype, np.float32)
+        self.assertTrue(np.all(np.isfinite(resized)))
+        self.assertGreaterEqual(float(np.min(resized)), 0.0)
+        self.assertLessEqual(float(np.max(resized)), 1.0)
+        small = frame[:20, :30]
+        np.testing.assert_array_equal(w.fit_preview_frame(small, 50, 80), small)
 
     @staticmethod
     def light_support_fixture(count=8):
@@ -239,6 +422,35 @@ class NumericalTests(unittest.TestCase):
                 actual = ((height.ravel()[b] - height.ravel()[a]) * scale).reshape(height.shape)
                 np.testing.assert_allclose(actual, derivative, atol=1e-6)
                 self.assertTrue(np.all(actual[~mask] == 0))
+
+    def test_curvature_stencils_preserve_planes_and_do_not_cross_holes(self):
+        yy, xx = np.mgrid[:9, :11].astype(np.float32)
+        height = 2.0 + 0.3 * xx - 0.2 * yy
+        mask = np.ones(height.shape, bool)
+        mask[4, 5] = False
+        for left, center, right, scale, valid in w.curvature_stencils(mask, 0.7, 0.3):
+            second = (height.ravel()[left] - 2 * height.ravel()[center] +
+                      height.ravel()[right]) * scale
+            np.testing.assert_allclose(second[valid > 0], 0, atol=1e-5)
+            self.assertTrue(np.all(second[valid == 0] == 0))
+        prepared = {'mask_small': mask, 'world_spacing': (0.7, 0.3),
+                    'baseline_positions': np.dstack((xx, yy, height))}
+        settings = {'datum_strength': 1.0, 'curvature_strength': 0.002}
+        self.assertLess(w.absolute_height_regularization_numpy(prepared, height, settings), 1e-10)
+        self.assertAlmostEqual(
+            w.absolute_height_regularization_numpy(prepared, height + 3, settings), 9.0, places=5)
+
+    def test_ultra_pixel_support_includes_mesh_boundary_but_not_isolated_pixels(self):
+        mask = np.zeros((8, 10), bool)
+        mask[1:7, 2:8] = True
+        mask[3:5, 4:6] = False
+        mask[0, 0] = True
+        support = w.triangle_vertex_support(mask)
+        self.assertFalse(support[0, 0])
+        self.assertTrue(np.all(support[1, 2:8]))
+        self.assertTrue(np.all(support[6, 2:8]))
+        self.assertFalse(np.any(support[3:5, 4:6]))
+        self.assertTrue(np.all(~support | mask))
 
     def test_normal_prior_reduction_and_invalid_support(self):
         mask = np.ones((8, 10), bool)

@@ -153,6 +153,8 @@ const char* mitsubaQualityName(MitsubaQualityMode mode) {
         return "preview";
     case MitsubaQualityMode::Research:
         return "research";
+    case MitsubaQualityMode::Ultra:
+        return "ultra";
     case MitsubaQualityMode::Standard:
     default:
         return "standard";
@@ -353,6 +355,7 @@ void removeKnownRunFiles(const Options& opt) {
     static const std::vector<std::string> names = {
         "lights.csv",
         "light_vectors.csv",
+        "microscope_calibration.json",
         "normal_rgb.png",
         "normal_x.png",
         "normal_y.png",
@@ -410,7 +413,8 @@ void removeKnownRunFiles(const Options& opt) {
     for (const std::string& name : names) {
         const fs::path path = outputDir / name;
         // A repeat run can read calibration or masks from its previous output.
-        if (sameExistingFile(path, opt.lightsFile) || sameExistingFile(path, opt.maskPath) ||
+        if (sameExistingFile(path, opt.lightsFile) || sameExistingFile(path, opt.microscopeCalibrationFile) ||
+            sameExistingFile(path, opt.maskPath) ||
             sameExistingFile(path, opt.heightMaskPath)) {
             continue;
         }
@@ -441,6 +445,9 @@ std::vector<fs::path> expectedOutputFiles(const Options& opt) {
         outputDir / "liquid_metal.png"};
     if (opt.hasHeightMask && !opt.heightMask.empty()) {
         paths.push_back(outputDir / "project_height_mask.png");
+    }
+    if (!opt.microscopeCalibrationFile.empty()) {
+        paths.push_back(outputDir / "microscope_calibration.json");
     }
     if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust && opt.specularDiagnostics) {
         paths.push_back(outputDir / "robust_weight.png");
@@ -535,7 +542,7 @@ std::vector<fs::path> collectVerifiedOutputs(const Options& opt) {
             }
         }
     }
-    if (opt.shadowHeightRefinement) {
+    if (opt.shadowHeightRefinement && opt.specularDiagnostics) {
         const fs::path shadowDirectory = fs::path(opt.outputDir) / "shadow_refinement";
         std::error_code error;
         if (fs::is_directory(shadowDirectory, error) && !error) {
@@ -613,6 +620,17 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << ",\n";
     out << "    \"lights_file_order_override\": "
         << (opt.lightsFileByOrder ? "true" : "false") << ",\n";
+    out << "    \"microscope_calibration_file\": ";
+    writePathOrNull(out, opt.microscopeCalibrationFile);
+    out << ",\n";
+    out << "    \"estimate_light_gains\": " << (opt.estimateLightGains ? "true" : "false") << ",\n";
+    out << "    \"light_gain_source\": \"" << jsonEscape(opt.lightGainSource) << "\",\n";
+    out << "    \"light_gains\": [";
+    for (size_t i = 0; i < opt.lightGains.size(); ++i) {
+        if (i) out << ", ";
+        out << opt.lightGains[i];
+    }
+    out << "],\n";
     out << "    \"solve_mask_file\": ";
     writePathOrNull(out, opt.maskPath);
     out << ",\n";
@@ -633,7 +651,24 @@ void writeParameters(std::ostream& out, const Options& opt) {
     out << "    \"sphere\": ";
     if (opt.hasSphere) {
         out << "{\"cx\": " << opt.sphere.cx << ", \"cy\": " << opt.sphere.cy
-            << ", \"radius\": " << opt.sphere.radius << "}";
+            << ", \"radius\": " << opt.sphere.radius
+            << ", \"selection_image_index\": " << opt.sphereSelectionImageIndex
+            << ", \"selection_image\": ";
+        if (opt.sphereSelectionImageIndex >= 0 &&
+            opt.sphereSelectionImageIndex < static_cast<int>(opt.imagePaths.size())) {
+            out << "\"" << jsonEscape(opt.imagePaths[static_cast<size_t>(opt.sphereSelectionImageIndex)]) << "\"";
+        } else {
+            out << "null";
+        }
+        out << ", \"fit_rms_pixels\": " << opt.sphereFitRmsPixels
+            << ", \"fit_max_residual_pixels\": " << opt.sphereFitMaxResidualPixels
+            << ", \"fit_coverage_degrees\": " << opt.sphereFitCoverageDegrees
+            << ", \"edge_points\": [";
+        for (size_t i = 0; i < opt.sphereEdgePoints.size(); ++i) {
+            if (i) out << ", ";
+            out << "[" << opt.sphereEdgePoints[i].x << ", " << opt.sphereEdgePoints[i].y << "]";
+        }
+        out << "]}";
     } else {
         out << "null";
     }
@@ -743,6 +778,16 @@ RunManifestContext beginRunManifest(const Options& opt) {
     if (opt.hasHeightMask && !opt.heightMask.empty()) {
         writeImageChecked(fs::path(opt.outputDir) / "project_height_mask.png", opt.heightMask);
     }
+    if (!opt.microscopeCalibrationFile.empty()) {
+        const fs::path destination = fs::path(opt.outputDir) / "microscope_calibration.json";
+        if (!sameExistingFile(destination, opt.microscopeCalibrationFile)) {
+            std::ifstream input(opt.microscopeCalibrationFile, std::ios::binary);
+            if (!input) throw std::runtime_error("Could not preserve microscope calibration in the output folder.");
+            CheckedOutputFile copied(destination);
+            copied.stream() << input.rdbuf();
+            copied.commit();
+        }
+    }
     const fs::path defaultRti = fs::path(opt.outputDir) / "rti";
     if (!opt.exportRti && fs::is_regular_file(defaultRti / "rti_manifest.json")) {
         fs::remove_all(defaultRti);
@@ -776,6 +821,25 @@ void completeRunManifest(
         out << diagnostics.lightingConditionNumber;
     }
     out << ", \"solved_fraction\": " << diagnostics.solvedFraction;
+    if (diagnostics.lightGainEstimationAttempted || diagnostics.lightGainCorrectionApplied) {
+        out << ", \"light_balance\": {\"source\": \"" << jsonEscape(diagnostics.lightGainSource)
+            << "\", \"applied\": " << (diagnostics.lightGainCorrectionApplied ? "true" : "false")
+            << ", \"decision\": \"" << jsonEscape(diagnostics.lightGainDecision) << "\""
+            << ", \"gains\": [";
+        for (size_t i = 0; i < diagnostics.lightGains.size(); ++i) {
+            if (i) out << ", ";
+            out << diagnostics.lightGains[i];
+        }
+        out << "], \"validation_error_before\": ";
+        writeNullableNumber(out, diagnostics.lightGainValidationErrorBefore);
+        out << ", \"validation_error_after\": ";
+        writeNullableNumber(out, diagnostics.lightGainValidationErrorAfter);
+        out << ", \"spatial_log_rms\": ";
+        writeNullableNumber(out, diagnostics.lightGainStability);
+        out << ", \"normal_dispersion\": ";
+        writeNullableNumber(out, diagnostics.lightGainNormalDiversity);
+        out << "}";
+    }
     if (!opt.uncalibratedLighting && opt.solverMode == NormalSolverMode::Robust) {
         out << ", \"robust_estimator\": \"adaptive_pseudo_huber_cauchy_v2\""
             << ", \"robust_mean_iterations\": " << diagnostics.robustMeanIterations

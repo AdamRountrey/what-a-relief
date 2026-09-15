@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(WhatARelief
-    VERSION 0.2.7
+    VERSION 0.2.16
     DESCRIPTION "Relief visualization and photometric stereo from directional image sets"
     LANGUAGES CXX)
 
@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(OpenCV REQUIRED COMPONENTS core dnn imgcodecs imgproc highgui)
+find_package(OpenCV REQUIRED COMPONENTS core dnn imgcodecs imgproc highgui calib3d)
 find_package(ZLIB REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
@@ -23,6 +23,7 @@ if(DEFINED OpenCV_DIR AND OpenCV_DIR MATCHES "[Aa]naconda|[.]conda")
 endif()
 
 add_library(what-a-relief-core STATIC
+    src/calibration.cpp
     src/checked_io.cpp
     src/image_io.cpp
     src/input_response.cpp

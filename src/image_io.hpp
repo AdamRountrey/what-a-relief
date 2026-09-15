@@ -21,6 +21,7 @@ std::vector<cv::Mat> loadLuminanceImages(
 cv::Mat photometricHeadroomWeights(const cv::Mat& raw);
 double readPixelScaleMmFromImage(const std::string& path);
 cv::Mat loadDisplayImage(const std::string& path);
+cv::Mat loadDisplayImage(const Options& opt, size_t imageIndex = 0);
 cv::Mat loadMask(const std::string& path, const cv::Size& size);
 void applyCropToMask(cv::Mat& mask, const cv::Rect& crop);
 void removeSphereFromMask(cv::Mat& mask, const Sphere& sphere);

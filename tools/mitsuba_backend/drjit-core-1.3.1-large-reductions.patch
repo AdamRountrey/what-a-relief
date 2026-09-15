@@ -1,0 +1,41 @@
+diff --git a/src/common.h b/src/common.h
+index ed6ac62..9a961bc 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -96,7 +96,7 @@ private:
+ };
+ 
+ inline uint32_t ceil_div(uint32_t a, uint32_t b) {
+-    return (a + b - 1) / b;
++    return a / b + (a % b != 0);
+ }
+ 
+ inline Ref steal(uint32_t index) {
+diff --git a/src/cuda_ts.cpp b/src/cuda_ts.cpp
+index ba6ae4f..d45375e 100644
+--- a/src/cuda_ts.cpp
++++ b/src/cuda_ts.cpp
+@@ -229,7 +229,11 @@ void CUDAThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
+ 
+     // We have precompiled kernels for reductions from 2..1024 values.
+     // Round up to the next power of two and select one of them.
+-    uint32_t chunk_size = round_pow2(block_size);
++    // Large reductions always use the fixed 1024-wide kernel below. Avoid
++    // rounding their full uint32 block size: round_pow2() wraps to zero for
++    // values above 2^31, which would route them into the small-block path and
++    // divide by zero when computing chunks_per_thread_block.
++    uint32_t chunk_size = block_size < 1024 ? round_pow2(block_size) : 1024;
+ 
+     // Launch configuration
+     uint32_t thread_count, grid_dim_x, grid_dim_y, chunk_count;
+@@ -440,7 +444,9 @@ void CUDAThreadState::block_prefix_reduce(VarType vt, ReduceOp op,
+ 
+     // We have precompiled kernels for reductions from 2..1024 values.
+     // Round up to the next power of two and select one of them.
+-    uint32_t chunk_size = round_pow2(block_size);
++    // As in block_reduce(), large blocks use a fixed 1024-wide kernel and must
++    // not pass through the overflowing uint32 round_pow2() helper.
++    uint32_t chunk_size = block_size < 1024 ? round_pow2(block_size) : 1024;
+ 
+     // Launch configuration
+     uint32_t thread_count, grid_dim_x, grid_dim_y, chunk_count;

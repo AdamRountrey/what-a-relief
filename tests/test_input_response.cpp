@@ -214,6 +214,19 @@ int main(int argc, char** argv) {
         check(arguments({"test", "--gui", "--linear"}).inputResponseMode == InputResponseMode::Linear, "linear override not parsed");
         check(arguments({"test", "--gui", "--srgb", "--input-response", "auto"}).inputResponseMode == InputResponseMode::Auto,
             "explicit Auto must override an earlier flag");
+        check(arguments({"test", "--gui", "--mitsuba-quality", "ultra"}).mitsubaQualityMode == MitsubaQualityMode::Ultra,
+            "Ultra Mitsuba quality was not parsed");
+        const Options microscopeArgs = arguments({
+            "test", "--gui", "--microscope-calibration", "scope.json", "--estimate-light-gains"});
+        check(microscopeArgs.microscopeCalibrationFile == "scope.json" && microscopeArgs.estimateLightGains,
+            "microscope calibration and per-stack gain options were not parsed");
+        const Options targetArgs = arguments({
+            "test", "--make-calibration-target", "target.svg", "--calibration-grid", "14", "10", "0.5",
+            "--calibration-page", "216", "279"});
+        check(targetArgs.calibrationTargetPath == "target.svg" && targetArgs.calibrationGridColumns == 14 &&
+            targetArgs.calibrationGridRows == 10 && targetArgs.calibrationSquareMm == 0.5 &&
+            targetArgs.calibrationPageWidthMm == 216.0 && targetArgs.calibrationPageHeightMm == 279.0,
+            "printable checkerboard dimensions were not parsed");
         bool invalidOption = false;
         try { (void)arguments({"test", "--gui", "--input-response", "guess"}); }
         catch (const std::exception&) { invalidOption = true; }

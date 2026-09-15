@@ -72,7 +72,11 @@ CPU count, with a minimum of one); the verified run used eight.
 ## Geometry and appearance
 
 The geometry is a fixed-XY height field initialized from the classical solve.
-Only a coarse bilinear Z correction is optimized. The optimization mesh
+Preview, Standard, and High detail optimize a coarse bilinear Z correction.
+Ultra optimizes vertex Z itself with one control per fitting-grid pixel on a grid
+capped at 1024 pixels on its longer side; the classical surface is its initializer
+and fallback, not an additive output layer. Larger accepted solutions are
+interpolated back to the source grid. The optimization mesh
 contains triangles only where all vertices have geometric support; excluded
 background and holes are not completed with a flat surface. Area reduction
 uses masked geometry and conservative coverage, which can remove thin regions
@@ -82,8 +86,12 @@ original image grid: height pixels per original-image pixel, not per reduced
 render sample.
 
 Production inverse scenes retain both primary and indirect projective
-silhouette sampling. Fixed XY
-support and an eroded fitting mask still limit outline evidence. Enabled
+silhouette sampling. Fixed XY support still limits outline evidence. The three
+refinement presets use a one-pixel-eroded fitting mask; Ultra uses every fitting-grid
+mask vertex that participates in at least one emitted triangle, including the
+boundary. Pixels outside the geometry mask, triangle-free isolated samples,
+nonfinite values, and clipped/saturated equality observations remain excluded;
+finite dark pixels remain included. Enabled
 primary derivatives do not make this a free-outline reconstruction method or
 prove accuracy for arbitrary camera-occlusion changes. Indirect silhouette
 sampling supplies cast-shadow terms, not indirect illumination.
@@ -105,18 +113,34 @@ preview are appearance surrogates, not calibrated BRDF measurements.
 Preview/standard/high-detail budgets are 12/24/50 Adam steps, with material
 refits every 4/4/5 steps and at the final step. Control spacing is two reduced
 pixels. Optimization sampling is 16/16/32 spp; validation sampling and maximum
-render sides remain 64/128/256. Checkpoint selection uses seed 20000; final
-checks use 10000 and 71000. This application-specific alternating schedule is
-not a published complete reconstruction method or a convergence guarantee.
+render sides are 64/128/256. Ultra uses 75 steps, refits every five steps,
+up to 32 optimization spp, 256 validation spp, control spacing one, and a
+1024-pixel maximum render side. Its stochastic spp falls as low as 1 to keep each pass at or
+below about eight million pixel samples. Its Adam rate is capped at 2% of the
+smaller normalized fitting-grid pixel pitch to avoid resolution-dependent first-step
+curvature. Full-image differentiable loss sums use hierarchical power-of-two
+blocks. Reverse-mode rendering also performs native reductions internally, so
+the packaged Dr.Jit Core 1.3.1 is rebuilt from its pinned source commit with
+overflow-safe large CUDA block and prefix reductions. Ultra verifies the patch
+record against the actual DLL before starting; every loss term and enabled
+visibility-derivative stream remains included.
+Ultra reuses the seed-10000 baseline
+as checkpoint zero; later checkpoints use seed 20000, and final checks use 10000
+and 71000. This application-specific alternating schedule is not a published
+complete reconstruction method or a convergence guarantee.
 
-The GUI reports each preset's longest-side grid limit: 64, 128, or 256 pixels.
+The GUI reports longest-side grid limits of 64, 128, or 256 pixels. Ultra is
+the 1024-pixel absolute-height mode and remains supported through the CLI for
+controlled experiments and existing-project compatibility, but is not offered
+in the GUI quality selector.
 Standard remains 128. Doubling each grid dimension gives about four times as
 many render pixels and height controls; the high-detail preset also doubles
 optimization spp and increases iterations from 24 to 50. Its nominal per-step
 pixel/sample budget is therefore eight times standard, before iteration and
 checkpoint costs. This is workload arithmetic, not a measured timing or accuracy
-gain. All presets preserve the full-resolution baseline height and add an
-upsampled correction; printable mesh sampling is controlled separately by
+gain. The three refinement presets preserve the full-resolution baseline height
+and add an upsampled correction. Ultra instead exports its absolute capped-grid
+solution, interpolated to the source grid when needed, when accepted. Printable mesh sampling is controlled separately by
 `--mesh-step`. Finer grids may retain more fully unclipped cells but still must
 pass the same eligibility and validation checks.
 
@@ -171,9 +195,11 @@ of printer-specific manufacturability.
 ## Rejected candidate outputs and review
 
 After the unchanged acceptance gate, a finite rejected candidate is retained
-under `inverse/unvalidated_candidate/`. It is the selected checkpoint's
-full-resolution baseline height plus the upsampled correction, not necessarily
-the final optimization iteration. The guarded `inverse/inverse_height.pfm`,
+under `inverse/unvalidated_candidate/`. In the three refinement modes it is the
+selected checkpoint's full-resolution baseline height plus the upsampled
+correction; in Ultra it is the selected absolute capped-grid solution, interpolated
+to the source grid when needed. It is
+not necessarily the final optimization iteration. The guarded `inverse/inverse_height.pfm`,
 inverse geometry previews/mesh, and material maps still retain the baseline;
 `inverse/height_correction.pfm` and its PNG represent a zero correction.
 Accepted runs deliver the refinement in `inverse/` without an extra candidate
@@ -187,7 +213,7 @@ Files in `inverse/unvalidated_candidate/` are:
 | `candidate_normal_rgb.png`, `candidate_normal_x.png`, `candidate_normal_y.png`, `candidate_normal_z.png` | Encoded normals derived from candidate height, not the original photometric normal map or ground truth |
 | `candidate_hillshade_ul.png` | Upper-left hillshade from those height-derived normals |
 | `candidate_surface.ply` | Open inspection mesh with an unvalidated-candidate warning in its PLY header |
-| `height_correction.pfm`, `height_correction.png` | Proposed candidate correction and signed visualization, separate from the zero guarded correction in the parent directory |
+| `height_correction.pfm`, `height_correction.png` | Signed candidate-minus-classical difference and visualization, separate from the zero guarded difference in the parent directory |
 | `candidate.json` | Rejection decision, validation metrics, selected-checkpoint/runtime provenance, units, and export status; `accepted:false`, `automatically_accepted:false`, and `selected_for_default_outputs:false` |
 | `review_baseline_height.png`, `review_candidate_height.png` | Baseline/candidate height previews with one shared display range |
 | `review.html` | Offline comparison report with relative links to the candidate files and parent `result.json` |
@@ -269,13 +295,16 @@ measure absolute specimen elevation or recover missing occluders.
 
 | CLI preset | Maximum render side | Adam iterations | Optimization spp | Validation spp |
 | --- | ---: | ---: | ---: | ---: |
-| `preview` | 64 | 6 | 8 | 64 |
-| `standard` (default) | 128 | 18 | 16 | 128 |
+| `preview` | 64 | 12 | 16 | 64 |
+| `standard` (default) | 128 | 24 | 16 | 128 |
 | `research` | 256 | 50 | 32 | 256 |
+| `ultra` | 1024 | 75 | 1-32 adaptive | 256 |
 
 Samples per pixel (spp) and iteration counts are engineering budgets, not
-convergence or accuracy guarantees. `research` remains the CLI identifier;
-the GUI calls it High sampling (slowest; experimental). Baseline material
+convergence or accuracy guarantees. The preview budget is 12 iterations and
+16 optimization spp; `research` remains the CLI identifier and the GUI calls
+it High detail. Ultra is a separate capped-grid absolute-height parameterization, not only
+a larger budget. Baseline material
 basis renders and before/after checks use the validation sample count.
 Optimization renders only training lights. Source-size, resolution,
 sample-count, seed, and iteration sensitivity still need empirical assessment.
@@ -291,19 +320,23 @@ recovery of black glossy specimens.
 ## Working-set limits
 
 `prepare_job` decodes each observation and validity image, crops and
-area-reduces it, and retains only the coarse observation/validity stacks.
-The full-resolution Python observation stack is no longer part of prepared
-state. Full-resolution height, albedo, mask, and per-image decode work buffers
-remain; the parent C++ application still holds its input stack.
+area-reduces it for all four presets; Ultra uses a larger 1024-pixel maximum side.
+Preview, Standard, and High detail no
+longer retain an additional full-resolution Python observation stack. Full-resolution height, albedo, mask, and
+per-image decode work buffers remain; the parent C++ application still holds
+its input stack.
 
 `make_scenes` creates three distinct scenes, one per material basis, and reuses
 them serially by updating emitter parameters for each light. It does not retain
 three distinct scene graphs per light. `optimize_ad` backpropagates each
 training light's contribution to the summed objective, accumulates those
 gradients plus regularization, and makes one Adam update per iteration. It
-does not update geometry between individual lights. This limits simultaneous
-AD graphs, but coarse multi-light observations/basis arrays and renderer/JIT
-caches still consume memory. No measured total-memory bound, speedup, or
+does not update geometry between individual lights. Ultra additionally uses an
+identity fitting-grid control map, streams each observation tensor, computes exact
+host-side prior gradients, and replays the three bases using the robust-loss
+adjoint so only one renderer AD graph is live at once. This limits simultaneous
+AD graphs, but source host observations, scene data, and renderer/JIT caches
+still consume memory. No measured total-memory bound, speedup, or
 bitwise equivalence across execution configurations is claimed.
 
 ## Verification status

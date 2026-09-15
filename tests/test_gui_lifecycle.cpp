@@ -15,6 +15,7 @@
 namespace fs = std::filesystem;
 namespace {
 constexpr int startId = 1016, cancelId = 1017, statusId = 1053;
+constexpr int mitsubaQualityId = 1046;
 constexpr int newId = 3001, openId = 3002, exitId = 3003;
 struct Driver {
     Options* options = nullptr;
@@ -94,10 +95,28 @@ void CALLBACK drive(HWND, UINT, UINT_PTR, DWORD) {
             require(SendMessageA(GetDlgItem(window, 1038), PBM_SETMARQUEE, FALSE, 0) != 0,
                 "Modern common-controls manifest missing; activity bar would not animate");
             require(GetMenuState(GetMenu(window), openId, MF_BYCOMMAND) != static_cast<UINT>(-1), "File > Open is missing");
+            HWND quality = nullptr;
+            for (HWND page = GetWindow(window, GW_CHILD); page; page = GetWindow(page, GW_HWNDNEXT)) {
+                if (HWND candidate = GetDlgItem(page, mitsubaQualityId)) quality = candidate;
+            }
+            require(quality && SendMessageA(quality, CB_GETCOUNT, 0, 0) == 3,
+                "Mitsuba quality selector must expose exactly Preview, Standard, and High detail");
+            require(SendMessageA(quality, CB_GETCURSEL, 0, 0) == 1,
+                "A stored Ultra selection must fall back to Standard in the GUI");
+            for (int index = 0; index < 3; ++index) {
+                char label[256] = {};
+                SendMessageA(quality, CB_GETLBTEXT, index, reinterpret_cast<LPARAM>(label));
+                require(std::string(label).find("Ultra") == std::string::npos,
+                    "Ultra remains visible in the GUI quality selector");
+            }
             active->phase = 1;
             SendMessageA(window, WM_COMMAND, startId, 0);
         } else if (active->phase == 1 && !active->exitWhileBusy) {
-            require(active->runs == 1 && status(window).find("Complete.") != std::string::npos, "Completion did not return to editable window");
+            require(active->runs == 1 && status(window).find("Complete.") != std::string::npos,
+                "Completion did not return to editable window");
+            require(status(window).find("Shadow refinement applied") != std::string::npos &&
+                status(window).find("25.0% lower") != std::string::npos,
+                "GUI completion did not expose the accepted shadow-refinement benefit");
             HWND tabs = GetDlgItem(window, 1037);
             TabCtrl_SetCurSel(tabs, 5);
             NMHDR changed{tabs, 1037, TCN_SELCHANGE};
@@ -175,7 +194,14 @@ GuiRunResult process(Options& opt, const GuiProgress& progress) {
         update.previewTotal = 12;
         progress(update);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        return {};
+        GuiRunResult result;
+        result.shadow.attempted = true;
+        result.shadow.applied = true;
+        result.shadow.decision = "accepted";
+        result.shadow.balancedMismatchBefore = 0.2;
+        result.shadow.balancedMismatchAfter = 0.15;
+        result.shadow.correctionRmsPixels = 1.25;
+        return result;
     }
     require(opt.outputDir != active->firstOutput && fs::is_regular_file(fs::path(active->firstOutput) / "completed.txt"), "Rerun overwrote previous output");
     if (active->runs == 2) throw std::runtime_error("synthetic processing failure");
@@ -187,6 +213,30 @@ GuiRunResult process(Options& opt, const GuiProgress& progress) {
 
 int main(int argc, char**) {
     try {
+        ShadowRefinementSummary accepted;
+        accepted.attempted = true;
+        accepted.applied = true;
+        accepted.balancedMismatchBefore = 0.2;
+        accepted.balancedMismatchAfter = 0.15;
+        accepted.correctionRmsPixels = 1.25;
+        const std::string acceptedMessage = formatShadowRefinementSummary(accepted);
+        require(
+            acceptedMessage.find("Shadow refinement applied") != std::string::npos &&
+                acceptedMessage.find("0.2000 -> 0.1500 (25.0% lower)") != std::string::npos &&
+                acceptedMessage.find("1.250 height pixels") != std::string::npos,
+            "Accepted shadow-refinement summary omitted its benefit");
+
+        ShadowRefinementSummary rejected;
+        rejected.attempted = true;
+        rejected.decision = "rejected_withheld_lights_worsened";
+        const std::string rejectedMessage = formatShadowRefinementSummary(rejected);
+        require(
+            rejectedMessage.find("not applied: held-out lights worsened") != std::string::npos &&
+                rejectedMessage.find("original height retained") != std::string::npos,
+            "Rejected shadow-refinement summary omitted its reason or fallback");
+        require(formatShadowRefinementSummary({}).empty(),
+            "Unrequested shadow refinement produced a completion summary");
+
         ProgressTiming timing;
         timing.update({"Loading", 0, "Images"}, 0);
         require(timing.remaining(1) < 0, "ETA guessed before any samples");
@@ -202,6 +252,7 @@ int main(int argc, char**) {
         Options initial;
         initial.guiMode = true;
         initial.calculateHeight = false;
+        initial.mitsubaQualityMode = MitsubaQualityMode::Ultra;
         initial.outputDir = (root / "output").string();
         initial.hasSphere = true;
         initial.sphere = {4, 4, 2};

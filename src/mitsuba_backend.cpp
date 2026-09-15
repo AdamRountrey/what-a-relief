@@ -127,6 +127,8 @@ const char* qualityModeName(MitsubaQualityMode mode) {
         return "preview";
     case MitsubaQualityMode::Research:
         return "research";
+    case MitsubaQualityMode::Ultra:
+        return "ultra";
     case MitsubaQualityMode::Standard:
     default:
         return "standard";
@@ -878,7 +880,8 @@ void runMitsubaInverseRefinement(
             result.status = "failed";
             result.decision = "backend process exited with code " + std::to_string(exitCode);
             throw std::runtime_error(
-                "Mitsuba inverse refinement failed. Baseline outputs are intact; inspect " +
+                "Mitsuba inverse refinement failed (backend process exited with code " +
+                std::to_string(exitCode) + "). Baseline outputs are intact; inspect " +
                 (staging / "backend.log").string());
         }
 

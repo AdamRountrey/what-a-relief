@@ -1,5 +1,6 @@
 #include "gui_workflow.hpp"
 
+#include "calibration.hpp"
 #include "crop_ui.hpp"
 #include "image_io.hpp"
 #include "input_response.hpp"
@@ -45,6 +46,76 @@ namespace fs = std::filesystem;
 #ifndef WHAT_A_RELIEF_VERSION
 #define WHAT_A_RELIEF_VERSION "0.2.4"
 #endif
+
+std::string formatShadowRefinementSummary(const ShadowRefinementSummary& summary) {
+    if (!summary.attempted) {
+        return {};
+    }
+
+    auto number = [](double value, int precision) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(precision) << value;
+        return out.str();
+    };
+    if (summary.applied) {
+        std::string message = "Shadow refinement applied";
+        if (std::isfinite(summary.balancedMismatchBefore) &&
+            std::isfinite(summary.balancedMismatchAfter) &&
+            summary.balancedMismatchBefore >= 0.0 &&
+            summary.balancedMismatchAfter >= 0.0) {
+            message += ": balanced mismatch " + number(summary.balancedMismatchBefore, 4) +
+                " -> " + number(summary.balancedMismatchAfter, 4);
+            if (summary.balancedMismatchBefore > 0.0) {
+                const double improvement = 100.0 *
+                    (summary.balancedMismatchBefore - summary.balancedMismatchAfter) /
+                    summary.balancedMismatchBefore;
+                message += " (" + number(improvement, 1) + "% lower)";
+            }
+        }
+        message += ". Correction RMS: " + number(summary.correctionRmsPixels, 3) +
+            " height pixels.";
+        return message;
+    }
+
+    std::string reason;
+    if (summary.decision == "rejected_insufficient_coherent_shadow_lights") {
+        reason = "not enough coherent shadow-bearing lights";
+    } else if (summary.decision == "rejected_insufficient_shadow_edge_constraints") {
+        reason = "not enough reliable shadow-edge constraints";
+    } else if (summary.decision == "rejected_fit_did_not_improve") {
+        reason = "the fitted-light shadow agreement did not improve";
+    } else if (summary.decision == "rejected_withheld_lights_worsened") {
+        reason = "held-out lights worsened";
+    } else if (summary.decision == "rejected_overall_agreement_did_not_improve") {
+        reason = "overall shadow agreement did not improve";
+    } else if (summary.decision == "rejected_normal_slope_inconsistency") {
+        reason = "the correction conflicted with the photometric normal slopes";
+    } else if (summary.decision == "rejected_validation_gate") {
+        reason = "the correction failed validation";
+    } else if (!summary.decision.empty()) {
+        reason = summary.decision;
+        std::replace(reason.begin(), reason.end(), '_', ' ');
+    } else {
+        reason = "the correction was not accepted";
+    }
+    return "Shadow refinement not applied: " + reason + "; original height retained.";
+}
+
+std::string formatLightGainSummary(const LightGainSummary& summary) {
+    if (!summary.attempted && !summary.applied) return {};
+    if (summary.attempted && summary.applied) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(4)
+            << "Specimen light-balance correction applied: held-out error "
+            << summary.validationErrorBefore << " -> " << summary.validationErrorAfter
+            << "; spatial log-RMS " << summary.stability
+            << "; normal dispersion " << summary.normalDiversity << ".";
+        return out.str();
+    }
+    std::string reason = summary.decision;
+    std::replace(reason.begin(), reason.end(), '_', ' ');
+    return "Specimen light-balance correction not applied: " + reason + ". Equal gains retained.";
+}
 
 namespace {
 
@@ -123,6 +194,12 @@ constexpr int kIdRunStatus = 1053;
 constexpr int kIdRunLog = 1054;
 constexpr int kIdPreview = 1055;
 constexpr int kIdPreviewCaption = 1056;
+constexpr int kIdMakeCalibrationTarget = 1057;
+constexpr int kIdCreateMicroscopeCalibration = 1058;
+constexpr int kIdLoadMicroscopeCalibration = 1059;
+constexpr int kIdClearMicroscopeCalibration = 1060;
+constexpr int kIdMicroscopeCalibrationStatus = 1061;
+constexpr int kIdEstimateLightGains = 1062;
 constexpr UINT_PTR kRunTimer = 4001;
 constexpr int kIdPromptEdit = 2001;
 constexpr int kIdPromptOk = 2002;
@@ -170,6 +247,7 @@ struct SetupDialogState {
     HWND hwnd = nullptr;
     HWND statusText = nullptr;
     HWND progressBar = nullptr;
+    int progressBarMode = -1;
     HWND startButton = nullptr;
     HWND cancelButton = nullptr;
     HWND nextStepLabel = nullptr;
@@ -181,6 +259,8 @@ struct SetupDialogState {
     HWND lightingCombo = nullptr;
     HWND sphereButton = nullptr;
     HWND sphereStatus = nullptr;
+    HWND microscopeCalibrationStatus = nullptr;
+    HWND estimateLightGainsCheck = nullptr;
     HWND cropButton = nullptr;
     HWND cropStatus = nullptr;
     HWND heightMaskButton = nullptr;
@@ -261,6 +341,7 @@ private:
 
 void updateApplicationState(SetupDialogState& state);
 void layoutApplicationFooter(SetupDialogState& state);
+void setProgressBarMode(SetupDialogState& state, bool determinate);
 
 std::atomic_bool gProgressCancelRequested{false};
 
@@ -348,6 +429,41 @@ std::string chooseLightsFile(HWND owner) {
     return std::string(buffer);
 }
 
+std::string chooseMicroscopeCalibrationFile(HWND owner) {
+    char buffer[MAX_PATH] = {};
+    OPENFILENAMEA dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = "Microscope calibration JSON\0*.json\0All files\0*.*\0";
+    dialog.lpstrFile = buffer;
+    dialog.nMaxFile = static_cast<DWORD>(sizeof(buffer));
+    dialog.lpstrTitle = "Select microscope checkerboard calibration";
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameA(&dialog)) throw std::runtime_error("Calibration selection was canceled.");
+    return std::string(buffer);
+}
+
+std::string chooseCalibrationSaveFile(
+    HWND owner,
+    const char* title,
+    const char* filter,
+    const char* defaultExtension,
+    const char* suggestedName) {
+    char buffer[MAX_PATH] = {};
+    strncpy_s(buffer, suggestedName, _TRUNCATE);
+    OPENFILENAMEA dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter;
+    dialog.lpstrFile = buffer;
+    dialog.nMaxFile = static_cast<DWORD>(sizeof(buffer));
+    dialog.lpstrTitle = title;
+    dialog.lpstrDefExt = defaultExtension;
+    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameA(&dialog)) throw std::runtime_error("Save selection was canceled.");
+    return std::string(buffer);
+}
+
 std::string chooseMitsubaPython(HWND owner) {
     char buffer[MAX_PATH] = {};
     OPENFILENAMEA ofn = {};
@@ -397,6 +513,11 @@ std::string lightsStatusText(const Options& opt) {
     }
     return baseName(opt.lightsFile) +
         (opt.lightsFileByOrder ? " loaded by image order; sphere not needed" : " loaded; sphere not needed");
+}
+
+std::string microscopeCalibrationStatusText(const Options& opt) {
+    if (opt.microscopeCalibrationFile.empty()) return "No microscope calibration";
+    return baseName(opt.microscopeCalibrationFile) + " loaded";
 }
 
 std::string heightMaskStatusText(const Options& opt) {
@@ -841,7 +962,25 @@ void updateSetupControls(SetupDialogState& state) {
     SetWindowTextA(state.imageStatus, imageStatusText(opt.imagePaths).c_str());
     SetWindowTextA(state.outputStatus, outputStatusText(opt.outputDir).c_str());
     SetWindowTextA(state.lightsStatus, lightsStatusText(opt).c_str());
-    SetWindowTextA(state.sphereStatus, opt.hasSphere ? "Sphere marked" : "No sphere marked");
+    if (opt.hasSphere) {
+        std::string sphereStatus = "Sphere marked";
+        if (opt.sphereSelectionImageIndex >= 0 &&
+            opt.sphereSelectionImageIndex < static_cast<int>(opt.imagePaths.size())) {
+            sphereStatus += " in image " + std::to_string(opt.sphereSelectionImageIndex + 1);
+        }
+        if (!opt.sphereEdgePoints.empty() && opt.sphereFitRmsPixels >= 0.0) {
+            std::ostringstream detail;
+            detail << " (" << opt.sphereEdgePoints.size() << " points, RMS "
+                   << std::fixed << std::setprecision(2) << opt.sphereFitRmsPixels << " px)";
+            sphereStatus += detail.str();
+        }
+        SetWindowTextA(state.sphereStatus, sphereStatus.c_str());
+    } else {
+        SetWindowTextA(state.sphereStatus, "No sphere marked");
+    }
+    if (state.microscopeCalibrationStatus != nullptr) {
+        SetWindowTextA(state.microscopeCalibrationStatus, microscopeCalibrationStatusText(opt).c_str());
+    }
     SetWindowTextA(state.cropStatus, opt.hasCrop ? "Crop selected" : "No crop selected");
     SetWindowTextA(state.heightMaskStatus, heightMaskStatusText(opt).c_str());
     if (state.nextStepLabel != nullptr) {
@@ -851,6 +990,14 @@ void updateSetupControls(SetupDialogState& state) {
 
     const bool calibrated = comboSelection(state.lightingCombo) == 0;
     const bool usingLightsFile = !opt.lightsFile.empty();
+    if (state.estimateLightGainsCheck != nullptr) {
+        const bool supportsEstimatedGains = calibrated && opt.imagePaths.size() >= 5;
+        if (!supportsEstimatedGains && buttonChecked(state.estimateLightGainsCheck)) {
+            setButtonChecked(state.estimateLightGainsCheck, false);
+            opt.estimateLightGains = false;
+        }
+        EnableWindow(state.estimateLightGainsCheck, supportsEstimatedGains);
+    }
     EnableWindow(state.lightingCombo, !usingLightsFile);
     EnableWindow(state.sphereButton, calibrated && !usingLightsFile);
     EnableWindow(state.cropButton, !opt.imagePaths.empty());
@@ -979,10 +1126,20 @@ void refreshInputResponse(SetupDialogState& state) {
     }
 }
 
+void clearSphereSelection(Options& opt) {
+    opt.hasSphere = false;
+    opt.sphere = {};
+    opt.sphereSelectionImageIndex = 0;
+    opt.sphereEdgePoints.clear();
+    opt.sphereFitRmsPixels = -1.0;
+    opt.sphereFitMaxResidualPixels = -1.0;
+    opt.sphereFitCoverageDegrees = -1.0;
+}
+
 void selectImages(SetupDialogState& state) {
     try {
         state.opt->imagePaths = chooseImageFiles(state.hwnd);
-        state.opt->hasSphere = false;
+        clearSphereSelection(*state.opt);
         state.opt->hasCrop = false;
         state.opt->heightMask.release();
         state.opt->hasHeightMask = false;
@@ -992,7 +1149,10 @@ void selectImages(SetupDialogState& state) {
             (state.opt->outputDir.empty() || state.opt->outputDir == "out")) {
             state.opt->outputDir = (fs::path(state.opt->imagePaths.front()).parent_path() / "what-a-relief").string();
         }
-        const double tagScale = state.opt->imagePaths.empty() ? 0.0 : readPixelScaleMmFromImage(state.opt->imagePaths.front());
+        double tagScale = state.opt->imagePaths.empty() ? 0.0 : readPixelScaleMmFromImage(state.opt->imagePaths.front());
+        if (!state.opt->microscopeCalibrationFile.empty()) {
+            tagScale = loadMicroscopeCalibration(state.opt->microscopeCalibrationFile).pixelScaleMm;
+        }
         if (tagScale > 0.0 && state.pixelScaleEdit != nullptr) {
             state.opt->pixelScaleMm = tagScale;
             setEditDouble(state.pixelScaleEdit, tagScale);
@@ -1023,7 +1183,7 @@ void selectLightsFile(SetupDialogState& state) {
         }
         state.opt->lightsFile = selectedPath;
         state.opt->lightsFileByOrder = useFileOrder;
-        state.opt->hasSphere = false;
+        clearSphereSelection(*state.opt);
         const bool hasMetadata = loadLightsFileMetadata(state.opt->lightsFile, *state.opt);
         if (!hasMetadata) {
             state.opt->lightingModel = LightingModel::Directional;
@@ -1068,7 +1228,17 @@ void markSphere(SetupDialogState& state) {
     }
     try {
         SelectionGuard selection(state);
-        state.opt->sphere = chooseSphereInteractive(loadDisplayImage(state.opt->imagePaths.front()));
+        const SphereSelection chosen = chooseSphereInteractive(
+            state.opt->imagePaths.size(),
+            [&](size_t imageIndex) { return loadDisplayImage(*state.opt, imageIndex); },
+            state.opt->imagePaths,
+            static_cast<size_t>(std::max(0, state.opt->sphereSelectionImageIndex)));
+        state.opt->sphere = chosen.sphere;
+        state.opt->sphereSelectionImageIndex = static_cast<int>(chosen.imageIndex);
+        state.opt->sphereEdgePoints = chosen.edgePoints;
+        state.opt->sphereFitRmsPixels = chosen.fitRmsPixels;
+        state.opt->sphereFitMaxResidualPixels = chosen.fitMaxResidualPixels;
+        state.opt->sphereFitCoverageDegrees = chosen.fitCoverageDegrees;
         state.opt->hasSphere = true;
         updateSetupControls(state);
     } catch (const std::exception& e) {
@@ -1083,7 +1253,7 @@ void cropSurface(SetupDialogState& state) {
     }
     try {
         SelectionGuard selection(state);
-        state.opt->crop = chooseCropInteractive(loadDisplayImage(state.opt->imagePaths.front()));
+        state.opt->crop = chooseCropInteractive(loadDisplayImage(*state.opt));
         state.opt->hasCrop = true;
         updateSetupControls(state);
     } catch (const std::exception& e) {
@@ -1098,7 +1268,7 @@ void markHeightMask(SetupDialogState& state) {
     }
     try {
         SelectionGuard selection(state);
-        state.opt->heightMask = chooseHeightMaskInteractive(loadDisplayImage(state.opt->imagePaths.front()));
+        state.opt->heightMask = chooseHeightMaskInteractive(loadDisplayImage(*state.opt));
         state.opt->hasHeightMask = true;
         state.opt->heightMaskPath.clear();
         updateSetupControls(state);
@@ -1114,7 +1284,7 @@ void markScaleLine(SetupDialogState& state) {
     }
     try {
         SelectionGuard selection(state);
-        const double pixels = chooseScaleLineInteractive(loadDisplayImage(state.opt->imagePaths.front()));
+        const double pixels = chooseScaleLineInteractive(loadDisplayImage(*state.opt));
         std::ostringstream prompt;
         prompt << "The line is " << pixels << " pixels long.\n\n"
                << "Enter the real length of that line:";
@@ -1136,6 +1306,133 @@ void clearHeightMask(SetupDialogState& state) {
     state.opt->heightMask.release();
     state.opt->hasHeightMask = false;
     state.opt->heightMaskPath.clear();
+    updateSetupControls(state);
+}
+
+void makeCalibrationTarget(SetupDialogState& state) {
+    try {
+        const int columns = static_cast<int>(std::lround(promptDouble(
+            state.hwnd, "Checkerboard Target", "Number of printed squares across (5-80):",
+            state.opt->calibrationGridColumns, "squares")));
+        const int rows = static_cast<int>(std::lround(promptDouble(
+            state.hwnd, "Checkerboard Target", "Number of printed squares down (5-80):",
+            state.opt->calibrationGridRows, "squares")));
+        const double squareMm = promptDouble(
+            state.hwnd, "Checkerboard Target", "Printed size of each square:",
+            state.opt->calibrationSquareMm, "mm");
+        const std::string path = chooseCalibrationSaveFile(
+            state.hwnd,
+            "Save exact-size printable checkerboard",
+            "Scalable Vector Graphics\0*.svg\0All files\0*.*\0",
+            "svg",
+            "what-a-relief-checkerboard.svg");
+        writePrintableCheckerboardSvg(
+            path,
+            columns,
+            rows,
+            squareMm,
+            state.opt->calibrationPageWidthMm,
+            state.opt->calibrationPageHeightMm);
+        state.opt->calibrationGridColumns = columns;
+        state.opt->calibrationGridRows = rows;
+        state.opt->calibrationSquareMm = squareMm;
+        showOwnerMessage(
+            state.hwnd,
+            "Checkerboard Target",
+            "Target written to:\n" + path +
+                "\n\nPrint at 100% / Actual size, disable Fit to page, and verify the 10 mm check line before calibration.",
+            MB_ICONINFORMATION);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Checkerboard Target", e.what(), MB_ICONINFORMATION);
+    }
+}
+
+void createMicroscopeCalibrationInteractive(SetupDialogState& state) {
+    try {
+        std::vector<std::string> paths = chooseImageFiles(state.hwnd);
+        if (paths.size() < 3) throw std::runtime_error("Select one checkerboard image for each of at least three lighting positions.");
+        const int columns = static_cast<int>(std::lround(promptDouble(
+            state.hwnd, "Microscope Calibration", "Printed checkerboard squares across:",
+            state.opt->calibrationGridColumns, "squares")));
+        const int rows = static_cast<int>(std::lround(promptDouble(
+            state.hwnd, "Microscope Calibration", "Printed checkerboard squares down:",
+            state.opt->calibrationGridRows, "squares")));
+        const double squareMm = promptDouble(
+            state.hwnd, "Microscope Calibration", "Printed size of each checkerboard square:",
+            state.opt->calibrationSquareMm, "mm");
+        const std::string path = chooseCalibrationSaveFile(
+            state.hwnd,
+            "Save microscope calibration",
+            "Microscope calibration JSON\0*.json\0All files\0*.*\0",
+            "json",
+            "microscope_calibration.json");
+
+        Options calibrationOptions;
+        calibrationOptions.imagePaths = std::move(paths);
+        calibrationOptions.inputResponseMode = state.opt->inputResponseMode;
+        resolveInputResponses(calibrationOptions);
+        SelectionGuard selection(state);
+        const MicroscopeCalibration calibration = createMicroscopeCalibration(
+            calibrationOptions, columns, rows, squareMm);
+        saveMicroscopeCalibration(path, calibration);
+
+        state.opt->microscopeCalibrationFile = path;
+        state.opt->estimateLightGains = true;
+        state.opt->pixelScaleMm = calibration.pixelScaleMm;
+        state.opt->calibrationGridColumns = columns;
+        state.opt->calibrationGridRows = rows;
+        state.opt->calibrationSquareMm = squareMm;
+        clearSphereSelection(*state.opt);
+        state.opt->hasCrop = false;
+        state.opt->heightMask.release();
+        state.opt->hasHeightMask = false;
+        setEditDouble(state.pixelScaleEdit, calibration.pixelScaleMm);
+        setButtonChecked(state.estimateLightGainsCheck, true);
+        std::ostringstream message;
+        message << "Calibration saved and selected.\n\n"
+                << "Working-plane fit RMS: " << calibration.reprojectionRmsPixels << " pixels\n"
+                << "Maximum corner residual: " << calibration.reprojectionMaxPixels << " pixels\n"
+                << "Board coverage: " << 100.0 * calibration.boardCoverageFraction << "%\n"
+                << "Pixel scale: " << calibration.pixelScaleMm << " mm/pixel\n"
+                << "Lighting positions: " << calibration.lightGains.size()
+                << "\n\nUse specimen images from the same camera resolution and lighting order. "
+                   "The target must have been flat and fronto-parallel at the specimen working plane.";
+        showOwnerMessage(state.hwnd, "Microscope Calibration", message.str(), MB_ICONINFORMATION);
+        updateSetupControls(state);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Microscope Calibration", e.what(), MB_ICONWARNING);
+    }
+}
+
+void loadMicroscopeCalibrationInteractive(SetupDialogState& state) {
+    try {
+        const std::string path = chooseMicroscopeCalibrationFile(state.hwnd);
+        const MicroscopeCalibration calibration = loadMicroscopeCalibration(path);
+        state.opt->microscopeCalibrationFile = path;
+        state.opt->estimateLightGains = true;
+        state.opt->pixelScaleMm = calibration.pixelScaleMm;
+        clearSphereSelection(*state.opt);
+        state.opt->hasCrop = false;
+        state.opt->heightMask.release();
+        state.opt->hasHeightMask = false;
+        setEditDouble(state.pixelScaleEdit, calibration.pixelScaleMm);
+        setButtonChecked(state.estimateLightGainsCheck, true);
+        updateSetupControls(state);
+    } catch (const std::exception& e) {
+        showOwnerMessage(state.hwnd, "Microscope Calibration", e.what(), MB_ICONINFORMATION);
+    }
+}
+
+void clearMicroscopeCalibration(SetupDialogState& state) {
+    state.opt->microscopeCalibrationFile.clear();
+    state.opt->lightGains.clear();
+    state.opt->lightGainSource = "equal";
+    state.opt->pixelScaleMm = 0.0;
+    clearSphereSelection(*state.opt);
+    state.opt->hasCrop = false;
+    state.opt->heightMask.release();
+    state.opt->hasHeightMask = false;
+    setEditDouble(state.pixelScaleEdit, 0.0);
     updateSetupControls(state);
 }
 
@@ -1164,6 +1461,7 @@ bool validateAndAccept(SetupDialogState& state) {
     }
 
     opt.uncalibratedLighting = comboSelection(state.lightingCombo) == 1;
+    opt.estimateLightGains = !opt.uncalibratedLighting && buttonChecked(state.estimateLightGainsCheck);
     if (opt.uncalibratedLighting) {
         opt.lightsFile.clear();
         opt.lightsFileByOrder = false;
@@ -1284,6 +1582,27 @@ bool validateAndAccept(SetupDialogState& state) {
         showOwnerMessage(state.hwnd, "Input Response (Processing tab)", e.what(), MB_ICONWARNING);
         return false;
     }
+    if (!opt.microscopeCalibrationFile.empty()) {
+        try {
+            const MicroscopeCalibration calibration = loadMicroscopeCalibration(opt.microscopeCalibrationFile);
+            if (calibration.lightGains.size() != opt.imagePaths.size()) {
+                showOwnerMessage(
+                    state.hwnd,
+                    "Microscope Calibration",
+                    "The calibration has " + std::to_string(calibration.lightGains.size()) +
+                        " lighting positions, but the specimen stack has " +
+                        std::to_string(opt.imagePaths.size()) +
+                        ". Select the same positions in the same order.",
+                    MB_ICONWARNING);
+                return false;
+            }
+            opt.pixelScaleMm = calibration.pixelScaleMm;
+            setEditDouble(state.pixelScaleEdit, opt.pixelScaleMm);
+        } catch (const std::exception& e) {
+            showOwnerMessage(state.hwnd, "Microscope Calibration", e.what(), MB_ICONWARNING);
+            return false;
+        }
+    }
     opt.calculateHeight = buttonChecked(state.heightCheck);
     opt.meshStep = editInt(state.meshStepEdit, "mesh step");
     opt.printableThicknessMm = editDouble(state.printableThicknessEdit, "printable base thickness");
@@ -1385,9 +1704,13 @@ bool validateAndAccept(SetupDialogState& state) {
         ? MitsubaBackendMode::Cuda
         : (mitsubaBackendIndex == 2 ? MitsubaBackendMode::Cpu : MitsubaBackendMode::Auto);
     const int mitsubaQualityIndex = comboSelection(state.mitsubaQualityCombo);
-    opt.mitsubaQualityMode = mitsubaQualityIndex == 0
-        ? MitsubaQualityMode::Preview
-        : (mitsubaQualityIndex == 2 ? MitsubaQualityMode::Research : MitsubaQualityMode::Standard);
+    if (mitsubaQualityIndex == 0) {
+        opt.mitsubaQualityMode = MitsubaQualityMode::Preview;
+    } else if (mitsubaQualityIndex == 2) {
+        opt.mitsubaQualityMode = MitsubaQualityMode::Research;
+    } else {
+        opt.mitsubaQualityMode = MitsubaQualityMode::Standard;
+    }
     if (opt.mitsubaInverseRefinement && opt.shadowHeightRefinement) {
         showOwnerMessage(
             state.hwnd,
@@ -1397,6 +1720,24 @@ bool validateAndAccept(SetupDialogState& state) {
         return false;
     }
     if (opt.mitsubaInverseRefinement) {
+        if (opt.mitsubaQualityMode == MitsubaQualityMode::Ultra) {
+            const int answer = MessageBoxA(
+                state.hwnd,
+                "Ultra runs the inverse renderer on a grid capped at 1024 pixels on the longer side of the fitting-mask bounds.\n\n"
+                "It optimizes an absolute height field initialized by the classical reconstruction, rather than "
+                "an upsampled bounded correction. The classical result remains the validation baseline and fallback.\n\n"
+                "Runtime and memory grow with pixel count, light count, samples, and iterations. Large images can "
+                "take many hours or exhaust GPU/RAM. Ultra automatically lowers stochastic optimization samples "
+                "to limit peak renderer memory. Inputs larger than the 1024-pixel limit are area-reduced for the "
+                "solve and accepted height is interpolated back to the source grid. The original "
+                "height is retained if the worker fails or its "
+                "candidate does not pass validation.\n\nContinue with Ultra?",
+                "Ultra Mitsuba Inverse Solution",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (answer != IDYES) {
+                return false;
+            }
+        }
         if (opt.lightingModel == LightingModel::NearFieldRing &&
             (opt.shadowLedDiameterMm <= 0.0 || opt.shadowReferenceZMm >= opt.ringLightHeightMm)) {
             showOwnerMessage(state.hwnd, "Setup", "Near-field inverse refinement requires a positive LED diameter and a reference Z below the ring lights (Advanced tab).", MB_ICONWARNING);
@@ -1478,6 +1819,35 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     state.sphereStatus = makeControl(lightingPage, "STATIC", "", SS_LEFT, kIdSphereStatus, kControlX + kButtonWidth + 12, y + 5, 330, kRowHeight);
 
     y += 42;
+    makeLabel(lightingPage, "Microscope", kMargin, y, kLabelWidth, kRowHeight);
+    makeControl(lightingPage, "BUTTON", "Make Target...", BS_PUSHBUTTON | WS_TABSTOP,
+        kIdMakeCalibrationTarget, kControlX, y, 112, kRowHeight);
+    makeControl(lightingPage, "BUTTON", "Calibrate...", BS_PUSHBUTTON | WS_TABSTOP,
+        kIdCreateMicroscopeCalibration, kControlX + 120, y, 96, kRowHeight);
+    makeControl(lightingPage, "BUTTON", "Load...", BS_PUSHBUTTON | WS_TABSTOP,
+        kIdLoadMicroscopeCalibration, kControlX + 224, y, 76, kRowHeight);
+    makeControl(lightingPage, "BUTTON", "Clear", BS_PUSHBUTTON | WS_TABSTOP,
+        kIdClearMicroscopeCalibration, kControlX + 308, y, 62, kRowHeight);
+
+    y += 32;
+    state.microscopeCalibrationStatus = makeControl(
+        lightingPage, "STATIC", "", SS_LEFT, kIdMicroscopeCalibrationStatus,
+        kControlX, y + 5, kControlWidth, kRowHeight);
+
+    y += 34;
+    state.estimateLightGainsCheck = makeControl(
+        lightingPage,
+        "BUTTON",
+        "Estimate per-stack relative light balance (validated)",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        kIdEstimateLightGains,
+        kControlX,
+        y,
+        kControlWidth,
+        24);
+    setButtonChecked(state.estimateLightGainsCheck, state.opt->estimateLightGains);
+
+    y += 34;
     makeLabel(lightingPage, "Near Field", kMargin, y, kLabelWidth, kRowHeight);
     state.nearFieldCheck = makeControl(lightingPage, "BUTTON", "Use ring light point-source model", BS_AUTOCHECKBOX, kIdNearField, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.nearFieldCheck, state.opt->lightingModel == LightingModel::NearFieldRing);
@@ -1658,7 +2028,7 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     setButtonChecked(state.neuralFusionCheck, state.opt->neuralFusion);
 
     y += 38;
-    state.mitsubaInverseCheck = makeControl(advancedPage, "BUTTON", "Experimental: Mitsuba inverse geometry refinement", BS_AUTOCHECKBOX, kIdMitsubaInverse, kControlX, y, kControlWidth, 24);
+    state.mitsubaInverseCheck = makeControl(advancedPage, "BUTTON", "Experimental: Mitsuba inverse geometry", BS_AUTOCHECKBOX, kIdMitsubaInverse, kControlX, y, kControlWidth, 24);
     setButtonChecked(state.mitsubaInverseCheck, state.opt->mitsubaInverseRefinement);
 
     y += 25;
@@ -1684,6 +2054,8 @@ void createSetupControls(HWND hwnd, SetupDialogState& state) {
     addComboItem(state.mitsubaQualityCombo, "Preview (64 px grid limit, 12 iterations)");
     addComboItem(state.mitsubaQualityCombo, "Standard (128 px grid limit, 24 iterations)");
     addComboItem(state.mitsubaQualityCombo, "High detail (256 px grid limit, 50 iterations)");
+    // Ultra remains supported by the CLI, project format, and backend for
+    // controlled experiments, but is intentionally not offered in the GUI.
     int mitsubaQualityIndex = 1;
     if (state.opt->mitsubaQualityMode == MitsubaQualityMode::Preview) {
         mitsubaQualityIndex = 0;
@@ -1731,6 +2103,32 @@ void layoutApplicationFooter(SetupDialogState& state) {
     MoveWindow(state.progressBar, kMargin, progressY, width - 2 * kMargin, 10, TRUE);
     MoveWindow(state.startButton, width - 250, startY, 110, 34, TRUE);
     MoveWindow(state.cancelButton, width - 125, startY, 110, 34, TRUE);
+}
+
+void setProgressBarMode(SetupDialogState& state, bool determinate) {
+    const int requestedMode = determinate ? 1 : 0;
+    if (state.progressBarMode == requestedMode) {
+        return;
+    }
+
+    SendMessageA(state.progressBar, PBM_SETMARQUEE, FALSE, 0);
+    const LONG_PTR style = GetWindowLongPtrA(state.progressBar, GWL_STYLE);
+    const LONG_PTR requestedStyle = determinate ? style & ~PBS_MARQUEE : style | PBS_MARQUEE;
+    if (requestedStyle != style) {
+        SetWindowLongPtrA(state.progressBar, GWL_STYLE, requestedStyle);
+        SetWindowPos(
+            state.progressBar,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    if (!determinate) {
+        SendMessageA(state.progressBar, PBM_SETMARQUEE, TRUE, 40);
+    }
+    state.progressBarMode = requestedMode;
 }
 
 void updateApplicationState(SetupDialogState& state) {
@@ -1848,9 +2246,7 @@ void refreshRunProgress(SetupDialogState& state) {
     }
     const auto& update = state.currentProgress;
     const bool measured = update.total > 0;
-    LONG_PTR style = GetWindowLongPtrA(state.progressBar, GWL_STYLE);
-    SetWindowLongPtrA(state.progressBar, GWL_STYLE, measured ? style & ~PBS_MARQUEE : style | PBS_MARQUEE);
-    SendMessageA(state.progressBar, PBM_SETMARQUEE, !measured, 40);
+    setProgressBarMode(state, measured);
     if (measured) SendMessageA(state.progressBar, PBM_SETPOS, static_cast<int>(100 * std::clamp(update.completed / update.total, 0.0, 1.0)), 0);
     const double remaining = state.timing.remaining(elapsed);
     std::string text = update.message + "\r\nElapsed " + durationText(elapsed) + " | Stage ETA: " +
@@ -1907,6 +2303,15 @@ void finishProject(SetupDialogState& state) {
         state.reviewPath = result.inverse.candidateSaved ? result.inverse.candidateReviewPath : "";
         std::string message = "Complete. Outputs: " + state.lastOutput +
             "\r\nAdjust the tabs and Run Again, or use File > New Project / Open Completed Project.";
+        if (!state.opt->microscopeCalibrationFile.empty()) {
+            message += "\r\nMicroscope working-plane correction and calibrated pixel scale applied.";
+        }
+        const std::string shadowSummary = formatShadowRefinementSummary(result.shadow);
+        if (!shadowSummary.empty()) {
+            message += "\r\n" + shadowSummary;
+        }
+        const std::string lightGainSummary = formatLightGainSummary(result.lightGain);
+        if (!lightGainSummary.empty()) message += "\r\n" + lightGainSummary;
         if (result.inverse.attempted && !result.inverse.accepted) {
             message += "\r\nInverse refinement not accepted: " + result.inverse.decision + ". Baseline retained.";
             if (result.inverse.candidateSaved) message += " Use File > Review Inverse Candidate to inspect the unvalidated result.";
@@ -1920,6 +2325,8 @@ void finishProject(SetupDialogState& state) {
     }
     state.busy = false;
     KillTimer(state.hwnd, kRunTimer);
+    SendMessageA(state.progressBar, PBM_SETMARQUEE, FALSE, 0);
+    state.progressBarMode = -1;
     ShowWindow(state.progressBar, SW_HIDE);
     updateSetupControls(state);
     updateApplicationState(state);
@@ -1995,6 +2402,22 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         case kIdClearLights:
             clearLightsFile(*state);
+            return 0;
+        case kIdMakeCalibrationTarget:
+            makeCalibrationTarget(*state);
+            return 0;
+        case kIdCreateMicroscopeCalibration:
+            createMicroscopeCalibrationInteractive(*state);
+            return 0;
+        case kIdLoadMicroscopeCalibration:
+            loadMicroscopeCalibrationInteractive(*state);
+            return 0;
+        case kIdClearMicroscopeCalibration:
+            clearMicroscopeCalibration(*state);
+            return 0;
+        case kIdEstimateLightGains:
+            state->opt->estimateLightGains = buttonChecked(state->estimateLightGainsCheck);
+            updateSetupControls(*state);
             return 0;
         case kIdLighting:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
@@ -2110,7 +2533,7 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     updateSetupControls(*state);
                     updateApplicationState(*state);
                     SetWindowTextA(state->statusText, "Starting photometric stereo...");
-                    SendMessageA(state->progressBar, PBM_SETPOS, 0, 0);
+                    setProgressBarMode(*state, false);
                     ShowWindow(state->progressBar, SW_SHOW);
                     PostMessageA(hwnd, kRunProjectMessage, 0, 0);
                 }
@@ -2130,6 +2553,8 @@ LRESULT CALLBACK setupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             try { startProjectWorker(*state); }
             catch (const std::exception& error) {
                 state->busy = false;
+                SendMessageA(state->progressBar, PBM_SETMARQUEE, FALSE, 0);
+                state->progressBarMode = -1;
                 ShowWindow(state->progressBar, SW_HIDE);
                 SetWindowTextA(state->statusText, ("Could not start processing: " + std::string(error.what())).c_str());
                 updateApplicationState(*state);

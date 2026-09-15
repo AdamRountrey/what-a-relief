@@ -35,6 +35,11 @@ int main() {
         original.outputDir = (root / "images" / "what-a-relief").string();
         original.hasSphere = true;
         original.sphere = {2.5, 3.5, 1.25};
+        original.sphereSelectionImageIndex = 2;
+        original.sphereEdgePoints = {{1.25, 3.5}, {2.5, 2.25}, {3.75, 3.5}, {2.5, 4.75}, {1.62, 2.62}};
+        original.sphereFitRmsPixels = 0.18;
+        original.sphereFitMaxResidualPixels = 0.31;
+        original.sphereFitCoverageDegrees = 270.0;
         original.hasCrop = true;
         original.crop = {1, 2, 12, 11};
         original.pixelScaleMm = 0.125;
@@ -73,6 +78,12 @@ int main() {
         require(opt.imagePaths == original.imagePaths, "Image order changed");
         require(opt.guiMode && !opt.noGui, "Loaded project is not an editable GUI project");
         require(opt.hasSphere && opt.sphere.radius == 1.25 && opt.hasCrop && opt.crop == original.crop, "Sphere/crop did not round-trip");
+        require(opt.sphereSelectionImageIndex == 2 &&
+            opt.sphereEdgePoints.size() == original.sphereEdgePoints.size() &&
+            opt.sphereFitRmsPixels == original.sphereFitRmsPixels &&
+            opt.sphereFitMaxResidualPixels == original.sphereFitMaxResidualPixels &&
+            opt.sphereFitCoverageDegrees == original.sphereFitCoverageDegrees,
+            "Sphere source image or fit audit did not round-trip");
         require(opt.hasHeightMask && cv::countNonZero(opt.heightMask != original.heightMask) == 0, "Original specimen selection was not preserved");
         require(opt.maskPath.empty() && opt.heightMaskPath.empty(), "Specimen mask became a solve mask");
         require(opt.heightMask.at<uchar>(7, 7) == 255, "Final validity exclusions leaked into stored specimen selection");
@@ -113,7 +124,7 @@ int main() {
         p["ring_height_mm"] = 25.0;
         p["neural_fusion"] = true;
         p["mitsuba_inverse_refinement"] = true;
-        p["mitsuba_quality"] = "research";
+        p["mitsuba_quality"] = "ultra";
         p["mitsuba_backend_requested"] = "cpu";
         p["mitsuba_python_override"] = "C:/untrusted/python.exe";
         p["mitsuba_worker_override"] = "C:/untrusted/worker.py";
@@ -124,7 +135,7 @@ int main() {
         auto restored = loadCompletedProject(manifest);
         require(!restored.options.lightsFile.empty() && restored.options.lightingModel == LightingModel::NearFieldRing, "Saved calibration fallback lost ring mode");
         require(restored.options.ringLightRadiusMm == 37.5 && restored.options.ringLightHeightMm == 25, "Ring geometry changed");
-        require(restored.options.mitsubaInverseRefinement && restored.options.mitsubaQualityMode == MitsubaQualityMode::Research, "Inverse settings changed");
+        require(restored.options.mitsubaInverseRefinement && restored.options.mitsubaQualityMode == MitsubaQualityMode::Ultra, "Inverse settings changed");
         require(restored.options.mitsubaPythonPath.empty() && restored.options.mitsubaWorkerPath.empty(), "Project restored executable overrides");
         require(restored.options.exportRti && restored.options.rtiLayoutMode == RtiLayoutMode::WebRtiViewer && restored.options.rtiColorMode == RtiColorMode::Lrgb, "RTI settings changed");
         require(restored.options.neuralFusion && restored.warnings.size() == 2, "Expected restoration warnings missing");

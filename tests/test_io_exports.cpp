@@ -723,6 +723,81 @@ void testRunManifestAndCheckedWrites(TestContext& context) {
     fs::remove_all(root);
 }
 
+void testShadowRefinementAuditOutputPolicy(TestContext& context) {
+    const fs::path root = "io_shadow_audit_policy_test";
+    fs::remove_all(root);
+
+    Options opt;
+    opt.outputDir = (root / "routine").string();
+    opt.calculateHeight = true;
+    opt.solverMode = NormalSolverMode::Robust;
+    opt.shadowHeightRefinement = true;
+    const std::vector<cv::Vec3f> lights = makeLights();
+    for (size_t i = 0; i < lights.size(); ++i) {
+        opt.imagePaths.push_back("synthetic_shadow_input_" + std::to_string(i) + ".png");
+    }
+
+    const cv::Size size(14, 12);
+    const cv::Mat normals(size, CV_32FC3, cv::Scalar(0.0f, 0.0f, 1.0f));
+    const cv::Mat albedo(size, CV_32F, cv::Scalar(0.6f));
+    const cv::Mat residual(size, CV_32F, cv::Scalar(0.01f));
+    const cv::Mat mask(size, CV_8U, cv::Scalar(255));
+    const cv::Mat height(size, CV_32F, cv::Scalar(0.2f));
+    PhotometricDiagnostics diagnostics;
+    diagnostics.shadowHeightCorrection = cv::Mat(size, CV_32F, cv::Scalar(0.05f));
+    diagnostics.shadowConstraintCount = cv::Mat(size, CV_32F, cv::Scalar(2.0f));
+    diagnostics.shadowMismatchBefore = cv::Mat(size, CV_32F, cv::Scalar(0.3f));
+    diagnostics.shadowMismatchAfter = cv::Mat(size, CV_32F, cv::Scalar(0.2f));
+    diagnostics.shadowObservability = cv::Mat(size, CV_32F, cv::Scalar(0.7f));
+    diagnostics.shadowEdgeSupport = cv::Mat(size, CV_32F, cv::Scalar(0.4f));
+    diagnostics.shadowOccluderSupport = mask.clone();
+    diagnostics.shadowRefinementLightIndices = {0};
+    diagnostics.shadowObservedCastMasks.assign(lights.size(), cv::Mat());
+    diagnostics.shadowObservationConfidence.assign(lights.size(), cv::Mat());
+    diagnostics.shadowPredictedBeforeMasks.assign(lights.size(), cv::Mat());
+    diagnostics.shadowPredictedAfterMasks.assign(lights.size(), cv::Mat());
+    diagnostics.shadowPredictedBeforeProbability.assign(lights.size(), cv::Mat());
+    diagnostics.shadowPredictedAfterProbability.assign(lights.size(), cv::Mat());
+    diagnostics.shadowObservedCastMasks[0] = mask.clone();
+    diagnostics.shadowObservationConfidence[0] = cv::Mat(size, CV_32F, cv::Scalar(0.8f));
+    diagnostics.shadowPredictedBeforeMasks[0] = mask.clone();
+    diagnostics.shadowPredictedAfterMasks[0] = mask.clone();
+    diagnostics.shadowPredictedBeforeProbability[0] = cv::Mat(size, CV_32F, cv::Scalar(0.4f));
+    diagnostics.shadowPredictedAfterProbability[0] = cv::Mat(size, CV_32F, cv::Scalar(0.7f));
+
+    saveOutputs(opt, lights, {}, normals, albedo, residual, mask, diagnostics, height, mask);
+    context.check(
+        fs::is_regular_file(root / "routine" / "shadow_height_correction.png") &&
+            !fs::exists(root / "routine" / "shadow_refinement"),
+        "routine shadow refinement must keep aggregate results without writing per-light audits");
+
+    Options diagnosticOpt = opt;
+    diagnosticOpt.outputDir = (root / "diagnostic").string();
+    diagnosticOpt.specularDiagnostics = true;
+    saveOutputs(
+        diagnosticOpt,
+        lights,
+        {},
+        normals,
+        albedo,
+        residual,
+        mask,
+        diagnostics,
+        height,
+        mask);
+    const fs::path audit = root / "diagnostic" / "shadow_refinement";
+    context.check(
+        fs::is_regular_file(audit / "light_001_observed_cast.png") &&
+            fs::is_regular_file(audit / "light_001_evidence_confidence.png") &&
+            fs::is_regular_file(audit / "light_001_predicted_before.png") &&
+            fs::is_regular_file(audit / "light_001_predicted_after.png") &&
+            fs::is_regular_file(audit / "light_001_probability_before.png") &&
+            fs::is_regular_file(audit / "light_001_probability_after.png"),
+        "diagnostic mode must retain the complete per-light shadow audit");
+
+    fs::remove_all(root);
+}
+
 void testNearFieldCalibrationMetadataRoundTrip(TestContext& context) {
     const fs::path root = "io_near_field_metadata_test";
     fs::remove_all(root);
@@ -736,6 +811,13 @@ void testNearFieldCalibrationMetadataRoundTrip(TestContext& context) {
     opt.ringLightHeightMm = 8.25;
     opt.pixelScaleMm = 0.0175;
     opt.shadowLedDiameterMm = 0.65;
+    opt.hasSphere = true;
+    opt.sphere = {18.5, 41.0, 12.0};
+    opt.sphereSelectionImageIndex = 2;
+    opt.sphereEdgePoints = {{6.5, 41}, {18.5, 29}, {30.5, 41}, {18.5, 53}, {10, 32.5}};
+    opt.sphereFitRmsPixels = 0.24;
+    opt.sphereFitMaxResidualPixels = 0.51;
+    opt.sphereFitCoverageDegrees = 270.0;
     const std::vector<cv::Vec3f> lights = makeLights();
     for (size_t i = 0; i < lights.size(); ++i) {
         opt.imagePaths.push_back("calibration_" + std::to_string(i) + ".tif");
@@ -745,7 +827,20 @@ void testNearFieldCalibrationMetadataRoundTrip(TestContext& context) {
     const cv::Mat albedo(6, 7, CV_32F, cv::Scalar(0.6f));
     const cv::Mat residual(6, 7, CV_32F, cv::Scalar(0.0f));
     const cv::Mat mask(6, 7, CV_8U, cv::Scalar(255));
-    saveOutputs(opt, lights, {}, normals, albedo, residual, mask, {}, {}, {});
+    std::vector<HighlightEstimate> estimates(lights.size());
+    for (HighlightEstimate& estimate : estimates) {
+        estimate.point = {20.0f, 39.0f};
+        estimate.selectedPixels = 14;
+        estimate.candidateComponents = 1;
+        estimate.saturatedPixels = 2;
+        estimate.saturationFraction = 2.0f / 14.0f;
+        estimate.componentAreaFraction = 0.003f;
+        estimate.compactness = 0.7f;
+        estimate.centroidUncertaintyPixels = 0.32f;
+        estimate.radialFraction = 0.21f;
+        estimate.quality = "accepted_clipped_compact";
+    }
+    saveOutputs(opt, lights, estimates, normals, albedo, residual, mask, {}, {}, {});
 
     Options restored;
     const fs::path lightsPath = root / "output" / "lights.csv";
@@ -758,6 +853,13 @@ void testNearFieldCalibrationMetadataRoundTrip(TestContext& context) {
             std::abs(restored.pixelScaleMm - opt.pixelScaleMm) < 1.0e-9 &&
             std::abs(restored.shadowLedDiameterMm - opt.shadowLedDiameterMm) < 1.0e-9,
         "near-field calibration reuse must restore ring geometry, image scale, and effective LED diameter");
+    const std::string audit = readText(lightsPath);
+    context.check(
+        audit.find("sphere_selection_image_index,2") != std::string::npos &&
+            audit.find("sphere_edge_point_count,5") != std::string::npos &&
+            audit.find("centroid_uncertainty_pixels,radial_fraction,quality") != std::string::npos &&
+            audit.find("accepted_clipped_compact") != std::string::npos,
+        "lights.csv omitted sphere source-image, fit, or highlight-quality audit fields");
     fs::remove_all(root);
 }
 
@@ -1276,6 +1378,7 @@ int main() {
     testPtmReconstruction(context);
     testDeepZoomLayout(context);
     testRunManifestAndCheckedWrites(context);
+    testShadowRefinementAuditOutputPolicy(context);
     testNearFieldCalibrationMetadataRoundTrip(context);
     testDefiniteSaturationLoading(context);
     testPrintableMeshTopology(context);

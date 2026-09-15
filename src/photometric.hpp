@@ -8,13 +8,29 @@
 #include <string>
 #include <vector>
 
-HighlightEstimate estimateHighlight(const cv::Mat& image, const Sphere& sphere, const Options& opt);
+SphereCircleFit fitSphereCircle(const std::vector<cv::Point2d>& points);
+HighlightEstimate estimateHighlight(
+    const cv::Mat& image,
+    const Sphere& sphere,
+    const Options& opt,
+    const cv::Mat& saturationMask = {});
 bool loadLightsFileMetadata(const std::string& path, Options& opt);
 std::vector<cv::Vec3f> loadLightsFile(
     const std::string& path,
     const std::vector<std::string>& imagePaths,
     Options* opt = nullptr,
     bool useFileOrder = false);
+cv::Vec3f photometricLightVectorAtPixel(
+    const cv::Vec3f& reference,
+    int index,
+    int count,
+    int x,
+    int y,
+    LightingModel lightingModel,
+    double ringLightRadiusMm,
+    double ringLightHeightMm,
+    double pixelScaleMm,
+    cv::Point2d lightingCenter);
 cv::Mat buildObservationValidityMask(
     const std::vector<cv::Mat>& images,
     const cv::Mat& inputMask,

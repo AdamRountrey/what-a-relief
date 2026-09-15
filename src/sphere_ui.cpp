@@ -1,8 +1,17 @@
 #include "sphere_ui.hpp"
+#include "photometric.hpp"
 
 #ifdef PS_NO_GUI
 
 #include <stdexcept>
+
+SphereSelection chooseSphereInteractive(
+    size_t,
+    const SphereImageLoader&,
+    const std::vector<std::string>&,
+    size_t) {
+    throw std::runtime_error("Interactive sphere selection is disabled in this build. Use --sphere or rebuild with OpenCV highgui.");
+}
 
 Sphere chooseSphereInteractive(const cv::Mat&) {
     throw std::runtime_error("Interactive sphere selection is disabled in this build. Use --sphere or rebuild with OpenCV highgui.");
@@ -15,22 +24,28 @@ Sphere chooseSphereInteractive(const cv::Mat&) {
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 struct PickerState {
     cv::Mat image;
+    cv::Size imageSize;
     cv::Size viewSize;
+    size_t imageIndex = 0;
+    size_t imageCount = 1;
+    std::vector<std::string> imageLabels;
     double zoom = 1.0;
     double minZoom = 1.0;
     double maxZoom = 32.0;
     cv::Point2d origin = cv::Point2d(0.0, 0.0);
     std::vector<cv::Point2d> edgePoints;
-    Sphere circle;
-    bool hasCircle = false;
+    SphereCircleFit fit;
     bool panning = false;
     cv::Point panStartMouse;
     cv::Point2d panStartOrigin = cv::Point2d(0.0, 0.0);
@@ -77,49 +92,41 @@ void panBy(PickerState& state, double dx, double dy) {
     clampOrigin(state);
 }
 
-bool fitCircleFromThreePoints(const std::vector<cv::Point2d>& points, Sphere& sphere) {
-    if (points.size() != 3) {
-        return false;
-    }
-
-    const cv::Point2d a = points[0];
-    const cv::Point2d b = points[1];
-    const cv::Point2d c = points[2];
-    const double d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
-    if (std::abs(d) < 1.0e-6) {
-        return false;
-    }
-
-    const double aa = a.x * a.x + a.y * a.y;
-    const double bb = b.x * b.x + b.y * b.y;
-    const double cc = c.x * c.x + c.y * c.y;
-    sphere.cx = (aa * (b.y - c.y) + bb * (c.y - a.y) + cc * (a.y - b.y)) / d;
-    sphere.cy = (aa * (c.x - b.x) + bb * (a.x - c.x) + cc * (b.x - a.x)) / d;
-    sphere.radius = cv::norm(cv::Point2d(sphere.cx, sphere.cy) - a);
-    return std::isfinite(sphere.cx) && std::isfinite(sphere.cy) && std::isfinite(sphere.radius) && sphere.radius > 1.0;
-}
-
 void addEdgePoint(PickerState& state, const cv::Point2d& p) {
-    if (state.edgePoints.size() >= 3) {
-        return;
-    }
+    if (state.edgePoints.size() >= 64) return;
     state.edgePoints.push_back(p);
-    state.hasCircle = false;
-    if (state.edgePoints.size() == 3) {
-        if (!fitCircleFromThreePoints(state.edgePoints, state.circle)) {
-            state.edgePoints.clear();
-            state.hasCircle = false;
-            return;
-        }
-        state.hasCircle = true;
-    }
+    state.fit = fitSphereCircle(state.edgePoints);
 }
 
 void resetSelection(PickerState& state) {
     state.edgePoints.clear();
-    state.hasCircle = false;
+    state.fit = {};
     state.leftDown = false;
     state.panning = false;
+}
+
+bool circleFitsImage(const PickerState& state) {
+    if (!state.fit.hasGeometry) return false;
+    const Sphere& sphere = state.fit.sphere;
+    return sphere.cx - sphere.radius >= -0.5 && sphere.cy - sphere.radius >= -0.5 &&
+        sphere.cx + sphere.radius <= static_cast<double>(state.image.cols) - 0.5 &&
+        sphere.cy + sphere.radius <= static_cast<double>(state.image.rows) - 0.5;
+}
+
+bool selectionAccepted(const PickerState& state) {
+    return state.fit.accepted && circleFitsImage(state);
+}
+
+void selectImage(PickerState& state, const SphereImageLoader& loader, size_t index) {
+    cv::Mat image = loader(index);
+    if (image.empty()) throw std::runtime_error("Cannot choose a sphere from an empty image.");
+    if (image.size() != state.imageSize) {
+        throw std::runtime_error("All sphere-selection images must have identical dimensions.");
+    }
+    state.image = std::move(image);
+    state.imageIndex = index;
+    resetSelection(state);
+    resetView(state);
 }
 
 void mouseCallback(int event, int x, int y, int flags, void* userdata) {
@@ -173,11 +180,18 @@ cv::Mat render(const PickerState& state) {
         scaled(srcRect).copyTo(frame(dstRect));
     }
 
-    const std::string line1 = "Click 3 points on the sphere edge. Wheel/+/- zoom. Right-drag or WASD pans.";
-    const std::string line2 = "Enter/Space accepts after 3 points. Backspace removes last. R resets. 0 fits. Esc cancels.";
-    cv::rectangle(frame, cv::Point(0, 0), cv::Point(frame.cols, 64), cv::Scalar(0, 0, 0), cv::FILLED);
-    cv::putText(frame, line1, cv::Point(12, 24), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-    cv::putText(frame, line2, cv::Point(12, 50), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+    std::string label = state.imageIndex < state.imageLabels.size()
+        ? state.imageLabels[state.imageIndex]
+        : std::string("image");
+    if (label.size() > 70) label = "..." + label.substr(label.size() - 67);
+    const std::string line1 = "Image " + std::to_string(state.imageIndex + 1) + "/" +
+        std::to_string(state.imageCount) + ": " + label + "   PgUp/PgDn changes image and clears points.";
+    const std::string line2 = "Click 5+ well-spaced points on this sphere edge. Wheel/+/- zoom; right-drag or WASD pans.";
+    const std::string line3 = "Enter/Space accepts a green fit. Backspace removes last. R resets. 0 fits. Esc cancels.";
+    cv::rectangle(frame, cv::Point(0, 0), cv::Point(frame.cols, 88), cv::Scalar(0, 0, 0), cv::FILLED);
+    cv::putText(frame, line1, cv::Point(12, 22), cv::FONT_HERSHEY_SIMPLEX, 0.50, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    cv::putText(frame, line2, cv::Point(12, 48), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+    cv::putText(frame, line3, cv::Point(12, 73), cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
 
     for (size_t i = 0; i < state.edgePoints.size(); ++i) {
         const cv::Point p = toViewPoint(state, state.edgePoints[i]);
@@ -186,22 +200,28 @@ cv::Mat render(const PickerState& state) {
         cv::putText(frame, std::to_string(i + 1), p + cv::Point(9, -8), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     }
 
-    if (state.hasCircle) {
-        const cv::Point c = toViewPoint(state, cv::Point2d(state.circle.cx, state.circle.cy));
-        const int r = static_cast<int>(std::lround(state.circle.radius * state.zoom));
-        cv::circle(frame, c, r, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
-        cv::circle(frame, c, 4, cv::Scalar(0, 255, 255), cv::FILLED, cv::LINE_AA);
+    if (state.fit.hasGeometry) {
+        const cv::Scalar color = selectionAccepted(state) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255);
+        const cv::Point c = toViewPoint(state, cv::Point2d(state.fit.sphere.cx, state.fit.sphere.cy));
+        const int r = static_cast<int>(std::lround(state.fit.sphere.radius * state.zoom));
+        cv::circle(frame, c, r, color, 2, cv::LINE_AA);
+        cv::circle(frame, c, 4, color, cv::FILLED, cv::LINE_AA);
 
-        const std::string values =
-            "cx=" + std::to_string(static_cast<int>(std::lround(state.circle.cx))) +
-            " cy=" + std::to_string(static_cast<int>(std::lround(state.circle.cy))) +
-            " r=" + std::to_string(static_cast<int>(std::lround(state.circle.radius))) +
-            " zoom=" + std::to_string(static_cast<int>(std::lround(state.zoom * 100.0))) + "%";
-        cv::putText(frame, values, cv::Point(12, frame.rows - 16), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(1)
+               << state.edgePoints.size() << " points  cx=" << state.fit.sphere.cx
+               << " cy=" << state.fit.sphere.cy << " r=" << state.fit.sphere.radius
+               << "  RMS=" << state.fit.rmsResidualPixels << " px  coverage="
+               << state.fit.angularCoverageDegrees << " deg";
+        cv::putText(frame, values.str(), cv::Point(12, frame.rows - 40), cv::FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv::LINE_AA);
+        std::string message = circleFitsImage(state)
+            ? state.fit.message
+            : "The complete sphere must remain inside the image; it does not need to be centered.";
+        cv::putText(frame, message, cv::Point(12, frame.rows - 16), cv::FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv::LINE_AA);
     } else {
         const std::string values =
-            std::to_string(state.edgePoints.size()) + "/3 edge points   zoom=" +
-            std::to_string(static_cast<int>(std::lround(state.zoom * 100.0))) + "%";
+            std::to_string(state.edgePoints.size()) + "/5 minimum edge points   zoom=" +
+            std::to_string(static_cast<int>(std::lround(state.zoom * 100.0))) + "%   " + state.fit.message;
         cv::putText(frame, values, cv::Point(12, frame.rows - 16), cv::FONT_HERSHEY_SIMPLEX, 0.58, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     }
 
@@ -210,20 +230,28 @@ cv::Mat render(const PickerState& state) {
 
 } // namespace
 
-Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
-    if (displayImage.empty()) {
-        throw std::runtime_error("Cannot choose a sphere from an empty image.");
-    }
-
+SphereSelection chooseSphereInteractive(
+    size_t imageCount,
+    const SphereImageLoader& loader,
+    const std::vector<std::string>& imageLabels,
+    size_t initialImageIndex) {
+    if (imageCount == 0 || !loader) throw std::runtime_error("No images are available for sphere selection.");
+    if (initialImageIndex >= imageCount) initialImageIndex = 0;
+    cv::Mat initialImage = loader(initialImageIndex);
+    if (initialImage.empty()) throw std::runtime_error("Cannot choose a sphere from an empty image.");
     PickerState state;
     const double maxW = 1400.0;
     const double maxH = 900.0;
-    state.image = displayImage.clone();
-    state.minZoom = std::min(1.0, std::min(maxW / displayImage.cols, maxH / displayImage.rows));
+    state.image = std::move(initialImage);
+    state.imageSize = state.image.size();
+    state.imageIndex = initialImageIndex;
+    state.imageCount = imageCount;
+    state.imageLabels = imageLabels;
+    state.minZoom = std::min(1.0, std::min(maxW / state.image.cols, maxH / state.image.rows));
     state.zoom = state.minZoom;
     state.viewSize = cv::Size(
-        std::max(1, static_cast<int>(std::lround(displayImage.cols * state.minZoom))),
-        std::max(1, static_cast<int>(std::lround(displayImage.rows * state.minZoom))));
+        std::max(1, static_cast<int>(std::lround(state.image.cols * state.minZoom))),
+        std::max(1, static_cast<int>(std::lround(state.image.rows * state.minZoom))));
     state.maxZoom = std::max(32.0, state.minZoom * 32.0);
 
     const std::string windowName = "Select highlight sphere";
@@ -240,7 +268,11 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
             resetSelection(state);
         } else if (ascii == 8 && !state.edgePoints.empty()) {
             state.edgePoints.pop_back();
-            state.hasCircle = false;
+            state.fit = fitSphereCircle(state.edgePoints);
+        } else if (key == 2162688 || key == 65365 || ascii == '[') {
+            selectImage(state, loader, (state.imageIndex + imageCount - 1) % imageCount);
+        } else if (key == 2228224 || key == 65366 || ascii == ']') {
+            selectImage(state, loader, (state.imageIndex + 1) % imageCount);
         } else if (ascii == '0') {
             resetView(state);
         } else if (ascii == '+' || ascii == '=') {
@@ -255,7 +287,7 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
             panBy(state, 0.0, -static_cast<double>(state.viewSize.height) * 0.15 / state.zoom);
         } else if (ascii == 's' || ascii == 'S' || key == 2621440) {
             panBy(state, 0.0, static_cast<double>(state.viewSize.height) * 0.15 / state.zoom);
-        } else if ((ascii == 13 || ascii == 10 || ascii == 32) && state.hasCircle && state.circle.radius > 1.0) {
+        } else if ((ascii == 13 || ascii == 10 || ascii == 32) && selectionAccepted(state)) {
             state.done = true;
         }
     }
@@ -265,7 +297,23 @@ Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
         throw std::runtime_error("Interactive sphere selection was canceled.");
     }
 
-    return state.circle;
+    SphereSelection selection;
+    selection.sphere = state.fit.sphere;
+    selection.imageIndex = state.imageIndex;
+    selection.edgePoints = state.edgePoints;
+    selection.fitRmsPixels = state.fit.rmsResidualPixels;
+    selection.fitMaxResidualPixels = state.fit.maxResidualPixels;
+    selection.fitCoverageDegrees = state.fit.angularCoverageDegrees;
+    return selection;
+}
+
+Sphere chooseSphereInteractive(const cv::Mat& displayImage) {
+    const SphereSelection selection = chooseSphereInteractive(
+        1,
+        [&](size_t) { return displayImage.clone(); },
+        {"image"},
+        0);
+    return selection.sphere;
 }
 
 #endif

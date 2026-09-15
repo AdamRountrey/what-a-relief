@@ -1,6 +1,7 @@
 """Real CPU renderer regression gates, not a mock or a clinical accuracy claim."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import subprocess
@@ -18,7 +19,8 @@ spec.loader.exec_module(w)
 class RenderingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.mi, _, _ = w.configure_backend('llvm')
+        cls.backend = os.environ.get('WHAT_A_RELIEF_TEST_BACKEND', 'llvm')
+        cls.mi, _, _ = w.configure_backend(cls.backend)
 
     def test_finite_sources_have_shadow_derivatives(self):
         for model in ('near_field_ring', 'directional'):
@@ -66,6 +68,20 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(gradient[3, 4], 0)
         self.assertLess(w.normal_prior_loss(prepared, height - 0.1 * gradient), float(loss[0]))
 
+    def test_hierarchical_drjit_sum_matches_numpy(self):
+        import drjit as dr
+        values = np.linspace(-0.25, 0.75,
+                             w.DRJIT_REDUCTION_CHUNK + 37,
+                             dtype=np.float32)
+        source = self.mi.Float(values)
+        dr.enable_grad(source)
+        total = w.safe_dr_sum(dr, source)
+        actual = float(total[0])
+        expected = float(np.sum(values, dtype=np.float32))
+        self.assertAlmostEqual(actual, expected, delta=1.0)
+        dr.backward(total)
+        np.testing.assert_array_equal(dr.grad(source).numpy(), np.ones_like(values))
+
     def test_inverse_tilt_recovery_and_truth_guard(self):
         mi = self.mi
         side = 24
@@ -97,13 +113,13 @@ class RenderingTests(unittest.TestCase):
                 'geometry': {'lighting_model': 'near_field_ring', 'pixel_scale_mm_per_pixel': 0.25,
                              'ring_radius_mm': 35, 'ring_height_mm': 45, 'reference_surface_z_mm': 10,
                              'reference_height_pixels': 7, 'led_diameter_mm': 2, 'angular_diameter_degrees': 1},
-                'parameters': {'quality': 'regression', 'backend_selected': 'llvm', 'srgb_decode': False, 'height_scale': 1},
+                'parameters': {'quality': 'regression', 'backend_selected': self.backend, 'srgb_decode': False, 'height_scale': 1},
                 'outputs': {'directory': str(root)},
             }
             prepared = w.prepare_job(mi, job, settings, lambda *args: None, root / 'renderer')
             self.assertAlmostEqual(prepared['geometry']['ring_height_world'] / prepared['scene_scale'], 35)
             self.assertEqual(int(np.count_nonzero(prepared['mask_small'])), side * side - 9)
-            scenes, params = w.make_scenes(mi, prepared, 'llvm', 16)
+            scenes, params = w.make_scenes(mi, prepared, self.backend, 16)
             basis = w.render_basis_numpy(mi, scenes, params, prepared['baseline_positions'], 256, 901)
             # Spatial texture and two glossy coefficients vary independently.
             material = np.stack((albedo, 0.02 * (xx > 12), 0.03 * (yy > 12)), axis=-1)
@@ -114,25 +130,48 @@ class RenderingTests(unittest.TestCase):
             roi = prepared['weights'][0] > 0
             del scenes, params, basis, prepared
             w.QUALITY['regression'] = settings
+            ultra_test_spp = int(os.environ.get('WHAT_A_RELIEF_TEST_SPP', '8'))
+            ultra_settings = dict(w.QUALITY['ultra'], iterations_ad=2, spp=ultra_test_spp,
+                                  validation_spp=32, material_refit_interval=1)
+            ultra_tilted_settings = dict(w.QUALITY['ultra'], iterations_ad=40, spp=ultra_test_spp,
+                                         validation_spp=32, material_refit_interval=5)
+            w.QUALITY['ultra_regression'] = ultra_settings
+            w.QUALITY['ultra_tilted_regression'] = ultra_tilted_settings
             normal_paths = [inputs / f'normal_{axis}.pfm' for axis in range(3)]
             for axis, path in enumerate(normal_paths):
                 w.write_pfm(path, w.surface_normals(truth, mask)[..., axis])
             w.save_gray(mi, inputs / 'clipped.png', np.ones_like(truth))
             w.save_gray(mi, inputs / 'invalid.png', np.zeros_like(truth))
             try:
-                for name, baseline in [('tilted', np.full_like(truth, 7)),
-                                       ('tilted_clipped_views', np.full_like(truth, 7)), ('truth', truth)]:
+                all_cases = [('tilted', np.full_like(truth, 7)),
+                             ('tilted_clipped_views', np.full_like(truth, 7)),
+                             ('truth', truth),
+                             ('ultra_tilted', np.full_like(truth, 7)),
+                             ('ultra_truth', truth)]
+                requested_case = os.environ.get('WHAT_A_RELIEF_TEST_CASE')
+                if requested_case:
+                    cases = [case for case in all_cases if case[0] == requested_case]
+                    self.assertTrue(cases, f'Unknown requested fixture: {requested_case}')
+                else:
+                    # The 40-iteration nonzero Ultra recovery gate is available
+                    # for targeted CPU/CUDA qualification without adding minutes
+                    # to every installer build.
+                    cases = [case for case in all_cases if case[0] != 'ultra_tilted']
+                for name, baseline in cases:
                     with self.subTest(start=name):
                         output = root / name
                         output.mkdir()
                         w.write_pfm(inputs / 'height.pfm', baseline)
-                        if name.startswith('tilted'):
+                        if 'tilted' in name:
                             job['inputs']['normal_prior_pfm'] = list(map(str, normal_paths))
                         else:
                             job['inputs'].pop('normal_prior_pfm', None)
                         job['outputs']['directory'] = str(output)
                         job_path = output / 'job.json'
                         run_job = json.loads(json.dumps(job))
+                        run_job['parameters']['quality'] = (
+                            'ultra_tilted_regression' if name == 'ultra_tilted' else
+                            'ultra_regression' if name.startswith('ultra_') else 'regression')
                         run_job['parameters']['live_preview'] = name == 'tilted'
                         if name == 'tilted_clipped_views':
                             for index in (1, 4):
@@ -179,7 +218,7 @@ class RenderingTests(unittest.TestCase):
                                 self.assertEqual(selection['excluded_light_indices'], [1, 4])
                                 self.assertTrue(result['holdout_light_indices'])
                                 self.assertFalse({1, 4} & set(result['training_light_indices'] + result['holdout_light_indices']))
-                        else:
+                        elif name == 'truth':
                             self.assertLess(mean_error, 1.0)
                             self.assertLess(height_rmse, 0.05)
                             self.assertFalse(result['normal_prior_enabled'])  # Legacy jobs remain supported.
@@ -192,18 +231,49 @@ class RenderingTests(unittest.TestCase):
                             np.testing.assert_array_equal(candidate_height, np.where(mask, baseline + correction, 0))
                             self.assertFalse(json.loads((candidate / 'candidate.json').read_text())['accepted'])
                             self.assertTrue((candidate / 'review.html').is_file())
+                        else:
+                            self.assertEqual(result['geometry_parameterization'], 'absolute_height_grid')
+                            self.assertTrue(result['absolute_height_inverse'])
+                            self.assertTrue(result['full_resolution_inverse'])
+                            self.assertFalse(result['optimization_downsampled'])
+                            self.assertEqual(result['optimization_max_side'], 1024)
+                            self.assertEqual(result['control_grid_shape'], [side, side])
+                            self.assertEqual(result['modeled_fit_pixels'],
+                                             int(w.triangle_vertex_support(mask).sum()))
+                            self.assertEqual(result['pixel_inclusion_policy'],
+                                             'all_valid_triangle_supported_optimization_grid_vertices')
+                            self.assertTrue(all('geometry_regularization' in step for step in
+                                                result['optimization_history']))
+                            if name == 'ultra_tilted':
+                                selected = (reconstructed if result['accepted'] else
+                                            w.read_pfm(output / result['candidate_directory'] /
+                                                       'candidate_height.pfm'))
+                                self.assertGreater(float(np.max(np.abs(selected[roi] - baseline[roi]))),
+                                                   1.0e-5, str(result['optimization_history']))
+                                self.assertLess(result['train_loss_after'], result['train_loss_before'])
+                            if not result['accepted']:
+                                candidate = output / result['candidate_directory']
+                                candidate_height = w.read_pfm(candidate / 'candidate_height.pfm')
+                                difference = w.read_pfm(candidate / 'height_correction.pfm')
+                                np.testing.assert_allclose(
+                                    candidate_height[mask], baseline[mask] + difference[mask], atol=1e-6)
+                                self.assertEqual(result['delivered_geometry'], 'baseline')
                         self.assertTrue(np.all(np.isfinite(reconstructed)))
                         self.assertTrue(np.all(reconstructed[~mask] == 0))
                         self.assertEqual(result['reference_surface_z_mm'], 10)
                         self.assertFalse(result['baseline_outputs_modified'])
-                        self.assertEqual(result['material_refit_interval'], settings['material_refit_interval'])
+                        current_settings = (ultra_tilted_settings if name == 'ultra_tilted' else
+                                            ultra_settings if name.startswith('ultra_') else settings)
+                        self.assertEqual(result['material_refit_interval'], current_settings['material_refit_interval'])
                         history = result['optimization_history']
                         self.assertEqual(history[0]['iteration'], 0)
-                        self.assertEqual(history[-1]['iteration'], settings['iterations_ad'])
+                        self.assertEqual(history[-1]['iteration'], current_settings['iterations_ad'])
                         chosen = next(step for step in history if step['iteration'] == result['selected_iteration'])
                         self.assertEqual(chosen['objective'], min(step['objective'] for step in history))
             finally:
                 del w.QUALITY['regression']
+                del w.QUALITY['ultra_regression']
+                del w.QUALITY['ultra_tilted_regression']
 
 
 if __name__ == '__main__':
